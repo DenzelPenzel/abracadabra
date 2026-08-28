@@ -99,11 +99,14 @@ jobs:
           if ($architecture -ne [System.Runtime.InteropServices.Architecture]::X64) {
             throw "native VM differential gate requires X64, found $architecture"
           }
+          $env:CARGO_TERM_COLOR = "never"
           cargo test -p vmp-vm --test native_differential -- --nocapture 2>&1 | Tee-Object -Variable oracleOutput
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
-          if (($oracleOutput -join "`n") -notmatch "2 passed; 0 failed") {
+          $summaryPattern = '^test result: ok\. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in [0-9]+(?:\.[0-9]+)?s$'
+          $matchingSummaries = @($oracleOutput | Where-Object { $_ -match $summaryPattern })
+          if ($matchingSummaries.Count -ne 1) {
             throw "native VM differential oracle did not execute exactly two passing tests"
           }
 
