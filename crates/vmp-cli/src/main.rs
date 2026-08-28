@@ -30,11 +30,7 @@ use crate::protect::ProtectReport;
 use crate::report::InspectReport;
 
 #[derive(Parser)]
-#[command(
-    name = "vmp",
-    about = "Windows x64 PE protector CLI",
-    version
-)]
+#[command(name = "vmp", about = "Windows x64 PE protector CLI", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
