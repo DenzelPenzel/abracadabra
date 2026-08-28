@@ -1,0 +1,14 @@
+[package]
+name = "vmp-x86"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+iced-x86.workspace = true
+thiserror.workspace = true
+vmp-ir = { version = "0.1.0", path = "../vmp-ir" }
+vmp-pe = { version = "0.1.0", path = "../vmp-pe" }
+vmp-types = { version = "0.1.0", path = "../vmp-types" }
+
+[lints]
+workspace = true

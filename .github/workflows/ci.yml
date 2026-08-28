@@ -1,0 +1,126 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  VMP_REQUIRE_TEST_BINARIES: "1"
+  VMP_REQUIRE_CORPUS: "1"
+
+jobs:
+  lint:
+    name: fmt, clippy, docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Reject whitespace errors
+        run: git diff --check HEAD
+
+  test:
+    name: test ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest"]') }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      # Both gates are hard here: the pinned suites run against the committed
+      # fixtures, and the property sweeps default to the same directory. The
+      # windows-gate job below re-runs the sweeps against fresh linker output.
+      - run: cargo test --workspace --all-targets
+      - run: cargo test --workspace --all-targets --release
+
+  windows-gate:
+    name: windows loader and corpus gate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Add the 32-bit target
+        run: rustup target add i686-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+
+      # Real PE32 and PE32+ fixtures, produced here by the MSVC linker. Pointing
+      # `VMP_CORPUS_DIR` at them makes the property sweeps a hard gate on fresh
+      # toolchain output as well as on the committed corpus; the pinned suites
+      # keep reading `test-corpus` through their own variable.
+      - name: Build corpus fixtures
+        run: |
+          cargo build -p vmp-pe --bin pe-loader-probe --release --target x86_64-pc-windows-msvc
+          cargo build -p vmp-pe --bin pe-loader-probe --release --target i686-pc-windows-msvc
+          New-Item -ItemType Directory -Force -Path ci-fixtures | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/pe-loader-probe.exe ci-fixtures/probe-amd64.exe
+          Copy-Item target/i686-pc-windows-msvc/release/pe-loader-probe.exe ci-fixtures/probe-i386.exe
+          Get-ChildItem ci-fixtures
+
+      - name: Build SDK execution probes
+        shell: cmd
+        run: |
+          cl /nologo /TP /Icrates\vmp-cli\tests\fixtures /LD crates\vmp-cli\tests\fixtures\sdk_stub.c /link /out:ci-fixtures\VMProtectSDK64.dll /implib:ci-fixtures\VMProtectSDK64.lib
+          cl /nologo /TP /Icrates\vmp-cli\tests\fixtures /Od crates\vmp-cli\tests\fixtures\sdk_probe.c /link /libpath:ci-fixtures VMProtectSDK64.lib /out:ci-fixtures\sdk-probe.exe
+          cl /nologo /TP /DVMP_SDK_IMPORT_THUNK /Icrates\vmp-cli\tests\fixtures /Od crates\vmp-cli\tests\fixtures\sdk_probe.c /link /libpath:ci-fixtures VMProtectSDK64.lib /out:ci-fixtures\sdk-thunk-probe.exe
+          ml64 /nologo /c /Foci-fixtures\sdk-register-probe.obj crates\vmp-cli\tests\fixtures\sdk_register_probe.asm
+          cl /nologo /TP /DVMP_SDK_REGISTER_TRANSFER /Icrates\vmp-cli\tests\fixtures /Od /c crates\vmp-cli\tests\fixtures\sdk_probe.c /Foci-fixtures\sdk-register-main.obj
+          link /nologo ci-fixtures\sdk-register-main.obj ci-fixtures\sdk-register-probe.obj /libpath:ci-fixtures VMProtectSDK64.lib /out:ci-fixtures\sdk-register-probe.exe
+          ml64 /nologo /c /Foci-fixtures\sdk-static-probe.obj crates\vmp-cli\tests\fixtures\sdk_static_probe.asm
+          cl /nologo /TP /DVMP_SDK_STATIC_MARKER /Icrates\vmp-cli\tests\fixtures /Od /c crates\vmp-cli\tests\fixtures\sdk_probe.c /Foci-fixtures\sdk-static-main.obj
+          link /nologo ci-fixtures\sdk-static-main.obj ci-fixtures\sdk-static-probe.obj /libpath:ci-fixtures VMProtectSDK64.lib /out:ci-fixtures\sdk-static-probe.exe
+          echo VMP_SDK_PROBE=%GITHUB_WORKSPACE%\ci-fixtures\sdk-probe.exe>>%GITHUB_ENV%
+          echo VMP_SDK_THUNK_PROBE=%GITHUB_WORKSPACE%\ci-fixtures\sdk-thunk-probe.exe>>%GITHUB_ENV%
+          echo VMP_SDK_REGISTER_PROBE=%GITHUB_WORKSPACE%\ci-fixtures\sdk-register-probe.exe>>%GITHUB_ENV%
+          echo VMP_SDK_STATIC_PROBE=%GITHUB_WORKSPACE%\ci-fixtures\sdk-static-probe.exe>>%GITHUB_ENV%
+
+      - name: Parser and writer suite over the built corpus
+        env:
+          VMP_CORPUS_DIR: ${{ github.workspace }}/ci-fixtures
+        run: cargo test --workspace --all-targets
+
+      - name: Native x86-64 VM differential gate
+        run: |
+          $architecture = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture
+          if ($architecture -ne [System.Runtime.InteropServices.Architecture]::X64) {
+            throw "native VM differential gate requires X64, found $architecture"
+          }
+          cargo test -p vmp-vm --test native_differential native_arithmetic_matches_lowered_decoded_host_v1 -- --exact --nocapture 2>&1 | Tee-Object -Variable oracleOutput
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          if (($oracleOutput -join "`n") -notmatch "1 passed; 0 failed") {
+            throw "native VM differential oracle did not execute exactly one passing test"
+          }
+
+      # The loader gate proper: imagehlp recomputes the checksum, the kernel maps
+      # the rewritten image, and the original and rewritten executables must
+      # behave identically.
+      - name: Loader and execution gate
+        env:
+          VMP_CORPUS_DIR: ${{ github.workspace }}/ci-fixtures
+          VMP_LOADER_PROBE_EXTRA: ${{ github.workspace }}/ci-fixtures/probe-i386.exe
+        run: cargo test -p vmp-pe --test windows_loader -- --nocapture
+
+      - name: Mutation gate
+        run: cargo test -p vmp-emit --test windows_mutation -- --nocapture
+
+      - name: SDK marker execution gate
+        run: cargo test -p vmp-cli --test windows_sdk -- --nocapture
+
+      - name: SDK marker release execution gate
+        run: cargo test -p vmp-cli --test windows_sdk --release -- --nocapture

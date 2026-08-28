@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.dependencies]
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+getrandom = "0.3"
+iced-x86 = { version = "1", default-features = false, features = [
+    "std",
+    "decoder",
+    "encoder",
+    "block_encoder",
+    "instr_info",
+    "masm",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"

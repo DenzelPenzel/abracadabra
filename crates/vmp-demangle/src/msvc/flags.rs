@@ -1,0 +1,93 @@
+#[cfg(test)]
+pub(crate) const UNDNAME_COMPLETE: u16 = 0x0000;
+pub(crate) const UNDNAME_NO_LEADING_UNDERSCORES: u16 = 0x0001;
+pub(crate) const UNDNAME_NO_MS_KEYWORDS: u16 = 0x0002;
+pub(crate) const UNDNAME_NO_FUNCTION_RETURNS: u16 = 0x0004;
+pub(crate) const UNDNAME_NO_ALLOCATION_MODEL: u16 = 0x0008;
+pub(crate) const UNDNAME_NO_ALLOCATION_LANGUAGE: u16 = 0x0010;
+pub(crate) const UNDNAME_NO_MS_THISTYPE: u16 = 0x0020;
+pub(crate) const UNDNAME_NO_CV_THISTYPE: u16 = 0x0040;
+pub(crate) const UNDNAME_NO_THISTYPE: u16 = 0x0060;
+pub(crate) const UNDNAME_NO_ACCESS_SPECIFIERS: u16 = 0x0080;
+pub(crate) const UNDNAME_NO_THROW_SIGNATURES: u16 = 0x0100;
+pub(crate) const UNDNAME_NO_MEMBER_TYPE: u16 = 0x0200;
+pub(crate) const UNDNAME_NO_RETURN_UDT_MODEL: u16 = 0x0400;
+pub(crate) const UNDNAME_32_BIT_DECODE: u16 = 0x0800;
+pub(crate) const UNDNAME_NAME_ONLY: u16 = 0x1000;
+pub(crate) const UNDNAME_NO_ARGUMENTS: u16 = 0x2000;
+#[cfg(test)]
+pub(crate) const UNDNAME_NO_SPECIAL_SYMS: u16 = 0x4000;
+pub(crate) const UNDNAME_NO_COMPLEX_TYPE: u16 = 0x8000;
+
+pub(crate) const VMP_DEMANGLE_FLAGS: u16 = UNDNAME_NO_LEADING_UNDERSCORES
+    | UNDNAME_NO_MS_KEYWORDS
+    | UNDNAME_NO_ALLOCATION_MODEL
+    | UNDNAME_NO_ALLOCATION_LANGUAGE
+    | UNDNAME_NO_MS_THISTYPE
+    | UNDNAME_NO_CV_THISTYPE
+    | UNDNAME_NO_THISTYPE
+    | UNDNAME_NO_ACCESS_SPECIFIERS
+    | UNDNAME_NO_THROW_SIGNATURES
+    | UNDNAME_NO_MEMBER_TYPE
+    | UNDNAME_NO_RETURN_UDT_MODEL
+    | UNDNAME_32_BIT_DECODE;
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        UNDNAME_32_BIT_DECODE, UNDNAME_COMPLETE, UNDNAME_NAME_ONLY, UNDNAME_NO_ACCESS_SPECIFIERS,
+        UNDNAME_NO_ALLOCATION_LANGUAGE, UNDNAME_NO_ALLOCATION_MODEL, UNDNAME_NO_ARGUMENTS,
+        UNDNAME_NO_COMPLEX_TYPE, UNDNAME_NO_CV_THISTYPE, UNDNAME_NO_FUNCTION_RETURNS,
+        UNDNAME_NO_LEADING_UNDERSCORES, UNDNAME_NO_MEMBER_TYPE, UNDNAME_NO_MS_KEYWORDS,
+        UNDNAME_NO_MS_THISTYPE, UNDNAME_NO_RETURN_UDT_MODEL, UNDNAME_NO_SPECIAL_SYMS,
+        UNDNAME_NO_THISTYPE, UNDNAME_NO_THROW_SIGNATURES, VMP_DEMANGLE_FLAGS,
+    };
+
+    #[test]
+    fn constants_match_undname_header_exactly() {
+        assert_eq!(UNDNAME_COMPLETE, 0x0000);
+        assert_eq!(UNDNAME_NO_LEADING_UNDERSCORES, 0x0001);
+        assert_eq!(UNDNAME_NO_MS_KEYWORDS, 0x0002);
+        assert_eq!(UNDNAME_NO_FUNCTION_RETURNS, 0x0004);
+        assert_eq!(UNDNAME_NO_ALLOCATION_MODEL, 0x0008);
+        assert_eq!(UNDNAME_NO_ALLOCATION_LANGUAGE, 0x0010);
+        assert_eq!(UNDNAME_NO_MS_THISTYPE, 0x0020);
+        assert_eq!(UNDNAME_NO_CV_THISTYPE, 0x0040);
+        assert_eq!(UNDNAME_NO_THISTYPE, 0x0060);
+        assert_eq!(UNDNAME_NO_ACCESS_SPECIFIERS, 0x0080);
+        assert_eq!(UNDNAME_NO_THROW_SIGNATURES, 0x0100);
+        assert_eq!(UNDNAME_NO_MEMBER_TYPE, 0x0200);
+        assert_eq!(UNDNAME_NO_RETURN_UDT_MODEL, 0x0400);
+        assert_eq!(UNDNAME_32_BIT_DECODE, 0x0800);
+        assert_eq!(UNDNAME_NAME_ONLY, 0x1000);
+        assert_eq!(UNDNAME_NO_ARGUMENTS, 0x2000);
+        assert_eq!(UNDNAME_NO_SPECIAL_SYMS, 0x4000);
+        assert_eq!(UNDNAME_NO_COMPLEX_TYPE, 0x8000);
+    }
+
+    #[test]
+    fn demangle_mask_matches_core_files_expression_exactly() {
+        assert_eq!(VMP_DEMANGLE_FLAGS, 0x0ffb);
+
+        let expected = UNDNAME_NO_LEADING_UNDERSCORES
+            | UNDNAME_NO_MS_KEYWORDS
+            | UNDNAME_NO_ALLOCATION_MODEL
+            | UNDNAME_NO_ALLOCATION_LANGUAGE
+            | UNDNAME_NO_MS_THISTYPE
+            | UNDNAME_NO_CV_THISTYPE
+            | UNDNAME_NO_THISTYPE
+            | UNDNAME_NO_ACCESS_SPECIFIERS
+            | UNDNAME_NO_THROW_SIGNATURES
+            | UNDNAME_NO_MEMBER_TYPE
+            | UNDNAME_NO_RETURN_UDT_MODEL
+            | UNDNAME_32_BIT_DECODE;
+        assert_eq!(VMP_DEMANGLE_FLAGS, expected);
+
+        let excluded = UNDNAME_NO_FUNCTION_RETURNS
+            | UNDNAME_NAME_ONLY
+            | UNDNAME_NO_ARGUMENTS
+            | UNDNAME_NO_SPECIAL_SYMS
+            | UNDNAME_NO_COMPLEX_TYPE;
+        assert_eq!(VMP_DEMANGLE_FLAGS & excluded, 0);
+    }
+}

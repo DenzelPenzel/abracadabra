@@ -1,0 +1,16 @@
+[package]
+name = "vmp-compiler"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+thiserror.workspace = true
+vmp-emit = { version = "0.1.0", path = "../vmp-emit" }
+vmp-mutation = { version = "0.1.0", path = "../vmp-mutation" }
+vmp-pe = { version = "0.1.0", path = "../vmp-pe" }
+vmp-symbols = { version = "0.1.0", path = "../vmp-symbols" }
+vmp-types = { version = "0.1.0", path = "../vmp-types" }
+vmp-x86 = { version = "0.1.0", path = "../vmp-x86" }
+
+[lints]
+workspace = true

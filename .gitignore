@@ -1,0 +1,6 @@
+/target
+.omc
+/ci-fixtures
+docs
+.hermes
+.claude

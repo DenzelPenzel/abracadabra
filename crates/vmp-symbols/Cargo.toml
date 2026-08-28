@@ -1,0 +1,14 @@
+[package]
+name = "vmp-symbols"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vmp-pdb = { version = "0.1.0", path = "../vmp-pdb" }
+thiserror.workspace = true
+vmp-demangle = { version = "0.1.0", path = "../vmp-demangle" }
+vmp-pe = { version = "0.1.0", path = "../vmp-pe" }
+vmp-types = { version = "0.1.0", path = "../vmp-types" }
+
+[lints]
+workspace = true
