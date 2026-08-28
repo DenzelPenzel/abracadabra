@@ -99,12 +99,12 @@ jobs:
           if ($architecture -ne [System.Runtime.InteropServices.Architecture]::X64) {
             throw "native VM differential gate requires X64, found $architecture"
           }
-          cargo test -p vmp-vm --test native_differential native_arithmetic_matches_lowered_decoded_host_v1 -- --exact --nocapture 2>&1 | Tee-Object -Variable oracleOutput
+          cargo test -p vmp-vm --test native_differential -- --nocapture 2>&1 | Tee-Object -Variable oracleOutput
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
-          if (($oracleOutput -join "`n") -notmatch "1 passed; 0 failed") {
-            throw "native VM differential oracle did not execute exactly one passing test"
+          if (($oracleOutput -join "`n") -notmatch "2 passed; 0 failed") {
+            throw "native VM differential oracle did not execute exactly two passing tests"
           }
 
       # The loader gate proper: imagehlp recomputes the checksum, the kernel maps
