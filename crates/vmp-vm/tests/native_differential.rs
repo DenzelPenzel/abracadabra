@@ -44,8 +44,8 @@ struct NativeMovResult {
     flags_after: u64,
 }
 
-const BRANCH_EQUAL: u64 = 0x2222_2222_2222_2222;
-const BRANCH_NOT_EQUAL: u64 = 0x1111_1111_1111_1111;
+const BRANCH_TAKEN: u64 = 0x2222_2222_2222_2222;
+const BRANCH_NOT_TAKEN: u64 = 0x1111_1111_1111_1111;
 
 #[test]
 fn native_arithmetic_matches_lowered_decoded_host_v1() {
@@ -106,8 +106,8 @@ fn branch_vectors() -> [(u64, u64); 8] {
 }
 
 fn branching_function() -> Function {
-    // sub rax, rcx; je equal; mov rax, NOT_EQUAL; jmp end;
-    // equal: mov rax, EQUAL; end: ret
+    // sub rax, rcx; je taken; mov rax, NOT_TAKEN; jmp end;
+    // taken: mov rax, TAKEN; end: ret
     let text = [
         0x48, 0x29, 0xc8, 0x74, 0x0c, 0x48, 0xb8, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
         0xeb, 0x0a, 0x48, 0xb8, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0xc3,
@@ -434,9 +434,9 @@ fn run_native_branch(lhs: u64, rhs: u64) -> NativeResult {
     }
 
     let expected = if lhs == rhs {
-        BRANCH_EQUAL
+        BRANCH_TAKEN
     } else {
-        BRANCH_NOT_EQUAL
+        BRANCH_NOT_TAKEN
     };
     assert_eq!(
         result, expected,
