@@ -68,7 +68,7 @@ fn native_mov_matches_lowered_decoded_host_v1() {
 
 #[test]
 fn native_conditional_and_join_branches_match_lowered_decoded_host_v1() {
-    for (lhs, rhs) in [(0, 0), (1, 2), (u64::MAX, u64::MAX), (0, u64::MAX)] {
+    for (lhs, rhs) in branch_vectors() {
         let function = branching_function();
         let lowered = lower(&function).expect("curated branch function must lower");
         let encoded = encode(&lowered).expect("lowered branch program must encode");
@@ -90,6 +90,19 @@ fn native_conditional_and_join_branches_match_lowered_decoded_host_v1() {
             "flag mismatch for lhs=0x{lhs:x}, rhs=0x{rhs:x}"
         );
     }
+}
+
+fn branch_vectors() -> [(u64, u64); 8] {
+    [
+        (0, 0),
+        (1, 0),
+        (0, 1),
+        (0x7fff_ffff_ffff_ffff, u64::MAX),
+        (0x8000_0000_0000_0000, 1),
+        (0x8000_0000_0000_0000, u64::MAX),
+        (u64::MAX, 0x7fff_ffff_ffff_ffff),
+        (0x1122_3344_5566_7788, 0x8877_6655_4433_2211),
+    ]
 }
 
 fn branching_function() -> Function {
