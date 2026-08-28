@@ -9,7 +9,7 @@ use vmp_ir::{
 use vmp_pe::PeFile;
 use vmp_types::{Architecture, Rva};
 use vmp_vm::{
-    bytecode::{decode, encode, Register, Width},
+    bytecode::{decode, encode, Condition, Register, Width},
     host::{execute, MachineState, Termination},
     lowering::lower,
 };
@@ -68,28 +68,55 @@ fn native_mov_matches_lowered_decoded_host_v1() {
 
 #[test]
 fn native_conditional_and_join_branches_match_lowered_decoded_host_v1() {
-    for (lhs, rhs) in branch_vectors() {
-        let function = branching_function();
+    for condition in all_conditions() {
+        let function = branching_function(condition);
         let lowered = lower(&function).expect("curated branch function must lower");
         let encoded = encode(&lowered).expect("lowered branch program must encode");
         let decoded = decode(&encoded).expect("physical branch program must decode independently");
 
-        let mut initial = MachineState::default();
-        initial.set_register(Register::Rax, lhs);
-        initial.set_register(Register::Rcx, rhs);
-        let vm = execute(&decoded, initial).expect("lowered branch function must terminate");
-        let native = run_native_branch(lhs, rhs);
+        for (lhs, rhs) in branch_vectors() {
+            let mut initial = MachineState::default();
+            initial.set_register(Register::Rax, lhs);
+            initial.set_register(Register::Rcx, rhs);
+            let vm = execute(&decoded, initial).expect("lowered branch function must terminate");
+            let native = run_native_branch(condition, lhs, rhs);
 
-        assert_eq!(vm.termination(), Termination::Ret);
-        assert_eq!(vm.state().stack_len(), 0);
-        assert_eq!(vm.state().register(Register::Rax), native.rax);
-        assert_eq!(vm.state().flags_defined(), ARITHMETIC_DEFINED);
-        assert_eq!(
-            vm.state().flags_bits() & ARITHMETIC_DEFINED,
-            native.rflags & ARITHMETIC_DEFINED,
-            "flag mismatch for lhs=0x{lhs:x}, rhs=0x{rhs:x}"
-        );
+            assert_eq!(vm.termination(), Termination::Ret);
+            assert_eq!(vm.state().stack_len(), 0);
+            assert_eq!(
+                vm.state().register(Register::Rax),
+                native.rax,
+                "branch mismatch for {condition:?}, lhs=0x{lhs:x}, rhs=0x{rhs:x}"
+            );
+            assert_eq!(vm.state().flags_defined(), ARITHMETIC_DEFINED);
+            assert_eq!(
+                vm.state().flags_bits() & ARITHMETIC_DEFINED,
+                native.rflags & ARITHMETIC_DEFINED,
+                "flag mismatch for {condition:?}, lhs=0x{lhs:x}, rhs=0x{rhs:x}"
+            );
+        }
     }
+}
+
+fn all_conditions() -> [Condition; 16] {
+    [
+        Condition::O,
+        Condition::No,
+        Condition::B,
+        Condition::Ae,
+        Condition::E,
+        Condition::Ne,
+        Condition::Be,
+        Condition::A,
+        Condition::S,
+        Condition::Ns,
+        Condition::P,
+        Condition::Np,
+        Condition::L,
+        Condition::Ge,
+        Condition::Le,
+        Condition::G,
+    ]
 }
 
 fn branch_vectors() -> [(u64, u64); 8] {
@@ -105,12 +132,38 @@ fn branch_vectors() -> [(u64, u64); 8] {
     ]
 }
 
-fn branching_function() -> Function {
-    // sub rax, rcx; je taken; mov rax, NOT_TAKEN; jmp end;
+fn branching_function(condition: Condition) -> Function {
+    // sub rax, rcx; jcc taken; mov rax, NOT_TAKEN; jmp end;
     // taken: mov rax, TAKEN; end: ret
     let text = [
-        0x48, 0x29, 0xc8, 0x74, 0x0c, 0x48, 0xb8, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
-        0xeb, 0x0a, 0x48, 0xb8, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0xc3,
+        0x48,
+        0x29,
+        0xc8,
+        0x70 | condition as u8,
+        0x0c,
+        0x48,
+        0xb8,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0xeb,
+        0x0a,
+        0x48,
+        0xb8,
+        0x22,
+        0x22,
+        0x22,
+        0x22,
+        0x22,
+        0x22,
+        0x22,
+        0x22,
+        0xc3,
     ];
     let image = minimal_pe64(&text);
     let pe = PeFile::parse(&image).expect("branch fixture must be a valid PE32+ image");
@@ -410,37 +463,55 @@ fn run_native(operation: Operation, width: Width, lhs: u64, rhs: u64) -> NativeR
     unsafe_code,
     reason = "the x86-64 CPU oracle is isolated to this target-only test harness"
 )]
-fn run_native_branch(lhs: u64, rhs: u64) -> NativeResult {
+fn run_native_branch(condition: Condition, lhs: u64, rhs: u64) -> NativeResult {
     let mut result = lhs;
     let rflags: u64;
 
-    // SAFETY: the sequence uses only declared RAX/RCX operands, records RFLAGS
-    // in declared RDX, and balances its temporary stack push/pop.
-    unsafe {
-        asm!(
-            "sub rax, rcx",
-            "je 2f",
-            "mov rax, 0x1111111111111111",
-            "jmp 3f",
-            "2:",
-            "mov rax, 0x2222222222222222",
-            "3:",
-            "pushfq",
-            "pop rdx",
-            inout("rax") result,
-            in("rcx") rhs,
-            lateout("rdx") rflags,
-        );
+    macro_rules! execute {
+        ($jump:literal) => {
+            // SAFETY: the sequence uses only declared RAX/RCX operands, records
+            // RFLAGS in declared RDX, and balances its temporary stack push/pop.
+            unsafe {
+                asm!(
+                    "sub rax, rcx",
+                    $jump,
+                    "mov rax, 0x1111111111111111",
+                    "jmp 3f",
+                    "2:",
+                    "mov rax, 0x2222222222222222",
+                    "3:",
+                    "pushfq",
+                    "pop rdx",
+                    inout("rax") result,
+                    in("rcx") rhs,
+                    lateout("rdx") rflags,
+                );
+            }
+        };
     }
 
-    let expected = if lhs == rhs {
-        BRANCH_TAKEN
-    } else {
-        BRANCH_NOT_TAKEN
-    };
-    assert_eq!(
-        result, expected,
-        "native branch oracle selected the wrong arm"
+    match condition {
+        Condition::O => execute!("jo 2f"),
+        Condition::No => execute!("jno 2f"),
+        Condition::B => execute!("jb 2f"),
+        Condition::Ae => execute!("jae 2f"),
+        Condition::E => execute!("je 2f"),
+        Condition::Ne => execute!("jne 2f"),
+        Condition::Be => execute!("jbe 2f"),
+        Condition::A => execute!("ja 2f"),
+        Condition::S => execute!("js 2f"),
+        Condition::Ns => execute!("jns 2f"),
+        Condition::P => execute!("jp 2f"),
+        Condition::Np => execute!("jnp 2f"),
+        Condition::L => execute!("jl 2f"),
+        Condition::Ge => execute!("jge 2f"),
+        Condition::Le => execute!("jle 2f"),
+        Condition::G => execute!("jg 2f"),
+    }
+
+    assert!(
+        matches!(result, BRANCH_TAKEN | BRANCH_NOT_TAKEN),
+        "native branch oracle produced an unknown arm value"
     );
     NativeResult {
         rax: result,
