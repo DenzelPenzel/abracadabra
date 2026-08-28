@@ -403,6 +403,7 @@ dependencies = [
  "iced-x86",
  "thiserror",
  "vmp-ir",
+ "vmp-pe",
  "vmp-types",
  "vmp-x86",
 ]
