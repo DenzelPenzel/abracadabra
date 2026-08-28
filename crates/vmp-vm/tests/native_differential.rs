@@ -1,4 +1,4 @@
-#![cfg(all(target_arch = "x86_64", target_os = "windows"))]
+#![cfg(target_arch = "x86_64")]
 
 use core::arch::asm;
 
