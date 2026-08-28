@@ -73,6 +73,8 @@ fn native_conditional_and_join_branches_match_lowered_decoded_host_v1() {
         let lowered = lower(&function).expect("curated branch function must lower");
         let encoded = encode(&lowered).expect("lowered branch program must encode");
         let decoded = decode(&encoded).expect("physical branch program must decode independently");
+        let mut observed_taken = false;
+        let mut observed_not_taken = false;
 
         for (lhs, rhs) in branch_vectors() {
             let mut initial = MachineState::default();
@@ -94,7 +96,15 @@ fn native_conditional_and_join_branches_match_lowered_decoded_host_v1() {
                 native.rflags & ARITHMETIC_DEFINED,
                 "flag mismatch for {condition:?}, lhs=0x{lhs:x}, rhs=0x{rhs:x}"
             );
+            observed_taken |= native.rax == BRANCH_TAKEN;
+            observed_not_taken |= native.rax == BRANCH_NOT_TAKEN;
         }
+
+        assert!(observed_taken, "no taken native case for {condition:?}");
+        assert!(
+            observed_not_taken,
+            "no not-taken native case for {condition:?}"
+        );
     }
 }
 
