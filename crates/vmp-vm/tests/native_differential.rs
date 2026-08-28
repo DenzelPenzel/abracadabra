@@ -6,12 +6,14 @@ use iced_x86::{Decoder, DecoderOptions};
 use vmp_ir::{
     BasicBlock, BlockId, CompileStage, Function, Instruction as NativeInstruction, Terminator,
 };
+use vmp_pe::PeFile;
 use vmp_types::{Architecture, Rva};
 use vmp_vm::{
     bytecode::{decode, encode, Register, Width},
     host::{execute, MachineState, Termination},
     lowering::lower,
 };
+use vmp_x86::{decode_function, Image};
 
 const CF: u64 = 1 << 0;
 const PF: u64 = 1 << 2;
@@ -42,6 +44,9 @@ struct NativeMovResult {
     flags_after: u64,
 }
 
+const BRANCH_EQUAL: u64 = 0x2222_2222_2222_2222;
+const BRANCH_NOT_EQUAL: u64 = 0x1111_1111_1111_1111;
+
 #[test]
 fn native_arithmetic_matches_lowered_decoded_host_v1() {
     for operation in [Operation::Add, Operation::Sub, Operation::Xor] {
@@ -59,6 +64,85 @@ fn native_mov_matches_lowered_decoded_host_v1() {
         compare_native_mov_with_lowered(width, false);
         compare_native_mov_with_lowered(width, true);
     }
+}
+
+#[test]
+fn native_conditional_and_join_branches_match_lowered_decoded_host_v1() {
+    for (lhs, rhs) in [(0, 0), (1, 2), (u64::MAX, u64::MAX), (0, u64::MAX)] {
+        let function = branching_function();
+        let lowered = lower(&function).expect("curated branch function must lower");
+        let encoded = encode(&lowered).expect("lowered branch program must encode");
+        let decoded = decode(&encoded).expect("physical branch program must decode independently");
+
+        let mut initial = MachineState::default();
+        initial.set_register(Register::Rax, lhs);
+        initial.set_register(Register::Rcx, rhs);
+        let vm = execute(&decoded, initial).expect("lowered branch function must terminate");
+        let native = run_native_branch(lhs, rhs);
+
+        assert_eq!(vm.termination(), Termination::Ret);
+        assert_eq!(vm.state().stack_len(), 0);
+        assert_eq!(vm.state().register(Register::Rax), native.rax);
+        assert_eq!(vm.state().flags_defined(), ARITHMETIC_DEFINED);
+        assert_eq!(
+            vm.state().flags_bits() & ARITHMETIC_DEFINED,
+            native.rflags & ARITHMETIC_DEFINED,
+            "flag mismatch for lhs=0x{lhs:x}, rhs=0x{rhs:x}"
+        );
+    }
+}
+
+fn branching_function() -> Function {
+    // sub rax, rcx; je equal; mov rax, NOT_EQUAL; jmp end;
+    // equal: mov rax, EQUAL; end: ret
+    let text = [
+        0x48, 0x29, 0xc8, 0x74, 0x0c, 0x48, 0xb8, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+        0xeb, 0x0a, 0x48, 0xb8, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0xc3,
+    ];
+    let image = minimal_pe64(&text);
+    let pe = PeFile::parse(&image).expect("branch fixture must be a valid PE32+ image");
+    decode_function(Image::new(&pe, &image), Rva(0x1000))
+        .expect("production decoder must recover the branch CFG")
+}
+
+fn minimal_pe64(text: &[u8]) -> Vec<u8> {
+    let mut image = vec![0u8; 0x400];
+    put_u16(&mut image, 0, 0x5a4d);
+    put_u32(&mut image, 0x3c, 0x40);
+    put_u32(&mut image, 0x40, 0x0000_4550);
+    put_u16(&mut image, 0x44, 0x8664);
+    put_u16(&mut image, 0x46, 1);
+    put_u16(&mut image, 0x54, 240);
+    put_u16(&mut image, 0x58, 0x20b);
+    put_u32(&mut image, 0x58 + 16, 0x1000);
+    put_u64(&mut image, 0x58 + 24, 0x1_4000_0000);
+    put_u32(&mut image, 0x58 + 32, 0x1000);
+    put_u32(&mut image, 0x58 + 36, 0x200);
+    put_u32(&mut image, 0x58 + 56, 0x2000);
+    put_u32(&mut image, 0x58 + 60, 0x200);
+    put_u16(&mut image, 0x58 + 68, 3);
+    put_u32(&mut image, 0x58 + 108, 16);
+    let section = 0x148;
+    image[section..section + 5].copy_from_slice(b".text");
+    put_u32(&mut image, section + 8, 0x200);
+    put_u32(&mut image, section + 12, 0x1000);
+    put_u32(&mut image, section + 16, 0x200);
+    put_u32(&mut image, section + 20, 0x200);
+    put_u32(&mut image, section + 36, 0x6000_0020);
+    image[0x200..0x200 + text.len()].copy_from_slice(text);
+    image
+}
+
+fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
 fn edge_vectors(operation: Operation, width: Width) -> [(u64, u64); 6] {
@@ -303,6 +387,48 @@ fn run_native(operation: Operation, width: Width, lhs: u64, rhs: u64) -> NativeR
         (Operation::Xor, Width::Qword) => execute!("xor rax, rcx"),
     }
 
+    NativeResult {
+        rax: result,
+        rflags,
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the x86-64 CPU oracle is isolated to this target-only test harness"
+)]
+fn run_native_branch(lhs: u64, rhs: u64) -> NativeResult {
+    let mut result = lhs;
+    let rflags: u64;
+
+    // SAFETY: the sequence uses only declared RAX/RCX operands, records RFLAGS
+    // in declared RDX, and balances its temporary stack push/pop.
+    unsafe {
+        asm!(
+            "sub rax, rcx",
+            "je 2f",
+            "mov rax, 0x1111111111111111",
+            "jmp 3f",
+            "2:",
+            "mov rax, 0x2222222222222222",
+            "3:",
+            "pushfq",
+            "pop rdx",
+            inout("rax") result,
+            in("rcx") rhs,
+            lateout("rdx") rflags,
+        );
+    }
+
+    let expected = if lhs == rhs {
+        BRANCH_EQUAL
+    } else {
+        BRANCH_NOT_EQUAL
+    };
+    assert_eq!(
+        result, expected,
+        "native branch oracle selected the wrong arm"
+    );
     NativeResult {
         rax: result,
         rflags,
