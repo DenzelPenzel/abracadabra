@@ -198,6 +198,21 @@ fn malformed_instruction_fields_are_typed_and_fail_closed() {
             value: 3
         })
     ));
+    assert_eq!(
+        decode(&container(&[0x13, 3], 0)),
+        Err(DecodeError::InvalidWidth {
+            code_offset: 0,
+            value: 3,
+        })
+    );
+    assert_eq!(
+        decode(&container(&[0x13], 0)),
+        Err(DecodeError::TruncatedInstruction {
+            code_offset: 0,
+            needed: 2,
+            remaining: 1,
+        })
+    );
     assert!(matches!(
         decode(&container(&[0x11, 4, 4], 0)),
         Err(DecodeError::InvalidRegister {
