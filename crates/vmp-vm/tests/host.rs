@@ -112,6 +112,37 @@ fn drop_discards_a_typed_slot_without_changing_registers_or_flags() {
 }
 
 #[test]
+fn drop_rejects_underflow_and_a_mismatched_slot_width() {
+    assert_eq!(
+        execute(
+            &Program::new(0, vec![Instruction::Drop(Width::Byte)]),
+            MachineState::default(),
+        ),
+        Err(ExecutionError::StackUnderflow)
+    );
+
+    assert_eq!(
+        execute(
+            &Program::new(
+                0,
+                vec![
+                    Instruction::PushImm {
+                        width: Width::Word,
+                        value: 1,
+                    },
+                    Instruction::Drop(Width::Byte),
+                ],
+            ),
+            MachineState::default(),
+        ),
+        Err(ExecutionError::PopWidthMismatch {
+            expected: Width::Byte,
+            actual: Width::Word,
+        })
+    );
+}
+
+#[test]
 fn byte_xor_clears_carry_overflow_and_makes_auxiliary_undefined() {
     let program = Program::new(
         0,
