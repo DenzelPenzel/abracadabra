@@ -214,6 +214,15 @@ pub fn execute(program: &Program, mut state: MachineState) -> Result<Execution, 
                 }
                 write_register(&mut state, *register, *width, slot.value);
             }
+            Instruction::Drop(width) => {
+                let slot = state.pop()?;
+                if slot.width != *width {
+                    return Err(ExecutionError::PopWidthMismatch {
+                        expected: *width,
+                        actual: slot.width,
+                    });
+                }
+            }
             Instruction::Add(width) => execute_add(&mut state, *width)?,
             Instruction::Sub(width) => execute_sub(&mut state, *width)?,
             Instruction::Xor(width) => execute_xor(&mut state, *width)?,

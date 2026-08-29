@@ -162,6 +162,7 @@ pub enum Instruction {
     PushImm { width: Width, value: u64 },
     PushReg { width: Width, register: Register },
     PopReg { width: Width, register: Register },
+    Drop(Width),
     Add(Width),
     Sub(Width),
     Xor(Width),
@@ -175,7 +176,7 @@ impl Instruction {
             Self::Ret => 1,
             Self::PushImm { width, .. } => 2 + width.byte_len(),
             Self::PushReg { .. } | Self::PopReg { .. } => 3,
-            Self::Add(_) | Self::Sub(_) | Self::Xor(_) => 2,
+            Self::Drop(_) | Self::Add(_) | Self::Sub(_) | Self::Xor(_) => 2,
             Self::Jmp { .. } => 5,
             Self::Jcc { .. } => 6,
         }
@@ -370,6 +371,7 @@ fn encode_instruction(instruction: &Instruction, output: &mut Vec<u8>) {
         Instruction::PopReg { width, register } => {
             output.extend_from_slice(&[0x12, *width as u8, register.id()]);
         }
+        Instruction::Drop(width) => output.extend_from_slice(&[0x13, *width as u8]),
         Instruction::Add(width) => output.extend_from_slice(&[0x20, *width as u8]),
         Instruction::Sub(width) => output.extend_from_slice(&[0x21, *width as u8]),
         Instruction::Xor(width) => output.extend_from_slice(&[0x22, *width as u8]),
@@ -487,6 +489,12 @@ fn decode_instruction(
                 Ok(Instruction::PopReg { width, register })
             }
         }
+        0x13 => Ok(Instruction::Drop(decode_width(
+            code,
+            cursor,
+            instruction_offset,
+            code_offset,
+        )?)),
         0x20..=0x22 => {
             let width = decode_width(code, cursor, instruction_offset, code_offset)?;
             match opcode {

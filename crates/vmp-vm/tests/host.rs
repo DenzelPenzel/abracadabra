@@ -84,6 +84,65 @@ fn byte_sub_pops_rhs_then_lhs_and_sets_borrow_flags() {
 }
 
 #[test]
+fn drop_discards_a_typed_slot_without_changing_registers_or_flags() {
+    let program = Program::new(
+        0,
+        vec![
+            Instruction::PushImm {
+                width: Width::Word,
+                value: 0x1234,
+            },
+            Instruction::Drop(Width::Word),
+            Instruction::Ret,
+        ],
+    );
+    let mut initial = MachineState::default();
+    initial.set_register(Register::Rax, 0x1122_3344_5566_7788);
+    initial.set_flags(0x805, 0x8d5);
+
+    let execution = execute(&program, initial).expect("typed drop must execute");
+    let state = execution.state();
+
+    assert_eq!(execution.termination(), Termination::Ret);
+    assert_eq!(state.register(Register::Rax), 0x1122_3344_5566_7788);
+    assert_eq!(state.flags_bits(), 0x805);
+    assert_eq!(state.flags_defined(), 0x8d5);
+    assert_eq!(state.stack_len(), 0);
+    assert_eq!(state.steps(), 3);
+}
+
+#[test]
+fn drop_rejects_underflow_and_a_mismatched_slot_width() {
+    assert_eq!(
+        execute(
+            &Program::new(0, vec![Instruction::Drop(Width::Byte)]),
+            MachineState::default(),
+        ),
+        Err(ExecutionError::StackUnderflow)
+    );
+
+    assert_eq!(
+        execute(
+            &Program::new(
+                0,
+                vec![
+                    Instruction::PushImm {
+                        width: Width::Word,
+                        value: 1,
+                    },
+                    Instruction::Drop(Width::Byte),
+                ],
+            ),
+            MachineState::default(),
+        ),
+        Err(ExecutionError::PopWidthMismatch {
+            expected: Width::Byte,
+            actual: Width::Word,
+        })
+    );
+}
+
+#[test]
 fn byte_xor_clears_carry_overflow_and_makes_auxiliary_undefined() {
     let program = Program::new(
         0,

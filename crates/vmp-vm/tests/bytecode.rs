@@ -72,6 +72,31 @@ fn v1_golden_program_is_byte_exact_and_decodes() {
 }
 
 #[test]
+fn drop_has_an_independently_pinned_wire_encoding() {
+    let program = Program::new(
+        0,
+        vec![
+            Instruction::PushImm {
+                width: Width::Word,
+                value: 0x1234,
+            },
+            Instruction::Drop(Width::Word),
+            Instruction::Ret,
+        ],
+    );
+    let expected = [
+        0x56, 0x4d, 0x50, 0x42, 0x01, 0x00, 0x10, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x10, 0x02, 0x34, 0x12, 0x13, 0x02, 0x01,
+    ];
+
+    assert_eq!(encode(&program).expect("drop must encode"), expected);
+    assert_eq!(
+        decode(&expected).expect("physical drop must decode"),
+        program
+    );
+}
+
+#[test]
 fn declared_container_limit_rejects_one_over_before_length_mismatch() {
     let mut input = [0u8; 16];
     input[0..4].copy_from_slice(b"VMPB");
@@ -131,6 +156,7 @@ fn every_typed_width_register_and_condition_round_trips() {
     let mut instructions = Vec::new();
     for width in widths {
         instructions.push(Instruction::PushImm { width, value: 1 });
+        instructions.push(Instruction::Drop(width));
         instructions.push(Instruction::Add(width));
         instructions.push(Instruction::Sub(width));
         instructions.push(Instruction::Xor(width));
@@ -172,6 +198,21 @@ fn malformed_instruction_fields_are_typed_and_fail_closed() {
             value: 3
         })
     ));
+    assert_eq!(
+        decode(&container(&[0x13, 3], 0)),
+        Err(DecodeError::InvalidWidth {
+            code_offset: 0,
+            value: 3,
+        })
+    );
+    assert_eq!(
+        decode(&container(&[0x13], 0)),
+        Err(DecodeError::TruncatedInstruction {
+            code_offset: 0,
+            needed: 2,
+            remaining: 1,
+        })
+    );
     assert!(matches!(
         decode(&container(&[0x11, 4, 4], 0)),
         Err(DecodeError::InvalidRegister {
