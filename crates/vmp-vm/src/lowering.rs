@@ -576,7 +576,7 @@ fn lower_instruction(
             push_source(lowered, instruction.rva(), raw, width)?;
             lowered.push(Instruction::PopReg { width, register })?;
         }
-        mnemonic @ (Mnemonic::Add | Mnemonic::Sub | Mnemonic::Xor)
+        mnemonic @ (Mnemonic::Add | Mnemonic::Sub | Mnemonic::Xor | Mnemonic::Cmp)
             if raw.op_count() == 2 && raw.op0_kind() == OpKind::Register =>
         {
             let (register, width) = lower_register(instruction.rva(), raw.op0_register())?;
@@ -584,11 +584,15 @@ fn lower_instruction(
             push_source(lowered, instruction.rva(), raw, width)?;
             lowered.push(match mnemonic {
                 Mnemonic::Add => Instruction::Add(width),
-                Mnemonic::Sub => Instruction::Sub(width),
+                Mnemonic::Sub | Mnemonic::Cmp => Instruction::Sub(width),
                 Mnemonic::Xor => Instruction::Xor(width),
                 _ => unreachable!("guarded arithmetic mnemonic"),
             })?;
-            lowered.push(Instruction::PopReg { width, register })?;
+            if mnemonic == Mnemonic::Cmp {
+                lowered.push(Instruction::Drop(width))?;
+            } else {
+                lowered.push(Instruction::PopReg { width, register })?;
+            }
         }
         Mnemonic::Jmp if raw.is_jmp_short_or_near() => {
             push_branch(
