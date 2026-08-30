@@ -141,12 +141,14 @@ fn lowers_every_supported_gpr_width_operation_and_source_form() {
                 Code::Add_rm8_r8,
                 Code::Sub_rm8_r8,
                 Code::Xor_rm8_r8,
+                Code::Cmp_rm8_r8,
             ],
             [
                 Code::Mov_r8_imm8,
                 Code::Add_rm8_imm8,
                 Code::Sub_rm8_imm8,
                 Code::Xor_rm8_imm8,
+                Code::Cmp_rm8_imm8,
             ],
         ),
         (
@@ -157,12 +159,14 @@ fn lowers_every_supported_gpr_width_operation_and_source_form() {
                 Code::Add_rm16_r16,
                 Code::Sub_rm16_r16,
                 Code::Xor_rm16_r16,
+                Code::Cmp_rm16_r16,
             ],
             [
                 Code::Mov_r16_imm16,
                 Code::Add_rm16_imm16,
                 Code::Sub_rm16_imm16,
                 Code::Xor_rm16_imm16,
+                Code::Cmp_rm16_imm16,
             ],
         ),
         (
@@ -173,12 +177,14 @@ fn lowers_every_supported_gpr_width_operation_and_source_form() {
                 Code::Add_rm32_r32,
                 Code::Sub_rm32_r32,
                 Code::Xor_rm32_r32,
+                Code::Cmp_rm32_r32,
             ],
             [
                 Code::Mov_r32_imm32,
                 Code::Add_rm32_imm32,
                 Code::Sub_rm32_imm32,
                 Code::Xor_rm32_imm32,
+                Code::Cmp_rm32_imm32,
             ],
         ),
         (
@@ -189,12 +195,14 @@ fn lowers_every_supported_gpr_width_operation_and_source_form() {
                 Code::Add_rm64_r64,
                 Code::Sub_rm64_r64,
                 Code::Xor_rm64_r64,
+                Code::Cmp_rm64_r64,
             ],
             [
                 Code::Mov_r64_imm64,
                 Code::Add_rm64_imm32,
                 Code::Sub_rm64_imm32,
                 Code::Xor_rm64_imm32,
+                Code::Cmp_rm64_imm32,
             ],
         ),
     ];
@@ -214,7 +222,7 @@ fn lowers_every_supported_gpr_width_operation_and_source_form() {
             let source = native[source_index];
             let logical_destination = logical[destination_index];
             let logical_source = logical[source_index];
-            for operation_index in 0..4 {
+            for operation_index in 0..5 {
                 let raw =
                     IcedInstruction::with2(register_codes[operation_index], destination, source)
                         .expect("matrix register form must construct");
@@ -258,6 +266,7 @@ fn operation(index: usize, width: Width) -> Instruction {
         1 => Instruction::Add(width),
         2 => Instruction::Sub(width),
         3 => Instruction::Xor(width),
+        4 => Instruction::Sub(width),
         _ => unreachable!("MOV has no arithmetic operation"),
     }
 }
@@ -280,7 +289,7 @@ fn expected_register_form(
             },
         ];
     }
-    vec![
+    let mut expected = vec![
         Instruction::PushReg {
             width,
             register: destination,
@@ -290,11 +299,16 @@ fn expected_register_form(
             register: source,
         },
         operation(operation_index, width),
-        Instruction::PopReg {
+    ];
+    if operation_index == 4 {
+        expected.push(Instruction::Drop(width));
+    } else {
+        expected.push(Instruction::PopReg {
             width,
             register: destination,
-        },
-    ]
+        });
+    }
+    expected
 }
 
 fn expected_immediate_form(
@@ -311,16 +325,21 @@ fn expected_immediate_form(
             },
         ];
     }
-    vec![
+    let mut expected = vec![
         Instruction::PushReg {
             width,
             register: destination,
         },
         Instruction::PushImm { width, value: 1 },
         operation(operation_index, width),
-        Instruction::PopReg {
+    ];
+    if operation_index == 4 {
+        expected.push(Instruction::Drop(width));
+    } else {
+        expected.push(Instruction::PopReg {
             width,
             register: destination,
-        },
-    ]
+        });
+    }
+    expected
 }
