@@ -164,11 +164,11 @@ fn branch_vectors() -> [(u64, u64); 8] {
 }
 
 fn branching_function(condition: Condition) -> Function {
-    // sub rax, rcx; jcc taken; mov rax, NOT_TAKEN; jmp end;
+    // cmp rax, rcx; jcc taken; mov rax, NOT_TAKEN; jmp end;
     // taken: mov rax, TAKEN; end: ret
     let text = [
         0x48,
-        0x29,
+        0x39,
         0xc8,
         0x70 | condition as u8,
         0x0c,
@@ -598,7 +598,7 @@ fn run_native_branch(condition: Condition, lhs: u64, rhs: u64) -> NativeResult {
             // RFLAGS in declared RDX, and balances its temporary stack push/pop.
             unsafe {
                 asm!(
-                    "sub rax, rcx",
+                    "cmp rax, rcx",
                     $jump,
                     "mov rax, 0x1111111111111111",
                     "jmp 3f",
