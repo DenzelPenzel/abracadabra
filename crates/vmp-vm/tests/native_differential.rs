@@ -38,6 +38,13 @@ struct NativeResult {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct NativeCmpResult {
+    rax: u64,
+    rcx: u64,
+    rflags: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct NativeMovResult {
     rax: u64,
     flags_before: u64,
@@ -53,6 +60,20 @@ fn native_arithmetic_matches_lowered_decoded_host_v1() {
         for width in [Width::Byte, Width::Word, Width::Dword, Width::Qword] {
             for (lhs, rhs) in edge_vectors(operation, width) {
                 compare_native_with_lowered(operation, width, lhs, rhs);
+            }
+        }
+    }
+}
+
+#[test]
+fn native_cmp_preserves_operands_and_matches_lowered_flags_v1() {
+    for width in [Width::Byte, Width::Word, Width::Dword, Width::Qword] {
+        for (lhs, rhs) in edge_vectors(Operation::Sub, width) {
+            compare_native_cmp_with_lowered(width, None, lhs, rhs);
+        }
+        for immediate in [1, -1] {
+            for (lhs, _) in edge_vectors(Operation::Sub, width) {
+                compare_native_cmp_with_lowered(width, Some(immediate), lhs, 0x8877_6655_4433_2211);
             }
         }
     }
@@ -143,11 +164,11 @@ fn branch_vectors() -> [(u64, u64); 8] {
 }
 
 fn branching_function(condition: Condition) -> Function {
-    // sub rax, rcx; jcc taken; mov rax, NOT_TAKEN; jmp end;
+    // cmp rax, rcx; jcc taken; mov rax, NOT_TAKEN; jmp end;
     // taken: mov rax, TAKEN; end: ret
     let text = [
         0x48,
-        0x29,
+        0x39,
         0xc8,
         0x70 | condition as u8,
         0x0c,
@@ -293,6 +314,37 @@ fn compare_native_with_lowered(operation: Operation, width: Width, lhs: u64, rhs
     );
 }
 
+fn compare_native_cmp_with_lowered(width: Width, immediate: Option<i8>, lhs: u64, rcx: u64) {
+    let bytes = cmp_physical_bytes(width, immediate);
+    let image = minimal_pe64(&bytes);
+    let pe = PeFile::parse(&image).expect("CMP fixture must be a valid PE32+ image");
+    let function = decode_function(Image::new(&pe, &image), Rva(0x1000))
+        .expect("production decoder must recover the CMP function");
+    let lowered = lower(&function).expect("curated CMP must lower");
+    let encoded = encode(&lowered).expect("lowered CMP v1 must encode");
+    let decoded = decode(&encoded).expect("physical CMP v1 must decode independently");
+    let native = run_native_cmp(width, immediate, lhs, rcx);
+
+    assert_eq!(native.rax, lhs, "native CMP changed RAX for {width:?}");
+    assert_eq!(native.rcx, rcx, "native CMP changed RCX for {width:?}");
+
+    let mut initial = MachineState::default();
+    initial.set_register(Register::Rax, lhs);
+    initial.set_register(Register::Rcx, rcx);
+    let vm = execute(&decoded, initial).expect("lowered CMP must terminate");
+
+    assert_eq!(vm.termination(), Termination::Ret);
+    assert_eq!(vm.state().stack_len(), 0);
+    assert_eq!(vm.state().register(Register::Rax), native.rax);
+    assert_eq!(vm.state().register(Register::Rcx), native.rcx);
+    assert_eq!(vm.state().flags_defined(), ARITHMETIC_DEFINED);
+    assert_eq!(
+        vm.state().flags_bits() & ARITHMETIC_DEFINED,
+        native.rflags & ARITHMETIC_DEFINED,
+        "CMP flag mismatch for {width:?}, immediate={immediate:?}, lhs=0x{lhs:x}"
+    );
+}
+
 fn compare_native_mov_with_lowered(width: Width, immediate: bool) {
     let initial_rax = 0x1122_3344_5566_7788;
     let source = if immediate {
@@ -344,6 +396,24 @@ fn physical_bytes(operation: Operation, width: Width) -> Vec<u8> {
         Width::Word => vec![0x66, other_opcode, 0xc8, 0xc3],
         Width::Dword => vec![other_opcode, 0xc8, 0xc3],
         Width::Qword => vec![0x48, other_opcode, 0xc8, 0xc3],
+    }
+}
+
+fn cmp_physical_bytes(width: Width, immediate: Option<i8>) -> Vec<u8> {
+    if let Some(immediate) = immediate {
+        let immediate = immediate as u8;
+        return match width {
+            Width::Byte => vec![0x80, 0xf8, immediate, 0xc3],
+            Width::Word => vec![0x66, 0x83, 0xf8, immediate, 0xc3],
+            Width::Dword => vec![0x83, 0xf8, immediate, 0xc3],
+            Width::Qword => vec![0x48, 0x83, 0xf8, immediate, 0xc3],
+        };
+    }
+    match width {
+        Width::Byte => vec![0x38, 0xc8, 0xc3],
+        Width::Word => vec![0x66, 0x39, 0xc8, 0xc3],
+        Width::Dword => vec![0x39, 0xc8, 0xc3],
+        Width::Qword => vec![0x48, 0x39, 0xc8, 0xc3],
     }
 }
 
@@ -473,6 +543,51 @@ fn run_native(operation: Operation, width: Width, lhs: u64, rhs: u64) -> NativeR
     unsafe_code,
     reason = "the x86-64 CPU oracle is isolated to this target-only test harness"
 )]
+fn run_native_cmp(width: Width, immediate: Option<i8>, lhs: u64, rhs: u64) -> NativeCmpResult {
+    let mut rax = lhs;
+    let mut rcx = rhs;
+    let rflags: u64;
+
+    macro_rules! execute {
+        ($instruction:literal) => {
+            // SAFETY: CMP does not modify its declared RAX/RCX operands, RFLAGS
+            // is recorded in declared RDX, and the temporary push/pop is balanced.
+            unsafe {
+                asm!(
+                    $instruction,
+                    "pushfq",
+                    "pop rdx",
+                    inout("rax") rax,
+                    inout("rcx") rcx,
+                    lateout("rdx") rflags,
+                );
+            }
+        };
+    }
+
+    match (width, immediate) {
+        (Width::Byte, None) => execute!("cmp al, cl"),
+        (Width::Word, None) => execute!("cmp ax, cx"),
+        (Width::Dword, None) => execute!("cmp eax, ecx"),
+        (Width::Qword, None) => execute!("cmp rax, rcx"),
+        (Width::Byte, Some(1)) => execute!("cmp al, 1"),
+        (Width::Word, Some(1)) => execute!("cmp ax, 1"),
+        (Width::Dword, Some(1)) => execute!("cmp eax, 1"),
+        (Width::Qword, Some(1)) => execute!("cmp rax, 1"),
+        (Width::Byte, Some(-1)) => execute!("cmp al, -1"),
+        (Width::Word, Some(-1)) => execute!("cmp ax, -1"),
+        (Width::Dword, Some(-1)) => execute!("cmp eax, -1"),
+        (Width::Qword, Some(-1)) => execute!("cmp rax, -1"),
+        (_, Some(immediate)) => unreachable!("unsupported CMP immediate {immediate}"),
+    }
+
+    NativeCmpResult { rax, rcx, rflags }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the x86-64 CPU oracle is isolated to this target-only test harness"
+)]
 fn run_native_branch(condition: Condition, lhs: u64, rhs: u64) -> NativeResult {
     let mut result = lhs;
     let rflags: u64;
@@ -483,7 +598,7 @@ fn run_native_branch(condition: Condition, lhs: u64, rhs: u64) -> NativeResult {
             // RFLAGS in declared RDX, and balances its temporary stack push/pop.
             unsafe {
                 asm!(
-                    "sub rax, rcx",
+                    "cmp rax, rcx",
                     $jump,
                     "mov rax, 0x1111111111111111",
                     "jmp 3f",
