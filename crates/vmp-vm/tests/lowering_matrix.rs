@@ -142,6 +142,7 @@ fn lowers_every_supported_gpr_width_operation_and_source_form() {
                 Code::Sub_rm8_r8,
                 Code::Xor_rm8_r8,
                 Code::And_rm8_r8,
+                Code::Or_rm8_r8,
                 Code::Cmp_rm8_r8,
                 Code::Test_rm8_r8,
             ],
@@ -151,6 +152,7 @@ fn lowers_every_supported_gpr_width_operation_and_source_form() {
                 Code::Sub_rm8_imm8,
                 Code::Xor_rm8_imm8,
                 Code::And_rm8_imm8,
+                Code::Or_rm8_imm8,
                 Code::Cmp_rm8_imm8,
                 Code::Test_rm8_imm8,
             ],
@@ -164,6 +166,7 @@ fn lowers_every_supported_gpr_width_operation_and_source_form() {
                 Code::Sub_rm16_r16,
                 Code::Xor_rm16_r16,
                 Code::And_rm16_r16,
+                Code::Or_rm16_r16,
                 Code::Cmp_rm16_r16,
                 Code::Test_rm16_r16,
             ],
@@ -173,6 +176,7 @@ fn lowers_every_supported_gpr_width_operation_and_source_form() {
                 Code::Sub_rm16_imm16,
                 Code::Xor_rm16_imm16,
                 Code::And_rm16_imm16,
+                Code::Or_rm16_imm16,
                 Code::Cmp_rm16_imm16,
                 Code::Test_rm16_imm16,
             ],
@@ -186,6 +190,7 @@ fn lowers_every_supported_gpr_width_operation_and_source_form() {
                 Code::Sub_rm32_r32,
                 Code::Xor_rm32_r32,
                 Code::And_rm32_r32,
+                Code::Or_rm32_r32,
                 Code::Cmp_rm32_r32,
                 Code::Test_rm32_r32,
             ],
@@ -195,6 +200,7 @@ fn lowers_every_supported_gpr_width_operation_and_source_form() {
                 Code::Sub_rm32_imm32,
                 Code::Xor_rm32_imm32,
                 Code::And_rm32_imm32,
+                Code::Or_rm32_imm32,
                 Code::Cmp_rm32_imm32,
                 Code::Test_rm32_imm32,
             ],
@@ -208,6 +214,7 @@ fn lowers_every_supported_gpr_width_operation_and_source_form() {
                 Code::Sub_rm64_r64,
                 Code::Xor_rm64_r64,
                 Code::And_rm64_r64,
+                Code::Or_rm64_r64,
                 Code::Cmp_rm64_r64,
                 Code::Test_rm64_r64,
             ],
@@ -217,6 +224,7 @@ fn lowers_every_supported_gpr_width_operation_and_source_form() {
                 Code::Sub_rm64_imm32,
                 Code::Xor_rm64_imm32,
                 Code::And_rm64_imm32,
+                Code::Or_rm64_imm32,
                 Code::Cmp_rm64_imm32,
                 Code::Test_rm64_imm32,
             ],
@@ -238,7 +246,7 @@ fn lowers_every_supported_gpr_width_operation_and_source_form() {
             let source = native[source_index];
             let logical_destination = logical[destination_index];
             let logical_source = logical[source_index];
-            for operation_index in 0..7 {
+            for operation_index in 0..8 {
                 let raw =
                     IcedInstruction::with2(register_codes[operation_index], destination, source)
                         .expect("matrix register form must construct");
@@ -282,8 +290,9 @@ fn operation(index: usize, width: Width) -> Instruction {
         1 => Instruction::Add(width),
         2 => Instruction::Sub(width),
         3 => Instruction::Xor(width),
-        4 | 6 => Instruction::And(width),
-        5 => Instruction::Sub(width),
+        4 | 7 => Instruction::And(width),
+        5 => Instruction::Or(width),
+        6 => Instruction::Sub(width),
         _ => unreachable!("MOV has no arithmetic operation"),
     }
 }
@@ -317,7 +326,7 @@ fn expected_register_form(
         },
         operation(operation_index, width),
     ];
-    if matches!(operation_index, 5 | 6) {
+    if matches!(operation_index, 6 | 7) {
         expected.push(Instruction::Drop(width));
     } else {
         expected.push(Instruction::PopReg {
@@ -350,7 +359,7 @@ fn expected_immediate_form(
         Instruction::PushImm { width, value: 1 },
         operation(operation_index, width),
     ];
-    if matches!(operation_index, 5 | 6) {
+    if matches!(operation_index, 6 | 7) {
         expected.push(Instruction::Drop(width));
     } else {
         expected.push(Instruction::PopReg {

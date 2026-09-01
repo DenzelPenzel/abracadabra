@@ -30,6 +30,7 @@ enum Operation {
     Sub,
     Xor,
     And,
+    Or,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -75,6 +76,20 @@ fn native_and_matches_lowered_decoded_host_v1() {
         for immediate in [1, -1] {
             for (lhs, _) in edge_vectors(Operation::And, width) {
                 compare_native_and_immediate_with_lowered(width, immediate, lhs);
+            }
+        }
+    }
+}
+
+#[test]
+fn native_or_matches_lowered_decoded_host_v1() {
+    for width in [Width::Byte, Width::Word, Width::Dword, Width::Qword] {
+        for (lhs, rhs) in edge_vectors(Operation::Or, width) {
+            compare_native_with_lowered(Operation::Or, width, lhs, rhs);
+        }
+        for immediate in [1, -1] {
+            for (lhs, _) in edge_vectors(Operation::Or, width) {
+                compare_native_or_immediate_with_lowered(width, immediate, lhs);
             }
         }
     }
@@ -438,6 +453,14 @@ fn edge_vectors(operation: Operation, width: Width) -> [(u64, u64); 6] {
             (sign_max, mask),
             (0x1122_3344_5566_7788, 0x8877_6655_4433_2211),
         ],
+        Operation::Or => [
+            (0, 0),
+            (1, 1),
+            (sign, 0),
+            (mask, sign),
+            (sign_max, mask),
+            (0x1122_3344_5566_7788, 0x8877_6655_4433_2211),
+        ],
     }
 }
 
@@ -455,7 +478,7 @@ fn compare_native_with_lowered(operation: Operation, width: Width, lhs: u64, rhs
     let native = run_native(operation, width, lhs, rhs);
     let defined = match operation {
         Operation::Add | Operation::Sub => ARITHMETIC_DEFINED,
-        Operation::Xor | Operation::And => LOGICAL_DEFINED,
+        Operation::Xor | Operation::And | Operation::Or => LOGICAL_DEFINED,
     };
 
     assert_eq!(vm.termination(), Termination::Ret);
@@ -496,6 +519,28 @@ fn compare_native_and_immediate_with_lowered(width: Width, immediate: i8, lhs: u
         vm.state().flags_bits() & LOGICAL_DEFINED,
         native.rflags & LOGICAL_DEFINED,
         "immediate AND flag mismatch for {width:?}, immediate={immediate}, lhs=0x{lhs:x}"
+    );
+}
+
+fn compare_native_or_immediate_with_lowered(width: Width, immediate: i8, lhs: u64) {
+    let function = straight_line_function(&or_immediate_physical_bytes(width, immediate));
+    let lowered = lower(&function).expect("curated immediate OR must lower");
+    let encoded = encode(&lowered).expect("lowered immediate OR v1 must encode");
+    let decoded = decode(&encoded).expect("physical immediate OR v1 must decode independently");
+
+    let mut initial = MachineState::default();
+    initial.set_register(Register::Rax, lhs);
+    let vm = execute(&decoded, initial).expect("lowered immediate OR must terminate");
+    let native = run_native_or_immediate(width, immediate, lhs);
+
+    assert_eq!(vm.termination(), Termination::Ret);
+    assert_eq!(vm.state().stack_len(), 0);
+    assert_eq!(vm.state().register(Register::Rax), native.rax);
+    assert_eq!(vm.state().flags_defined(), LOGICAL_DEFINED);
+    assert_eq!(
+        vm.state().flags_bits() & LOGICAL_DEFINED,
+        native.rflags & LOGICAL_DEFINED,
+        "immediate OR flag mismatch for {width:?}, immediate={immediate}, lhs=0x{lhs:x}"
     );
 }
 
@@ -607,6 +652,7 @@ fn physical_bytes(operation: Operation, width: Width) -> Vec<u8> {
         Operation::Sub => (0x28, 0x29),
         Operation::Xor => (0x30, 0x31),
         Operation::And => (0x20, 0x21),
+        Operation::Or => (0x08, 0x09),
     };
     match width {
         Width::Byte => vec![byte_opcode, 0xc8, 0xc3],
@@ -623,6 +669,16 @@ fn and_immediate_physical_bytes(width: Width, immediate: i8) -> Vec<u8> {
         Width::Word => vec![0x66, 0x83, 0xe0, immediate, 0xc3],
         Width::Dword => vec![0x83, 0xe0, immediate, 0xc3],
         Width::Qword => vec![0x48, 0x83, 0xe0, immediate, 0xc3],
+    }
+}
+
+fn or_immediate_physical_bytes(width: Width, immediate: i8) -> Vec<u8> {
+    let immediate = immediate as u8;
+    match width {
+        Width::Byte => vec![0x80, 0xc8, immediate, 0xc3],
+        Width::Word => vec![0x66, 0x83, 0xc8, immediate, 0xc3],
+        Width::Dword => vec![0x83, 0xc8, immediate, 0xc3],
+        Width::Qword => vec![0x48, 0x83, 0xc8, immediate, 0xc3],
     }
 }
 
@@ -798,6 +854,10 @@ fn run_native(operation: Operation, width: Width, lhs: u64, rhs: u64) -> NativeR
         (Operation::And, Width::Word) => execute!("and ax, cx"),
         (Operation::And, Width::Dword) => execute!("and eax, ecx"),
         (Operation::And, Width::Qword) => execute!("and rax, rcx"),
+        (Operation::Or, Width::Byte) => execute!("or al, cl"),
+        (Operation::Or, Width::Word) => execute!("or ax, cx"),
+        (Operation::Or, Width::Dword) => execute!("or eax, ecx"),
+        (Operation::Or, Width::Qword) => execute!("or rax, rcx"),
     }
 
     NativeResult {
@@ -840,6 +900,48 @@ fn run_native_and_immediate(width: Width, immediate: i8, lhs: u64) -> NativeResu
         (Width::Dword, -1) => execute!("and eax, -1"),
         (Width::Qword, -1) => execute!("and rax, -1"),
         (_, immediate) => unreachable!("unsupported AND immediate {immediate}"),
+    }
+
+    NativeResult {
+        rax: result,
+        rflags,
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the x86-64 CPU oracle is isolated to this target-only test harness"
+)]
+fn run_native_or_immediate(width: Width, immediate: i8, lhs: u64) -> NativeResult {
+    let mut result = lhs;
+    let rflags: u64;
+
+    macro_rules! execute {
+        ($instruction:literal) => {
+            // SAFETY: OR modifies only declared RAX, records RFLAGS in declared
+            // RDX, and balances its temporary stack push/pop.
+            unsafe {
+                asm!(
+                    $instruction,
+                    "pushfq",
+                    "pop rdx",
+                    inout("rax") result,
+                    lateout("rdx") rflags,
+                );
+            }
+        };
+    }
+
+    match (width, immediate) {
+        (Width::Byte, 1) => execute!("or al, 1"),
+        (Width::Word, 1) => execute!("or ax, 1"),
+        (Width::Dword, 1) => execute!("or eax, 1"),
+        (Width::Qword, 1) => execute!("or rax, 1"),
+        (Width::Byte, -1) => execute!("or al, -1"),
+        (Width::Word, -1) => execute!("or ax, -1"),
+        (Width::Dword, -1) => execute!("or eax, -1"),
+        (Width::Qword, -1) => execute!("or rax, -1"),
+        (_, immediate) => unreachable!("unsupported OR immediate {immediate}"),
     }
 
     NativeResult {

@@ -250,6 +250,77 @@ fn and_rejects_underflow_and_mismatched_operand_widths() {
 }
 
 #[test]
+fn byte_or_clears_carry_overflow_and_makes_auxiliary_undefined() {
+    let program = Program::new(
+        0,
+        vec![
+            Instruction::PushImm {
+                width: Width::Byte,
+                value: 0xf0,
+            },
+            Instruction::PushImm {
+                width: Width::Byte,
+                value: 0x0f,
+            },
+            Instruction::Or(Width::Byte),
+            Instruction::PopReg {
+                width: Width::Byte,
+                register: Register::Rax,
+            },
+            Instruction::Ret,
+        ],
+    );
+    let mut initial = MachineState::default();
+    initial.set_flags(u64::MAX, u64::MAX);
+
+    let execution = execute(&program, initial).expect("or must execute");
+    let state = execution.state();
+    let modeled = (1 << 0) | (1 << 2) | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 11);
+
+    assert_eq!(state.register(Register::Rax), 0xff);
+    assert_eq!(state.flags_defined(), !(1 << 4));
+    assert_eq!(
+        state.flags_bits() & state.flags_defined(),
+        !modeled | (1 << 2) | (1 << 7)
+    );
+}
+
+#[test]
+fn or_rejects_underflow_and_mismatched_operand_widths() {
+    assert_eq!(
+        execute(
+            &Program::new(0, vec![Instruction::Or(Width::Byte)]),
+            MachineState::default(),
+        ),
+        Err(ExecutionError::StackUnderflow)
+    );
+    assert_eq!(
+        execute(
+            &Program::new(
+                0,
+                vec![
+                    Instruction::PushImm {
+                        width: Width::Byte,
+                        value: 1,
+                    },
+                    Instruction::PushImm {
+                        width: Width::Word,
+                        value: 1,
+                    },
+                    Instruction::Or(Width::Byte),
+                ],
+            ),
+            MachineState::default(),
+        ),
+        Err(ExecutionError::WidthMismatch {
+            instruction: Width::Byte,
+            lhs: Width::Byte,
+            rhs: Width::Word,
+        })
+    );
+}
+
+#[test]
 fn conditional_and_unconditional_branches_select_exact_boundaries() {
     let program = Program::new(
         0,
