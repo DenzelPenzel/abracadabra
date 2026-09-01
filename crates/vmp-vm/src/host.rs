@@ -227,6 +227,7 @@ pub fn execute(program: &Program, mut state: MachineState) -> Result<Execution, 
             Instruction::Sub(width) => execute_sub(&mut state, *width)?,
             Instruction::Xor(width) => execute_xor(&mut state, *width)?,
             Instruction::And(width) => execute_and(&mut state, *width)?,
+            Instruction::Or(width) => execute_or(&mut state, *width)?,
             Instruction::Jmp { target } => {
                 state.pc = *target;
                 continue;
@@ -402,6 +403,33 @@ fn execute_and(state: &mut MachineState, width: Width) -> Result<(), ExecutionEr
     require_binary_widths(width, lhs, rhs)?;
 
     let result = (lhs.value & rhs.value) & width.mask();
+    let sign = 1u64 << (width.byte_len() * 8 - 1);
+    let parity = (result & u64::from(u8::MAX)).count_ones().is_multiple_of(2);
+    let defined = CF | PF | ZF | SF | OF;
+    let mut bits = state.flags_bits & !MODELED_FLAGS;
+    if parity {
+        bits |= PF;
+    }
+    if result == 0 {
+        bits |= ZF;
+    }
+    if result & sign != 0 {
+        bits |= SF;
+    }
+    state.flags_bits = bits;
+    state.flags_defined = (state.flags_defined & !MODELED_FLAGS) | defined;
+    state.push(Slot {
+        width,
+        value: result,
+    })
+}
+
+fn execute_or(state: &mut MachineState, width: Width) -> Result<(), ExecutionError> {
+    let rhs = state.pop()?;
+    let lhs = state.pop()?;
+    require_binary_widths(width, lhs, rhs)?;
+
+    let result = (lhs.value | rhs.value) & width.mask();
     let sign = 1u64 << (width.byte_len() * 8 - 1);
     let parity = (result & u64::from(u8::MAX)).count_ones().is_multiple_of(2);
     let defined = CF | PF | ZF | SF | OF;

@@ -167,6 +167,7 @@ pub enum Instruction {
     Sub(Width),
     Xor(Width),
     And(Width),
+    Or(Width),
     Jmp { target: u32 },
     Jcc { condition: Condition, target: u32 },
 }
@@ -177,7 +178,12 @@ impl Instruction {
             Self::Ret => 1,
             Self::PushImm { width, .. } => 2 + width.byte_len(),
             Self::PushReg { .. } | Self::PopReg { .. } => 3,
-            Self::Drop(_) | Self::Add(_) | Self::Sub(_) | Self::Xor(_) | Self::And(_) => 2,
+            Self::Drop(_)
+            | Self::Add(_)
+            | Self::Sub(_)
+            | Self::Xor(_)
+            | Self::And(_)
+            | Self::Or(_) => 2,
             Self::Jmp { .. } => 5,
             Self::Jcc { .. } => 6,
         }
@@ -377,6 +383,7 @@ fn encode_instruction(instruction: &Instruction, output: &mut Vec<u8>) {
         Instruction::Sub(width) => output.extend_from_slice(&[0x21, *width as u8]),
         Instruction::Xor(width) => output.extend_from_slice(&[0x22, *width as u8]),
         Instruction::And(width) => output.extend_from_slice(&[0x23, *width as u8]),
+        Instruction::Or(width) => output.extend_from_slice(&[0x24, *width as u8]),
         Instruction::Jmp { target } => {
             output.push(0x30);
             output.extend_from_slice(&target.to_le_bytes());
@@ -497,13 +504,14 @@ fn decode_instruction(
             instruction_offset,
             code_offset,
         )?)),
-        0x20..=0x23 => {
+        0x20..=0x24 => {
             let width = decode_width(code, cursor, instruction_offset, code_offset)?;
             match opcode {
                 0x20 => Ok(Instruction::Add(width)),
                 0x21 => Ok(Instruction::Sub(width)),
                 0x22 => Ok(Instruction::Xor(width)),
-                _ => Ok(Instruction::And(width)),
+                0x23 => Ok(Instruction::And(width)),
+                _ => Ok(Instruction::Or(width)),
             }
         }
         0x30 => Ok(Instruction::Jmp {
