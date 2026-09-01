@@ -179,6 +179,77 @@ fn byte_xor_clears_carry_overflow_and_makes_auxiliary_undefined() {
 }
 
 #[test]
+fn byte_and_clears_carry_overflow_and_makes_auxiliary_undefined() {
+    let program = Program::new(
+        0,
+        vec![
+            Instruction::PushImm {
+                width: Width::Byte,
+                value: 0xf0,
+            },
+            Instruction::PushImm {
+                width: Width::Byte,
+                value: 0x0f,
+            },
+            Instruction::And(Width::Byte),
+            Instruction::PopReg {
+                width: Width::Byte,
+                register: Register::Rax,
+            },
+            Instruction::Ret,
+        ],
+    );
+    let mut initial = MachineState::default();
+    initial.set_flags(u64::MAX, u64::MAX);
+
+    let execution = execute(&program, initial).expect("and must execute");
+    let state = execution.state();
+    let modeled = (1 << 0) | (1 << 2) | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 11);
+
+    assert_eq!(state.register(Register::Rax), 0);
+    assert_eq!(state.flags_defined(), !(1 << 4));
+    assert_eq!(
+        state.flags_bits() & state.flags_defined(),
+        !modeled | (1 << 2) | (1 << 6)
+    );
+}
+
+#[test]
+fn and_rejects_underflow_and_mismatched_operand_widths() {
+    assert_eq!(
+        execute(
+            &Program::new(0, vec![Instruction::And(Width::Byte)]),
+            MachineState::default(),
+        ),
+        Err(ExecutionError::StackUnderflow)
+    );
+    assert_eq!(
+        execute(
+            &Program::new(
+                0,
+                vec![
+                    Instruction::PushImm {
+                        width: Width::Byte,
+                        value: 1,
+                    },
+                    Instruction::PushImm {
+                        width: Width::Word,
+                        value: 1,
+                    },
+                    Instruction::And(Width::Byte),
+                ],
+            ),
+            MachineState::default(),
+        ),
+        Err(ExecutionError::WidthMismatch {
+            instruction: Width::Byte,
+            lhs: Width::Byte,
+            rhs: Width::Word,
+        })
+    );
+}
+
+#[test]
 fn conditional_and_unconditional_branches_select_exact_boundaries() {
     let program = Program::new(
         0,
@@ -760,6 +831,93 @@ fn nonzero_xor_vectors_are_pinned_at_every_width() {
         assert_eq!(
             execution.state().flags_bits() & execution.state().flags_defined(),
             !modeled | (1 << 2) | (1 << 7)
+        );
+    }
+}
+
+#[test]
+fn nonzero_and_vectors_are_pinned_at_every_width() {
+    let cases = [
+        (Width::Byte, 0xf3, 0x3f, 0x33),
+        (Width::Word, 0xf0f3, 0x3ff0, 0x30f0),
+        (Width::Dword, 0xf0f0_f0f3, 0x3f3f_3ff0, 0x3030_30f0),
+        (
+            Width::Qword,
+            0xf0f0_f0f0_f0f0_f0f3,
+            0x3f3f_3f3f_3f3f_3ff0,
+            0x3030_3030_3030_30f0,
+        ),
+    ];
+    let modeled = (1 << 0) | (1 << 2) | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 11);
+    for (width, lhs, rhs, expected) in cases {
+        let program = Program::new(
+            0,
+            vec![
+                Instruction::PushImm { width, value: lhs },
+                Instruction::PushImm { width, value: rhs },
+                Instruction::And(width),
+                Instruction::PopReg {
+                    width,
+                    register: Register::Rax,
+                },
+                Instruction::Ret,
+            ],
+        );
+        let mut initial = MachineState::default();
+        initial.set_flags(u64::MAX, u64::MAX);
+
+        let execution = execute(&program, initial).expect("nonzero and vector must execute");
+        assert_eq!(execution.state().register(Register::Rax), expected);
+        assert_eq!(execution.state().flags_defined(), !(1 << 4));
+        assert_eq!(
+            execution.state().flags_bits() & execution.state().flags_defined(),
+            !modeled | (1 << 2)
+        );
+    }
+}
+
+#[test]
+fn and_sets_sign_clears_odd_parity_and_preserves_outside_flags_at_every_width() {
+    let cases = [
+        (Width::Byte, 0x80, u64::from(u8::MAX)),
+        (Width::Word, 0x8001, u64::from(u16::MAX)),
+        (Width::Dword, 0x8000_0001, u64::from(u32::MAX)),
+        (Width::Qword, 0x8000_0000_0000_0001, u64::MAX),
+    ];
+    let modeled = (1 << 0) | (1 << 2) | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 11);
+    let logical_defined = (1 << 0) | (1 << 2) | (1 << 6) | (1 << 7) | (1 << 11);
+    let initial_bits = modeled | (1 << 9) | (1 << 10);
+    let initial_defined = modeled | (1 << 9) | (1 << 12);
+
+    for (width, expected, rhs) in cases {
+        let program = Program::new(
+            0,
+            vec![
+                Instruction::PushImm {
+                    width,
+                    value: expected,
+                },
+                Instruction::PushImm { width, value: rhs },
+                Instruction::And(width),
+                Instruction::PopReg {
+                    width,
+                    register: Register::Rax,
+                },
+                Instruction::Ret,
+            ],
+        );
+        let mut initial = MachineState::default();
+        initial.set_flags(initial_bits, initial_defined);
+
+        let execution = execute(&program, initial).expect("signed and vector must execute");
+        assert_eq!(execution.state().register(Register::Rax), expected);
+        assert_eq!(
+            execution.state().flags_bits(),
+            (1 << 7) | (1 << 9) | (1 << 10)
+        );
+        assert_eq!(
+            execution.state().flags_defined(),
+            logical_defined | (1 << 9) | (1 << 12)
         );
     }
 }
