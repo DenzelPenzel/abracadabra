@@ -580,6 +580,7 @@ fn lower_instruction(
         | Mnemonic::Sub
         | Mnemonic::Xor
         | Mnemonic::And
+        | Mnemonic::Or
         | Mnemonic::Cmp
         | Mnemonic::Test)
             if raw.op_count() == 2 && raw.op0_kind() == OpKind::Register =>
@@ -592,6 +593,7 @@ fn lower_instruction(
                 Mnemonic::Sub | Mnemonic::Cmp => Instruction::Sub(width),
                 Mnemonic::Xor => Instruction::Xor(width),
                 Mnemonic::And | Mnemonic::Test => Instruction::And(width),
+                Mnemonic::Or => Instruction::Or(width),
                 _ => unreachable!("guarded arithmetic mnemonic"),
             })?;
             if matches!(mnemonic, Mnemonic::Cmp | Mnemonic::Test) {
