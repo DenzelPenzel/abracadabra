@@ -22,7 +22,7 @@ const ZF: u64 = 1 << 6;
 const SF: u64 = 1 << 7;
 const OF: u64 = 1 << 11;
 const ARITHMETIC_DEFINED: u64 = CF | PF | AF | ZF | SF | OF;
-const XOR_DEFINED: u64 = CF | PF | ZF | SF | OF;
+const LOGICAL_DEFINED: u64 = CF | PF | ZF | SF | OF;
 
 #[derive(Debug, Clone, Copy)]
 enum Operation {
@@ -80,6 +80,25 @@ fn native_cmp_preserves_operands_and_matches_lowered_flags_v1() {
 }
 
 #[test]
+fn native_test_preserves_operands_and_matches_lowered_flags_v1() {
+    for width in [Width::Byte, Width::Word, Width::Dword, Width::Qword] {
+        for (lhs, rhs) in test_vectors(width) {
+            compare_native_test_with_lowered(width, None, lhs, rhs);
+        }
+        for immediate in [1, -1] {
+            for (lhs, _) in test_vectors(width) {
+                compare_native_test_with_lowered(
+                    width,
+                    Some(immediate),
+                    lhs,
+                    0x8877_6655_4433_2211,
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn native_mov_matches_lowered_decoded_host_v1() {
     for width in [Width::Byte, Width::Word, Width::Dword, Width::Qword] {
         compare_native_mov_with_lowered(width, false);
@@ -129,6 +148,60 @@ fn native_conditional_and_join_branches_match_lowered_decoded_host_v1() {
     }
 }
 
+#[test]
+fn native_test_flags_feed_all_conditional_branches_v1() {
+    for condition in all_conditions() {
+        let function = test_branching_function(condition);
+        let lowered = lower(&function).expect("curated TEST branch function must lower");
+        let encoded = encode(&lowered).expect("lowered TEST branch program must encode");
+        let decoded =
+            decode(&encoded).expect("physical TEST branch program must decode independently");
+        let mut observed_taken = false;
+        let mut observed_not_taken = false;
+
+        for (lhs, rhs) in test_branch_vectors() {
+            let mut initial = MachineState::default();
+            initial.set_register(Register::Rax, lhs);
+            initial.set_register(Register::Rcx, rhs);
+            let vm = execute(&decoded, initial).expect("lowered TEST branch must terminate");
+            let native = run_native_test_branch(condition, lhs, rhs);
+
+            assert_eq!(vm.termination(), Termination::Ret);
+            assert_eq!(vm.state().stack_len(), 0);
+            assert_eq!(vm.state().register(Register::Rax), native.rax);
+            assert_eq!(vm.state().flags_defined(), LOGICAL_DEFINED);
+            assert_eq!(
+                vm.state().flags_bits() & LOGICAL_DEFINED,
+                native.rflags & LOGICAL_DEFINED,
+                "TEST branch flag mismatch for {condition:?}, lhs=0x{lhs:x}, rhs=0x{rhs:x}"
+            );
+            observed_taken |= native.rax == BRANCH_TAKEN;
+            observed_not_taken |= native.rax == BRANCH_NOT_TAKEN;
+        }
+
+        match condition {
+            Condition::O | Condition::B => {
+                assert!(!observed_taken, "TEST unexpectedly took {condition:?}");
+                assert!(observed_not_taken, "TEST never exercised {condition:?}");
+            }
+            Condition::No | Condition::Ae => {
+                assert!(observed_taken, "TEST never exercised {condition:?}");
+                assert!(
+                    !observed_not_taken,
+                    "TEST unexpectedly did not take {condition:?}"
+                );
+            }
+            _ => {
+                assert!(observed_taken, "no taken TEST case for {condition:?}");
+                assert!(
+                    observed_not_taken,
+                    "no not-taken TEST case for {condition:?}"
+                );
+            }
+        }
+    }
+}
+
 fn all_conditions() -> [Condition; 16] {
     [
         Condition::O,
@@ -159,6 +232,34 @@ fn branch_vectors() -> [(u64, u64); 8] {
         (0x8000_0000_0000_0000, 1),
         (0x8000_0000_0000_0000, u64::MAX),
         (u64::MAX, 0x7fff_ffff_ffff_ffff),
+        (0x1122_3344_5566_7788, 0x8877_6655_4433_2211),
+    ]
+}
+
+fn test_vectors(width: Width) -> [(u64, u64); 6] {
+    let (sign, mask) = match width {
+        Width::Byte => (0x80, u64::from(u8::MAX)),
+        Width::Word => (0x8000, u64::from(u16::MAX)),
+        Width::Dword => (0x8000_0000, u64::from(u32::MAX)),
+        Width::Qword => (0x8000_0000_0000_0000, u64::MAX),
+    };
+    [
+        (0, mask),
+        (mask, 0),
+        (mask, mask),
+        (sign | 1, mask),
+        (1, 1),
+        (0x1122_3344_5566_7788, 0x8877_6655_4433_2211),
+    ]
+}
+
+fn test_branch_vectors() -> [(u64, u64); 6] {
+    [
+        (0, u64::MAX),
+        (1, 1),
+        (3, 3),
+        (0x8000_0000_0000_0000, u64::MAX),
+        (0x8000_0000_0000_0001, u64::MAX),
         (0x1122_3344_5566_7788, 0x8877_6655_4433_2211),
     ]
 }
@@ -200,6 +301,45 @@ fn branching_function(condition: Condition) -> Function {
     let pe = PeFile::parse(&image).expect("branch fixture must be a valid PE32+ image");
     decode_function(Image::new(&pe, &image), Rva(0x1000))
         .expect("production decoder must recover the branch CFG")
+}
+
+fn test_branching_function(condition: Condition) -> Function {
+    // test rax, rcx; jcc taken; mov rax, NOT_TAKEN; jmp end;
+    // taken: mov rax, TAKEN; end: ret
+    let text = [
+        0x48,
+        0x85,
+        0xc8,
+        0x70 | condition as u8,
+        0x0c,
+        0x48,
+        0xb8,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0x11,
+        0xeb,
+        0x0a,
+        0x48,
+        0xb8,
+        0x22,
+        0x22,
+        0x22,
+        0x22,
+        0x22,
+        0x22,
+        0x22,
+        0x22,
+        0xc3,
+    ];
+    let image = minimal_pe64(&text);
+    let pe = PeFile::parse(&image).expect("TEST branch fixture must be a valid PE32+ image");
+    decode_function(Image::new(&pe, &image), Rva(0x1000))
+        .expect("production decoder must recover the TEST branch CFG")
 }
 
 fn minimal_pe64(text: &[u8]) -> Vec<u8> {
@@ -292,7 +432,7 @@ fn compare_native_with_lowered(operation: Operation, width: Width, lhs: u64, rhs
     let native = run_native(operation, width, lhs, rhs);
     let defined = match operation {
         Operation::Add | Operation::Sub => ARITHMETIC_DEFINED,
-        Operation::Xor => XOR_DEFINED,
+        Operation::Xor => LOGICAL_DEFINED,
     };
 
     assert_eq!(vm.termination(), Termination::Ret);
@@ -342,6 +482,37 @@ fn compare_native_cmp_with_lowered(width: Width, immediate: Option<i8>, lhs: u64
         vm.state().flags_bits() & ARITHMETIC_DEFINED,
         native.rflags & ARITHMETIC_DEFINED,
         "CMP flag mismatch for {width:?}, immediate={immediate:?}, lhs=0x{lhs:x}"
+    );
+}
+
+fn compare_native_test_with_lowered(width: Width, immediate: Option<i8>, lhs: u64, rcx: u64) {
+    let bytes = test_physical_bytes(width, immediate);
+    let image = minimal_pe64(&bytes);
+    let pe = PeFile::parse(&image).expect("TEST fixture must be a valid PE32+ image");
+    let function = decode_function(Image::new(&pe, &image), Rva(0x1000))
+        .expect("production decoder must recover the TEST function");
+    let lowered = lower(&function).expect("curated TEST must lower");
+    let encoded = encode(&lowered).expect("lowered TEST v1 must encode");
+    let decoded = decode(&encoded).expect("physical TEST v1 must decode independently");
+    let native = run_native_test(width, immediate, lhs, rcx);
+
+    assert_eq!(native.rax, lhs, "native TEST changed RAX for {width:?}");
+    assert_eq!(native.rcx, rcx, "native TEST changed RCX for {width:?}");
+
+    let mut initial = MachineState::default();
+    initial.set_register(Register::Rax, lhs);
+    initial.set_register(Register::Rcx, rcx);
+    let vm = execute(&decoded, initial).expect("lowered TEST must terminate");
+
+    assert_eq!(vm.termination(), Termination::Ret);
+    assert_eq!(vm.state().stack_len(), 0);
+    assert_eq!(vm.state().register(Register::Rax), native.rax);
+    assert_eq!(vm.state().register(Register::Rcx), native.rcx);
+    assert_eq!(vm.state().flags_defined(), LOGICAL_DEFINED);
+    assert_eq!(
+        vm.state().flags_bits() & LOGICAL_DEFINED,
+        native.rflags & LOGICAL_DEFINED,
+        "TEST flag mismatch for {width:?}, immediate={immediate:?}, lhs=0x{lhs:x}"
     );
 }
 
@@ -414,6 +585,42 @@ fn cmp_physical_bytes(width: Width, immediate: Option<i8>) -> Vec<u8> {
         Width::Word => vec![0x66, 0x39, 0xc8, 0xc3],
         Width::Dword => vec![0x39, 0xc8, 0xc3],
         Width::Qword => vec![0x48, 0x39, 0xc8, 0xc3],
+    }
+}
+
+fn test_physical_bytes(width: Width, immediate: Option<i8>) -> Vec<u8> {
+    if let Some(immediate) = immediate {
+        let value = match immediate {
+            1 => 1,
+            -1 => u64::MAX,
+            _ => unreachable!("unsupported TEST immediate {immediate}"),
+        };
+        let mut bytes = match width {
+            Width::Byte => vec![0xf6, 0xc0, value as u8],
+            Width::Word => {
+                let mut bytes = vec![0x66, 0xf7, 0xc0];
+                bytes.extend_from_slice(&(value as u16).to_le_bytes());
+                bytes
+            }
+            Width::Dword => {
+                let mut bytes = vec![0xf7, 0xc0];
+                bytes.extend_from_slice(&(value as u32).to_le_bytes());
+                bytes
+            }
+            Width::Qword => {
+                let mut bytes = vec![0x48, 0xf7, 0xc0];
+                bytes.extend_from_slice(&(value as u32).to_le_bytes());
+                bytes
+            }
+        };
+        bytes.push(0xc3);
+        return bytes;
+    }
+    match width {
+        Width::Byte => vec![0x84, 0xc8, 0xc3],
+        Width::Word => vec![0x66, 0x85, 0xc8, 0xc3],
+        Width::Dword => vec![0x85, 0xc8, 0xc3],
+        Width::Qword => vec![0x48, 0x85, 0xc8, 0xc3],
     }
 }
 
@@ -588,6 +795,51 @@ fn run_native_cmp(width: Width, immediate: Option<i8>, lhs: u64, rhs: u64) -> Na
     unsafe_code,
     reason = "the x86-64 CPU oracle is isolated to this target-only test harness"
 )]
+fn run_native_test(width: Width, immediate: Option<i8>, lhs: u64, rhs: u64) -> NativeCmpResult {
+    let mut rax = lhs;
+    let mut rcx = rhs;
+    let rflags: u64;
+
+    macro_rules! execute {
+        ($instruction:literal) => {
+            // SAFETY: TEST does not modify its declared RAX/RCX operands, RFLAGS
+            // is recorded in declared RDX, and the temporary push/pop is balanced.
+            unsafe {
+                asm!(
+                    $instruction,
+                    "pushfq",
+                    "pop rdx",
+                    inout("rax") rax,
+                    inout("rcx") rcx,
+                    lateout("rdx") rflags,
+                );
+            }
+        };
+    }
+
+    match (width, immediate) {
+        (Width::Byte, None) => execute!("test al, cl"),
+        (Width::Word, None) => execute!("test ax, cx"),
+        (Width::Dword, None) => execute!("test eax, ecx"),
+        (Width::Qword, None) => execute!("test rax, rcx"),
+        (Width::Byte, Some(1)) => execute!("test al, 1"),
+        (Width::Word, Some(1)) => execute!("test ax, 1"),
+        (Width::Dword, Some(1)) => execute!("test eax, 1"),
+        (Width::Qword, Some(1)) => execute!("test rax, 1"),
+        (Width::Byte, Some(-1)) => execute!("test al, -1"),
+        (Width::Word, Some(-1)) => execute!("test ax, -1"),
+        (Width::Dword, Some(-1)) => execute!("test eax, -1"),
+        (Width::Qword, Some(-1)) => execute!("test rax, -1"),
+        (_, Some(immediate)) => unreachable!("unsupported TEST immediate {immediate}"),
+    }
+
+    NativeCmpResult { rax, rcx, rflags }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the x86-64 CPU oracle is isolated to this target-only test harness"
+)]
 fn run_native_branch(condition: Condition, lhs: u64, rhs: u64) -> NativeResult {
     let mut result = lhs;
     let rflags: u64;
@@ -637,6 +889,66 @@ fn run_native_branch(condition: Condition, lhs: u64, rhs: u64) -> NativeResult {
     assert!(
         matches!(result, BRANCH_TAKEN | BRANCH_NOT_TAKEN),
         "native branch oracle produced an unknown arm value"
+    );
+    NativeResult {
+        rax: result,
+        rflags,
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the x86-64 CPU oracle is isolated to this target-only test harness"
+)]
+fn run_native_test_branch(condition: Condition, lhs: u64, rhs: u64) -> NativeResult {
+    let mut result = lhs;
+    let rflags: u64;
+
+    macro_rules! execute {
+        ($jump:literal) => {
+            // SAFETY: the sequence uses only declared RAX/RCX operands, records
+            // RFLAGS in declared RDX, and balances its temporary stack push/pop.
+            unsafe {
+                asm!(
+                    "test rax, rcx",
+                    $jump,
+                    "mov rax, 0x1111111111111111",
+                    "jmp 3f",
+                    "2:",
+                    "mov rax, 0x2222222222222222",
+                    "3:",
+                    "pushfq",
+                    "pop rdx",
+                    inout("rax") result,
+                    in("rcx") rhs,
+                    lateout("rdx") rflags,
+                );
+            }
+        };
+    }
+
+    match condition {
+        Condition::O => execute!("jo 2f"),
+        Condition::No => execute!("jno 2f"),
+        Condition::B => execute!("jb 2f"),
+        Condition::Ae => execute!("jae 2f"),
+        Condition::E => execute!("je 2f"),
+        Condition::Ne => execute!("jne 2f"),
+        Condition::Be => execute!("jbe 2f"),
+        Condition::A => execute!("ja 2f"),
+        Condition::S => execute!("js 2f"),
+        Condition::Ns => execute!("jns 2f"),
+        Condition::P => execute!("jp 2f"),
+        Condition::Np => execute!("jnp 2f"),
+        Condition::L => execute!("jl 2f"),
+        Condition::Ge => execute!("jge 2f"),
+        Condition::Le => execute!("jle 2f"),
+        Condition::G => execute!("jg 2f"),
+    }
+
+    assert!(
+        matches!(result, BRANCH_TAKEN | BRANCH_NOT_TAKEN),
+        "native TEST branch oracle produced an unknown arm value"
     );
     NativeResult {
         rax: result,

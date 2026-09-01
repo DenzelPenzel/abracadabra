@@ -576,7 +576,11 @@ fn lower_instruction(
             push_source(lowered, instruction.rva(), raw, width)?;
             lowered.push(Instruction::PopReg { width, register })?;
         }
-        mnemonic @ (Mnemonic::Add | Mnemonic::Sub | Mnemonic::Xor | Mnemonic::Cmp)
+        mnemonic @ (Mnemonic::Add
+        | Mnemonic::Sub
+        | Mnemonic::Xor
+        | Mnemonic::Cmp
+        | Mnemonic::Test)
             if raw.op_count() == 2 && raw.op0_kind() == OpKind::Register =>
         {
             let (register, width) = lower_register(instruction.rva(), raw.op0_register())?;
@@ -586,9 +590,10 @@ fn lower_instruction(
                 Mnemonic::Add => Instruction::Add(width),
                 Mnemonic::Sub | Mnemonic::Cmp => Instruction::Sub(width),
                 Mnemonic::Xor => Instruction::Xor(width),
+                Mnemonic::Test => Instruction::And(width),
                 _ => unreachable!("guarded arithmetic mnemonic"),
             })?;
-            if mnemonic == Mnemonic::Cmp {
+            if matches!(mnemonic, Mnemonic::Cmp | Mnemonic::Test) {
                 lowered.push(Instruction::Drop(width))?;
             } else {
                 lowered.push(Instruction::PopReg { width, register })?;
