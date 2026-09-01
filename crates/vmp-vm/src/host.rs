@@ -143,6 +143,14 @@ pub enum ExecutionError {
         lhs: Width,
         rhs: Width,
     },
+    #[error(
+        "VM shift width mismatch: instruction {instruction:?}, count {count:?}, value {value:?}"
+    )]
+    ShiftWidthMismatch {
+        instruction: Width,
+        count: Width,
+        value: Width,
+    },
     #[error("VM pop width mismatch: expected {expected:?}, actual {actual:?}")]
     PopWidthMismatch { expected: Width, actual: Width },
     #[error("ret reached with {depth} VM stack slots")]
@@ -228,6 +236,7 @@ pub fn execute(program: &Program, mut state: MachineState) -> Result<Execution, 
             Instruction::Xor(width) => execute_xor(&mut state, *width)?,
             Instruction::And(width) => execute_and(&mut state, *width)?,
             Instruction::Or(width) => execute_or(&mut state, *width)?,
+            Instruction::Shl(width) => execute_shl(&mut state, *width)?,
             Instruction::Jmp { target } => {
                 state.pc = *target;
                 continue;
@@ -442,6 +451,61 @@ fn execute_or(state: &mut MachineState, width: Width) -> Result<(), ExecutionErr
     }
     if result & sign != 0 {
         bits |= SF;
+    }
+    state.flags_bits = bits;
+    state.flags_defined = (state.flags_defined & !MODELED_FLAGS) | defined;
+    state.push(Slot {
+        width,
+        value: result,
+    })
+}
+
+fn execute_shl(state: &mut MachineState, width: Width) -> Result<(), ExecutionError> {
+    let value = state.pop()?;
+    let count = state.pop()?;
+    if count.width != Width::Byte || value.width != width {
+        return Err(ExecutionError::ShiftWidthMismatch {
+            instruction: width,
+            count: count.width,
+            value: value.width,
+        });
+    }
+
+    let count_mask = if width == Width::Qword { 0x3f } else { 0x1f };
+    let count = count.value & count_mask;
+    if count == 0 {
+        return state.push(value);
+    }
+
+    let bit_count = (width.byte_len() * 8) as u64;
+    let sign = 1u64 << (bit_count - 1);
+    let carry_defined = count <= bit_count;
+    let carry = carry_defined && ((value.value >> (bit_count - count)) & 1 != 0);
+    let result = (value.value << count) & width.mask();
+    let overflow = count == 1 && ((result & sign != 0) ^ carry);
+    let parity = (result & u64::from(u8::MAX)).count_ones().is_multiple_of(2);
+    let mut defined = PF | ZF | SF;
+    if carry_defined {
+        defined |= CF;
+    }
+    if count == 1 {
+        defined |= OF;
+    }
+    let mut bits = state.flags_bits & !MODELED_FLAGS;
+    if carry {
+        bits |= CF;
+    }
+    if parity {
+        bits |= PF;
+    }
+    if result == 0 {
+        bits |= ZF;
+    }
+    if result & sign != 0 {
+        bits |= SF;
+    }
+    if overflow {
+        bits |= OF;
     }
     state.flags_bits = bits;
     state.flags_defined = (state.flags_defined & !MODELED_FLAGS) | defined;
