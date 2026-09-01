@@ -124,6 +124,21 @@ fn or_has_an_independently_pinned_wire_encoding() {
 }
 
 #[test]
+fn shl_has_an_independently_pinned_wire_encoding() {
+    let program = Program::new(0, vec![Instruction::Shl(Width::Word), Instruction::Ret]);
+    let expected = [
+        0x56, 0x4d, 0x50, 0x42, 0x01, 0x00, 0x10, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x25, 0x02, 0x01,
+    ];
+
+    assert_eq!(encode(&program).expect("shl must encode"), expected);
+    assert_eq!(
+        decode(&expected).expect("physical shl must decode"),
+        program
+    );
+}
+
+#[test]
 fn declared_container_limit_rejects_one_over_before_length_mismatch() {
     let mut input = [0u8; 16];
     input[0..4].copy_from_slice(b"VMPB");
@@ -189,6 +204,7 @@ fn every_typed_width_register_and_condition_round_trips() {
         instructions.push(Instruction::Xor(width));
         instructions.push(Instruction::And(width));
         instructions.push(Instruction::Or(width));
+        instructions.push(Instruction::Shl(width));
         for register in registers {
             instructions.push(Instruction::PushReg { width, register });
             instructions.push(Instruction::PopReg { width, register });
@@ -266,6 +282,21 @@ fn malformed_instruction_fields_are_typed_and_fail_closed() {
     );
     assert_eq!(
         decode(&container(&[0x24], 0)),
+        Err(DecodeError::TruncatedInstruction {
+            code_offset: 0,
+            needed: 2,
+            remaining: 1,
+        })
+    );
+    assert_eq!(
+        decode(&container(&[0x25, 3], 0)),
+        Err(DecodeError::InvalidWidth {
+            code_offset: 0,
+            value: 3,
+        })
+    );
+    assert_eq!(
+        decode(&container(&[0x25], 0)),
         Err(DecodeError::TruncatedInstruction {
             code_offset: 0,
             needed: 2,
