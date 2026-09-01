@@ -321,6 +321,176 @@ fn or_rejects_underflow_and_mismatched_operand_widths() {
 }
 
 #[test]
+fn shl_result_carry_overflow_and_status_flags_are_pinned_at_every_width() {
+    let initial_rax = 0x1122_3344_5566_7788;
+    let modeled = (1 << 0) | (1 << 2) | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 11);
+    let cases = [
+        (
+            Width::Byte,
+            0x40,
+            0x1122_3344_5566_7780,
+            (1 << 7) | (1 << 11),
+        ),
+        (
+            Width::Word,
+            0x8000,
+            0x1122_3344_5566_0000,
+            (1 << 0) | (1 << 2) | (1 << 6) | (1 << 11),
+        ),
+        (
+            Width::Dword,
+            0x4000_0000,
+            0x8000_0000,
+            (1 << 2) | (1 << 7) | (1 << 11),
+        ),
+        (Width::Qword, u64::MAX, u64::MAX - 1, (1 << 0) | (1 << 7)),
+    ];
+
+    for (width, value, expected_result, expected_modeled) in cases {
+        let program = Program::new(
+            0,
+            vec![
+                Instruction::PushImm {
+                    width: Width::Byte,
+                    value: 1,
+                },
+                Instruction::PushImm { width, value },
+                Instruction::Shl(width),
+                Instruction::PopReg {
+                    width,
+                    register: Register::Rax,
+                },
+                Instruction::Ret,
+            ],
+        );
+        let mut initial = MachineState::default();
+        initial.set_register(Register::Rax, initial_rax);
+        initial.set_flags(u64::MAX, u64::MAX);
+
+        let execution = execute(&program, initial).expect("shl must execute");
+        let state = execution.state();
+
+        assert_eq!(state.register(Register::Rax), expected_result, "{width:?}");
+        assert_eq!(state.flags_defined(), !(1 << 4), "{width:?}");
+        assert_eq!(
+            state.flags_bits() & state.flags_defined(),
+            !modeled | expected_modeled,
+            "{width:?}"
+        );
+    }
+}
+
+#[test]
+fn shl_rejects_underflow_and_mismatched_count_or_value_widths() {
+    assert_eq!(
+        execute(
+            &Program::new(0, vec![Instruction::Shl(Width::Byte)]),
+            MachineState::default(),
+        ),
+        Err(ExecutionError::StackUnderflow)
+    );
+    assert_eq!(
+        execute(
+            &Program::new(
+                0,
+                vec![
+                    Instruction::PushImm {
+                        width: Width::Byte,
+                        value: 1,
+                    },
+                    Instruction::Shl(Width::Byte),
+                ],
+            ),
+            MachineState::default(),
+        ),
+        Err(ExecutionError::StackUnderflow)
+    );
+
+    for (count_width, value_width) in [(Width::Word, Width::Byte), (Width::Byte, Width::Word)] {
+        assert_eq!(
+            execute(
+                &Program::new(
+                    0,
+                    vec![
+                        Instruction::PushImm {
+                            width: count_width,
+                            value: 1,
+                        },
+                        Instruction::PushImm {
+                            width: value_width,
+                            value: 1,
+                        },
+                        Instruction::Shl(Width::Byte),
+                    ],
+                ),
+                MachineState::default(),
+            ),
+            Err(ExecutionError::ShiftWidthMismatch {
+                instruction: Width::Byte,
+                count: count_width,
+                value: value_width,
+            })
+        );
+    }
+}
+
+#[test]
+fn shl_masks_count_preserves_flags_at_zero_and_undefines_overflow_above_one() {
+    let modeled = (1 << 0) | (1 << 2) | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 11);
+    let cases = [
+        (
+            Width::Dword,
+            0x20,
+            0x8000_0001,
+            0x8000_0001,
+            modeled,
+            modeled,
+        ),
+        (Width::Qword, 0x40, u64::MAX, u64::MAX, modeled, modeled),
+        (
+            Width::Byte,
+            2,
+            0x40,
+            0,
+            (1 << 0) | (1 << 2) | (1 << 6),
+            (1 << 0) | (1 << 2) | (1 << 6) | (1 << 7),
+        ),
+    ];
+
+    for (width, count, value, expected_result, expected_bits, expected_defined) in cases {
+        let program = Program::new(
+            0,
+            vec![
+                Instruction::PushImm {
+                    width: Width::Byte,
+                    value: count,
+                },
+                Instruction::PushImm { width, value },
+                Instruction::Shl(width),
+                Instruction::PopReg {
+                    width,
+                    register: Register::Rax,
+                },
+                Instruction::Ret,
+            ],
+        );
+        let mut initial = MachineState::default();
+        initial.set_flags(modeled, modeled);
+
+        let execution = execute(&program, initial).expect("general shl must execute");
+        assert_eq!(execution.state().register(Register::Rax), expected_result);
+        assert_eq!(
+            execution.state().flags_defined() & modeled,
+            expected_defined
+        );
+        assert_eq!(
+            execution.state().flags_bits() & expected_defined,
+            expected_bits & expected_defined
+        );
+    }
+}
+
+#[test]
 fn conditional_and_unconditional_branches_select_exact_boundaries() {
     let program = Program::new(
         0,

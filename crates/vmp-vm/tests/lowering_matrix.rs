@@ -156,6 +156,7 @@ fn lowers_every_supported_gpr_width_operation_and_source_form() {
                 Code::Cmp_rm8_imm8,
                 Code::Test_rm8_imm8,
             ],
+            [Code::Shl_rm8_1, Code::Sal_rm8_1],
         ),
         (
             &word,
@@ -180,6 +181,7 @@ fn lowers_every_supported_gpr_width_operation_and_source_form() {
                 Code::Cmp_rm16_imm16,
                 Code::Test_rm16_imm16,
             ],
+            [Code::Shl_rm16_1, Code::Sal_rm16_1],
         ),
         (
             &dword,
@@ -204,6 +206,7 @@ fn lowers_every_supported_gpr_width_operation_and_source_form() {
                 Code::Cmp_rm32_imm32,
                 Code::Test_rm32_imm32,
             ],
+            [Code::Shl_rm32_1, Code::Sal_rm32_1],
         ),
         (
             &qword,
@@ -228,6 +231,7 @@ fn lowers_every_supported_gpr_width_operation_and_source_form() {
                 Code::Cmp_rm64_imm32,
                 Code::Test_rm64_imm32,
             ],
+            [Code::Shl_rm64_1, Code::Sal_rm64_1],
         ),
     ];
     let encode_with_ret = |instruction: &IcedInstruction| {
@@ -240,7 +244,7 @@ fn lowers_every_supported_gpr_width_operation_and_source_form() {
         bytes
     };
 
-    for (native, width, register_codes, immediate_codes) in matrices {
+    for (native, width, register_codes, immediate_codes, shift_one_codes) in matrices {
         for (destination_index, destination) in native.iter().copied().enumerate() {
             let source_index = (destination_index + 1) % native.len();
             let source = native[source_index];
@@ -279,6 +283,107 @@ fn lowers_every_supported_gpr_width_operation_and_source_form() {
                         .instructions(),
                     expected,
                     "immediate form {width:?} {destination:?}, 1"
+                );
+            }
+
+            for shift_one_code in shift_one_codes {
+                let raw = IcedInstruction::with2(shift_one_code, destination, 1u32)
+                    .expect("shift-by-one matrix form must construct");
+                let function = straight_line_function(&encode_with_ret(&raw));
+                assert_eq!(
+                    lower(&function)
+                        .unwrap_or_else(|error| panic!("shift-by-one matrix form failed: {error}"))
+                        .instructions(),
+                    [
+                        Instruction::PushImm {
+                            width: Width::Byte,
+                            value: 1,
+                        },
+                        Instruction::PushReg {
+                            width,
+                            register: logical_destination,
+                        },
+                        Instruction::Shl(width),
+                        Instruction::PopReg {
+                            width,
+                            register: logical_destination,
+                        },
+                        Instruction::Ret,
+                    ],
+                    "shift-by-one form {shift_one_code:?} {width:?} {destination:?}, 1"
+                );
+            }
+
+            let (shift_immediate_codes, shift_cl_codes) = match width {
+                Width::Byte => (
+                    [Code::Shl_rm8_imm8, Code::Sal_rm8_imm8],
+                    [Code::Shl_rm8_CL, Code::Sal_rm8_CL],
+                ),
+                Width::Word => (
+                    [Code::Shl_rm16_imm8, Code::Sal_rm16_imm8],
+                    [Code::Shl_rm16_CL, Code::Sal_rm16_CL],
+                ),
+                Width::Dword => (
+                    [Code::Shl_rm32_imm8, Code::Sal_rm32_imm8],
+                    [Code::Shl_rm32_CL, Code::Sal_rm32_CL],
+                ),
+                Width::Qword => (
+                    [Code::Shl_rm64_imm8, Code::Sal_rm64_imm8],
+                    [Code::Shl_rm64_CL, Code::Sal_rm64_CL],
+                ),
+            };
+            for shift_immediate_code in shift_immediate_codes {
+                let raw = IcedInstruction::with2(shift_immediate_code, destination, 2u32)
+                    .expect("shift immediate matrix form must construct");
+                let function = straight_line_function(&encode_with_ret(&raw));
+                assert_eq!(
+                    lower(&function)
+                        .unwrap_or_else(|error| panic!("shift immediate matrix failed: {error}"))
+                        .instructions(),
+                    [
+                        Instruction::PushImm {
+                            width: Width::Byte,
+                            value: 2,
+                        },
+                        Instruction::PushReg {
+                            width,
+                            register: logical_destination,
+                        },
+                        Instruction::Shl(width),
+                        Instruction::PopReg {
+                            width,
+                            register: logical_destination,
+                        },
+                        Instruction::Ret,
+                    ],
+                    "shift immediate form {shift_immediate_code:?} {width:?} {destination:?}, 2"
+                );
+            }
+            for shift_cl_code in shift_cl_codes {
+                let raw = IcedInstruction::with2(shift_cl_code, destination, IcedRegister::CL)
+                    .expect("shift CL matrix form must construct");
+                let function = straight_line_function(&encode_with_ret(&raw));
+                assert_eq!(
+                    lower(&function)
+                        .unwrap_or_else(|error| panic!("shift CL matrix failed: {error}"))
+                        .instructions(),
+                    [
+                        Instruction::PushReg {
+                            width: Width::Byte,
+                            register: Register::Rcx,
+                        },
+                        Instruction::PushReg {
+                            width,
+                            register: logical_destination,
+                        },
+                        Instruction::Shl(width),
+                        Instruction::PopReg {
+                            width,
+                            register: logical_destination,
+                        },
+                        Instruction::Ret,
+                    ],
+                    "shift CL form {shift_cl_code:?} {width:?} {destination:?}"
                 );
             }
         }

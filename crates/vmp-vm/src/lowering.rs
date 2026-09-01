@@ -602,6 +602,41 @@ fn lower_instruction(
                 lowered.push(Instruction::PopReg { width, register })?;
             }
         }
+        Mnemonic::Shl | Mnemonic::Sal
+            if raw.op_count() == 2
+                && raw.op0_kind() == OpKind::Register
+                && is_supported_shift_code(raw.code()) =>
+        {
+            let (register, width) = lower_register(instruction.rva(), raw.op0_register())?;
+            if is_shift_one_code(raw.code()) {
+                lowered.push(Instruction::PushImm {
+                    width: Width::Byte,
+                    value: 1,
+                })?;
+            } else if is_shift_immediate_code(raw.code()) && raw.op1_kind() == OpKind::Immediate8 {
+                let value = raw
+                    .try_immediate(1)
+                    .map_err(|_| unsupported_instruction(instruction.rva(), raw))?
+                    & u64::from(u8::MAX);
+                lowered.push(Instruction::PushImm {
+                    width: Width::Byte,
+                    value,
+                })?;
+            } else if is_shift_cl_code(raw.code())
+                && raw.op1_kind() == OpKind::Register
+                && raw.op1_register() == NativeRegister::CL
+            {
+                lowered.push(Instruction::PushReg {
+                    width: Width::Byte,
+                    register: Register::Rcx,
+                })?;
+            } else {
+                return Err(unsupported_instruction(instruction.rva(), raw));
+            }
+            lowered.push(Instruction::PushReg { width, register })?;
+            lowered.push(Instruction::Shl(width))?;
+            lowered.push(Instruction::PopReg { width, register })?;
+        }
         Mnemonic::Jmp if raw.is_jmp_short_or_near() => {
             push_branch(
                 lowered,
@@ -626,6 +661,52 @@ fn lower_instruction(
         _ => return Err(unsupported_instruction(instruction.rva(), raw)),
     }
     Ok(())
+}
+
+fn is_shift_one_code(code: Code) -> bool {
+    matches!(
+        code,
+        Code::Shl_rm8_1
+            | Code::Shl_rm16_1
+            | Code::Shl_rm32_1
+            | Code::Shl_rm64_1
+            | Code::Sal_rm8_1
+            | Code::Sal_rm16_1
+            | Code::Sal_rm32_1
+            | Code::Sal_rm64_1
+    )
+}
+
+fn is_shift_immediate_code(code: Code) -> bool {
+    matches!(
+        code,
+        Code::Shl_rm8_imm8
+            | Code::Shl_rm16_imm8
+            | Code::Shl_rm32_imm8
+            | Code::Shl_rm64_imm8
+            | Code::Sal_rm8_imm8
+            | Code::Sal_rm16_imm8
+            | Code::Sal_rm32_imm8
+            | Code::Sal_rm64_imm8
+    )
+}
+
+fn is_shift_cl_code(code: Code) -> bool {
+    matches!(
+        code,
+        Code::Shl_rm8_CL
+            | Code::Shl_rm16_CL
+            | Code::Shl_rm32_CL
+            | Code::Shl_rm64_CL
+            | Code::Sal_rm8_CL
+            | Code::Sal_rm16_CL
+            | Code::Sal_rm32_CL
+            | Code::Sal_rm64_CL
+    )
+}
+
+fn is_supported_shift_code(code: Code) -> bool {
+    is_shift_one_code(code) || is_shift_immediate_code(code) || is_shift_cl_code(code)
 }
 
 fn push_branch(

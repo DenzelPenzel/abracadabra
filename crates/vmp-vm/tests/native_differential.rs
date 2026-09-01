@@ -34,6 +34,12 @@ enum Operation {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum ShiftSource {
+    ImmediateTwo,
+    Cl(u8),
+}
+
+#[derive(Debug, Clone, Copy)]
 struct NativeResult {
     rax: u64,
     rflags: u64,
@@ -90,6 +96,43 @@ fn native_or_matches_lowered_decoded_host_v1() {
         for immediate in [1, -1] {
             for (lhs, _) in edge_vectors(Operation::Or, width) {
                 compare_native_or_immediate_with_lowered(width, immediate, lhs);
+            }
+        }
+    }
+}
+
+#[test]
+fn native_shl_matches_lowered_decoded_host_v1() {
+    for width in [Width::Byte, Width::Word, Width::Dword, Width::Qword] {
+        for sal_alias in [false, true] {
+            for value in shl_vectors(width) {
+                compare_native_shl_with_lowered(width, sal_alias, value);
+            }
+        }
+    }
+}
+
+#[test]
+fn native_shl_immediate_and_cl_match_lowered_decoded_host_v1() {
+    for width in [Width::Byte, Width::Word, Width::Dword, Width::Qword] {
+        for sal_alias in [false, true] {
+            for value in shl_vectors(width) {
+                compare_native_general_shl_with_lowered(
+                    width,
+                    sal_alias,
+                    ShiftSource::ImmediateTwo,
+                    value,
+                );
+            }
+            for count in u8::MIN..=u8::MAX {
+                for value in shl_vectors(width) {
+                    compare_native_general_shl_with_lowered(
+                        width,
+                        sal_alias,
+                        ShiftSource::Cl(count),
+                        value,
+                    );
+                }
             }
         }
     }
@@ -464,6 +507,24 @@ fn edge_vectors(operation: Operation, width: Width) -> [(u64, u64); 6] {
     }
 }
 
+fn shl_vectors(width: Width) -> [u64; 7] {
+    let (sign, mask) = match width {
+        Width::Byte => (0x80, u64::from(u8::MAX)),
+        Width::Word => (0x8000, u64::from(u16::MAX)),
+        Width::Dword => (0x8000_0000, u64::from(u32::MAX)),
+        Width::Qword => (0x8000_0000_0000_0000, u64::MAX),
+    };
+    [
+        0,
+        1,
+        sign >> 1,
+        sign,
+        mask,
+        0x5555_5555_5555_5555 & mask,
+        0x1122_3344_5566_7788,
+    ]
+}
+
 fn compare_native_with_lowered(operation: Operation, width: Width, lhs: u64, rhs: u64) {
     let bytes = physical_bytes(operation, width);
     let function = straight_line_function(&bytes);
@@ -541,6 +602,78 @@ fn compare_native_or_immediate_with_lowered(width: Width, immediate: i8, lhs: u6
         vm.state().flags_bits() & LOGICAL_DEFINED,
         native.rflags & LOGICAL_DEFINED,
         "immediate OR flag mismatch for {width:?}, immediate={immediate}, lhs=0x{lhs:x}"
+    );
+}
+
+fn compare_native_shl_with_lowered(width: Width, sal_alias: bool, value: u64) {
+    let function = straight_line_function(&shl_one_physical_bytes(width, sal_alias));
+    let lowered = lower(&function).expect("curated SHL-by-one must lower");
+    let encoded = encode(&lowered).expect("lowered SHL-by-one v1 must encode");
+    let decoded = decode(&encoded).expect("physical SHL-by-one v1 must decode independently");
+
+    let mut initial = MachineState::default();
+    initial.set_register(Register::Rax, value);
+    let vm = execute(&decoded, initial).expect("lowered SHL-by-one must terminate");
+    let native = run_native_shl_one(width, sal_alias, value);
+
+    assert_eq!(vm.termination(), Termination::Ret);
+    assert_eq!(vm.state().stack_len(), 0);
+    assert_eq!(
+        vm.state().register(Register::Rax),
+        native.rax,
+        "SHL/SAL-by-one result mismatch for {width:?}, sal_alias={sal_alias}, value=0x{value:x}"
+    );
+    assert_eq!(vm.state().flags_defined(), LOGICAL_DEFINED);
+    assert_eq!(
+        vm.state().flags_bits() & LOGICAL_DEFINED,
+        native.rflags & LOGICAL_DEFINED,
+        "SHL/SAL-by-one flag mismatch for {width:?}, sal_alias={sal_alias}, value=0x{value:x}"
+    );
+}
+
+fn compare_native_general_shl_with_lowered(
+    width: Width,
+    sal_alias: bool,
+    source: ShiftSource,
+    value: u64,
+) {
+    let function = straight_line_function(&shl_physical_bytes(width, sal_alias, source));
+    let lowered = lower(&function).expect("curated general SHL must lower");
+    let encoded = encode(&lowered).expect("lowered general SHL v1 must encode");
+    let decoded = decode(&encoded).expect("physical general SHL v1 must decode independently");
+
+    let mut initial = MachineState::default();
+    initial.set_register(Register::Rax, value);
+    initial.set_register(Register::Rcx, shift_count(source));
+    let vm = execute(&decoded, initial).expect("lowered general SHL must terminate");
+    let native = run_native_general_shl(width, sal_alias, source, value);
+    let count = shift_count(source) & if width == Width::Qword { 0x3f } else { 0x1f };
+    let bit_count = match width {
+        Width::Byte => 8,
+        Width::Word => 16,
+        Width::Dword => 32,
+        Width::Qword => 64,
+    };
+    let mut defined = if count == 0 { 0 } else { PF | ZF | SF };
+    if count != 0 && count <= bit_count {
+        defined |= CF;
+    }
+    if count == 1 {
+        defined |= OF;
+    }
+
+    assert_eq!(vm.termination(), Termination::Ret);
+    assert_eq!(vm.state().stack_len(), 0);
+    assert_eq!(
+        vm.state().register(Register::Rax),
+        native.rax,
+        "general SHL/SAL result mismatch for {width:?}, sal_alias={sal_alias}, source={source:?}, value=0x{value:x}"
+    );
+    assert_eq!(vm.state().flags_defined(), defined);
+    assert_eq!(
+        vm.state().flags_bits() & defined,
+        native.rflags & defined,
+        "general SHL/SAL flag mismatch for {width:?}, sal_alias={sal_alias}, source={source:?}, value=0x{value:x}"
     );
 }
 
@@ -679,6 +812,37 @@ fn or_immediate_physical_bytes(width: Width, immediate: i8) -> Vec<u8> {
         Width::Word => vec![0x66, 0x83, 0xc8, immediate, 0xc3],
         Width::Dword => vec![0x83, 0xc8, immediate, 0xc3],
         Width::Qword => vec![0x48, 0x83, 0xc8, immediate, 0xc3],
+    }
+}
+
+fn shl_one_physical_bytes(width: Width, sal_alias: bool) -> Vec<u8> {
+    let modrm = if sal_alias { 0xf0 } else { 0xe0 };
+    match width {
+        Width::Byte => vec![0xd0, modrm, 0xc3],
+        Width::Word => vec![0x66, 0xd1, modrm, 0xc3],
+        Width::Dword => vec![0xd1, modrm, 0xc3],
+        Width::Qword => vec![0x48, 0xd1, modrm, 0xc3],
+    }
+}
+
+fn shl_physical_bytes(width: Width, sal_alias: bool, source: ShiftSource) -> Vec<u8> {
+    let modrm = if sal_alias { 0xf0 } else { 0xe0 };
+    match (width, source) {
+        (Width::Byte, ShiftSource::ImmediateTwo) => vec![0xc0, modrm, 2, 0xc3],
+        (Width::Word, ShiftSource::ImmediateTwo) => vec![0x66, 0xc1, modrm, 2, 0xc3],
+        (Width::Dword, ShiftSource::ImmediateTwo) => vec![0xc1, modrm, 2, 0xc3],
+        (Width::Qword, ShiftSource::ImmediateTwo) => vec![0x48, 0xc1, modrm, 2, 0xc3],
+        (Width::Byte, ShiftSource::Cl(_)) => vec![0xd2, modrm, 0xc3],
+        (Width::Word, ShiftSource::Cl(_)) => vec![0x66, 0xd3, modrm, 0xc3],
+        (Width::Dword, ShiftSource::Cl(_)) => vec![0xd3, modrm, 0xc3],
+        (Width::Qword, ShiftSource::Cl(_)) => vec![0x48, 0xd3, modrm, 0xc3],
+    }
+}
+
+fn shift_count(source: ShiftSource) -> u64 {
+    match source {
+        ShiftSource::ImmediateTwo => 2,
+        ShiftSource::Cl(count) => u64::from(count),
     }
 }
 
@@ -944,6 +1108,108 @@ fn run_native_or_immediate(width: Width, immediate: i8, lhs: u64) -> NativeResul
         (_, immediate) => unreachable!("unsupported OR immediate {immediate}"),
     }
 
+    NativeResult {
+        rax: result,
+        rflags,
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the x86-64 CPU oracle is isolated to this target-only test harness"
+)]
+fn run_native_shl_one(width: Width, sal_alias: bool, value: u64) -> NativeResult {
+    let mut result = value;
+    let rflags: u64;
+
+    macro_rules! execute {
+        ($instruction:literal) => {
+            // SAFETY: SHL modifies only declared RAX, records RFLAGS in declared
+            // RDX, and balances its temporary stack push/pop.
+            unsafe {
+                asm!(
+                    $instruction,
+                    "pushfq",
+                    "pop rdx",
+                    inout("rax") result,
+                    lateout("rdx") rflags,
+                );
+            }
+        };
+    }
+
+    match (width, sal_alias) {
+        (Width::Byte, false) => execute!("shl al, 1"),
+        (Width::Word, false) => execute!("shl ax, 1"),
+        (Width::Dword, false) => execute!("shl eax, 1"),
+        (Width::Qword, false) => execute!("shl rax, 1"),
+        (Width::Byte, true) => execute!(".byte 0xd0, 0xf0"),
+        (Width::Word, true) => execute!(".byte 0x66, 0xd1, 0xf0"),
+        (Width::Dword, true) => execute!(".byte 0xd1, 0xf0"),
+        (Width::Qword, true) => execute!(".byte 0x48, 0xd1, 0xf0"),
+    }
+
+    NativeResult {
+        rax: result,
+        rflags,
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the x86-64 CPU oracle is isolated to this target-only test harness"
+)]
+fn run_native_general_shl(
+    width: Width,
+    sal_alias: bool,
+    source: ShiftSource,
+    value: u64,
+) -> NativeResult {
+    let mut result = value;
+    let mut count = shift_count(source);
+    let rflags: u64;
+
+    macro_rules! execute {
+        ($instruction:literal) => {
+            // SAFETY: SHL modifies only declared RAX/RFLAGS, reads count from
+            // either its encoding or declared RCX, and balances push/pop.
+            unsafe {
+                asm!(
+                    $instruction,
+                    "pushfq",
+                    "pop rdx",
+                    inout("rax") result,
+                    inout("rcx") count,
+                    lateout("rdx") rflags,
+                );
+            }
+        };
+    }
+
+    match (width, sal_alias, source) {
+        (Width::Byte, false, ShiftSource::ImmediateTwo) => execute!("shl al, 2"),
+        (Width::Word, false, ShiftSource::ImmediateTwo) => execute!("shl ax, 2"),
+        (Width::Dword, false, ShiftSource::ImmediateTwo) => execute!("shl eax, 2"),
+        (Width::Qword, false, ShiftSource::ImmediateTwo) => execute!("shl rax, 2"),
+        (Width::Byte, true, ShiftSource::ImmediateTwo) => execute!(".byte 0xc0, 0xf0, 0x02"),
+        (Width::Word, true, ShiftSource::ImmediateTwo) => {
+            execute!(".byte 0x66, 0xc1, 0xf0, 0x02")
+        }
+        (Width::Dword, true, ShiftSource::ImmediateTwo) => execute!(".byte 0xc1, 0xf0, 0x02"),
+        (Width::Qword, true, ShiftSource::ImmediateTwo) => {
+            execute!(".byte 0x48, 0xc1, 0xf0, 0x02")
+        }
+        (Width::Byte, false, ShiftSource::Cl(_)) => execute!("shl al, cl"),
+        (Width::Word, false, ShiftSource::Cl(_)) => execute!("shl ax, cl"),
+        (Width::Dword, false, ShiftSource::Cl(_)) => execute!("shl eax, cl"),
+        (Width::Qword, false, ShiftSource::Cl(_)) => execute!("shl rax, cl"),
+        (Width::Byte, true, ShiftSource::Cl(_)) => execute!(".byte 0xd2, 0xf0"),
+        (Width::Word, true, ShiftSource::Cl(_)) => execute!(".byte 0x66, 0xd3, 0xf0"),
+        (Width::Dword, true, ShiftSource::Cl(_)) => execute!(".byte 0xd3, 0xf0"),
+        (Width::Qword, true, ShiftSource::Cl(_)) => execute!(".byte 0x48, 0xd3, 0xf0"),
+    }
+
+    core::hint::black_box(count);
     NativeResult {
         rax: result,
         rflags,
