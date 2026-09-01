@@ -104,10 +104,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
-          $summaryPattern = '^test result: ok[.] 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in [0-9]+([.][0-9]+)?s$'
+          $summaryPattern = '^test result: ok[.] 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in [0-9]+([.][0-9]+)?s$'
           $matchingSummaries = @($oracleOutput | Where-Object { $_ -match $summaryPattern })
           if ($matchingSummaries.Count -ne 1) {
-            throw "native VM differential oracle did not execute exactly ten passing tests"
+            throw "native VM differential oracle did not execute exactly eleven passing tests"
           }
 
       # The loader gate proper: imagehlp recomputes the checksum, the kernel maps

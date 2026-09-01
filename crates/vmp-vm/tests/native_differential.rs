@@ -59,6 +59,13 @@ struct NativeMovResult {
     flags_after: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct NativeWholeFunctionResult {
+    rax: u64,
+    r8: u64,
+    rflags: u64,
+}
+
 const BRANCH_TAKEN: u64 = 0x2222_2222_2222_2222;
 const BRANCH_NOT_TAKEN: u64 = 0x1111_1111_1111_1111;
 
@@ -275,6 +282,77 @@ fn native_test_flags_feed_all_conditional_branches_v1() {
     }
 }
 
+#[test]
+fn native_representative_integer_function_matches_lowered_decoded_host_v1() {
+    let function = representative_integer_function();
+    let lowered = lower(&function).expect("representative integer function must lower");
+    let encoded = encode(&lowered).expect("representative integer function must encode");
+    let decoded =
+        decode(&encoded).expect("representative integer bytecode must decode independently");
+    let mut observed_greater = false;
+    let mut observed_less = false;
+    let mut observed_equal = false;
+
+    for (rax, rcx, rdx, rsi, rdi) in representative_integer_vectors() {
+        let mut initial = MachineState::default();
+        initial.set_register(Register::Rax, rax);
+        initial.set_register(Register::Rcx, rcx);
+        initial.set_register(Register::Rdx, rdx);
+        initial.set_register(Register::Rsi, rsi);
+        initial.set_register(Register::Rdi, rdi);
+        let vm = execute(&decoded, initial).expect("representative integer VM must terminate");
+        let native = run_native_representative_integer(rax, rcx, rdx, rsi, rdi);
+
+        assert_eq!(vm.termination(), Termination::Ret);
+        assert_eq!(vm.state().stack_len(), 0);
+        assert_eq!(vm.state().register(Register::Rax), native.rax);
+        assert_eq!(vm.state().register(Register::R8), native.r8);
+        assert_eq!(vm.state().register(Register::Rcx), rcx);
+        assert_eq!(vm.state().register(Register::Rdx), rdx);
+        assert_eq!(vm.state().register(Register::Rsi), rsi);
+        assert_eq!(vm.state().register(Register::Rdi), rdi);
+        for register in [
+            Register::Rbx,
+            Register::Rbp,
+            Register::R9,
+            Register::R10,
+            Register::R11,
+            Register::R12,
+            Register::R13,
+            Register::R14,
+            Register::R15,
+        ] {
+            assert_eq!(
+                vm.state().register(register),
+                0,
+                "representative integer function corrupted {register:?}"
+            );
+        }
+        assert_eq!(vm.state().flags_defined(), ARITHMETIC_DEFINED);
+        assert_eq!(
+            vm.state().flags_bits() & ARITHMETIC_DEFINED,
+            native.rflags & ARITHMETIC_DEFINED,
+            "representative integer flags mismatch for rax=0x{rax:x}, rcx=0x{rcx:x}, rdx=0x{rdx:x}, rsi=0x{rsi:x}, rdi=0x{rdi:x}"
+        );
+        observed_greater |= native.r8 > rdi;
+        observed_less |= native.r8 < rdi;
+        observed_equal |= native.r8 == rdi;
+    }
+
+    assert!(
+        observed_greater,
+        "representative fixture never exercised its strict-greater path"
+    );
+    assert!(
+        observed_less,
+        "representative fixture never exercised its strict-less path"
+    );
+    assert!(
+        observed_equal,
+        "representative fixture never exercised its equality boundary"
+    );
+}
+
 fn all_conditions() -> [Condition; 16] {
     [
         Condition::O,
@@ -306,6 +384,19 @@ fn branch_vectors() -> [(u64, u64); 8] {
         (0x8000_0000_0000_0000, u64::MAX),
         (u64::MAX, 0x7fff_ffff_ffff_ffff),
         (0x1122_3344_5566_7788, 0x8877_6655_4433_2211),
+    ]
+}
+
+fn representative_integer_vectors() -> [(u64, u64, u64, u64, u64); 8] {
+    [
+        (0, 0, 0, u64::MAX, 0),
+        (1, 2, 3, u64::MAX, 0),
+        (u64::MAX, 1, 0, u64::MAX, 1),
+        (0x7fff_ffff_ffff_ffff, 1, 0, u64::MAX, u64::MAX),
+        (0x8000_0000_0000_0000, u64::MAX, 1, u64::MAX, 7),
+        (0x1122_3344_5566_7788, 0x10, 0xff, 0xffff, 0x8000),
+        (0xaaaa_aaaa_aaaa_aaaa, 0x5555_5555_5555_5555, 0, 0xff, 0xff),
+        (0x4000_0000_0000_0000, 0, 0, u64::MAX, 0x7fff_ffff_ffff_ffff),
     ]
 }
 
@@ -413,6 +504,31 @@ fn test_branching_function(condition: Condition) -> Function {
     let pe = PeFile::parse(&image).expect("TEST branch fixture must be a valid PE32+ image");
     decode_function(Image::new(&pe, &image), Rva(0x1000))
         .expect("production decoder must recover the TEST branch CFG")
+}
+
+fn representative_integer_function() -> Function {
+    // r8 = (((rax + rcx) ^ rdx) << 1) & rsi | 1;
+    // return r8 > rdi ? r8 - rdi : rdi - r8;
+    let text = [
+        0x49, 0x89, 0xc0, // mov r8, rax
+        0x49, 0x01, 0xc8, // add r8, rcx
+        0x49, 0x31, 0xd0, // xor r8, rdx
+        0x49, 0xd1, 0xe0, // shl r8, 1
+        0x49, 0x21, 0xf0, // and r8, rsi
+        0x49, 0x83, 0xc8, 0x01, // or r8, 1
+        0x49, 0x39, 0xf8, // cmp r8, rdi
+        0x76, 0x07, // jbe else
+        0x4c, 0x89, 0xc0, // mov rax, r8
+        0x48, 0x29, 0xf8, // sub rax, rdi
+        0xc3, // ret
+        0x48, 0x89, 0xf8, // else: mov rax, rdi
+        0x4c, 0x29, 0xc0, // sub rax, r8
+        0xc3, // ret
+    ];
+    let image = minimal_pe64(&text);
+    let pe = PeFile::parse(&image).expect("representative fixture must be a valid PE32+ image");
+    decode_function(Image::new(&pe, &image), Rva(0x1000))
+        .expect("production decoder must recover the representative function CFG")
 }
 
 fn minimal_pe64(text: &[u8]) -> Vec<u8> {
@@ -1304,6 +1420,59 @@ fn run_native_test(width: Width, immediate: Option<i8>, lhs: u64, rhs: u64) -> N
     }
 
     NativeCmpResult { rax, rcx, rflags }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the x86-64 CPU oracle is isolated to this target-only test harness"
+)]
+fn run_native_representative_integer(
+    rax: u64,
+    rcx: u64,
+    rdx: u64,
+    rsi: u64,
+    rdi: u64,
+) -> NativeWholeFunctionResult {
+    let mut result = rax;
+    let scratch: u64;
+    let rflags: u64;
+
+    // SAFETY: the sequence reads only declared inputs, writes declared RAX/R8/R9,
+    // and balances the temporary push/pop used to capture its final flags.
+    unsafe {
+        asm!(
+            "mov r8, rax",
+            "add r8, rcx",
+            "xor r8, rdx",
+            "shl r8, 1",
+            "and r8, rsi",
+            "or r8, 1",
+            "cmp r8, rdi",
+            "jbe 2f",
+            "mov rax, r8",
+            "sub rax, rdi",
+            "jmp 3f",
+            "2:",
+            "mov rax, rdi",
+            "sub rax, r8",
+            "3:",
+            "pushfq",
+            "pop r9",
+            inout("rax") result,
+            in("rcx") rcx,
+            in("rdx") rdx,
+            in("rsi") rsi,
+            in("rdi") rdi,
+            lateout("r8") scratch,
+            lateout("r9") rflags,
+        );
+    }
+
+    NativeWholeFunctionResult {
+        rax: result,
+        r8: scratch,
+        rflags,
+    }
 }
 
 #[allow(
