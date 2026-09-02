@@ -11,6 +11,7 @@ pub const MAX_RUNTIME_CODE_SIZE: usize = 1024 * 1024 - 16;
 const MAX_RUNTIME_STEPS: u32 = 1_000_000;
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RuntimeTrap {
     #[error("runtime bytecode size {size} exceeds {maximum}")]
     BytecodeTooLarge { size: usize, maximum: usize },
