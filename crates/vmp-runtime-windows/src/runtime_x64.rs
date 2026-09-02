@@ -3,22 +3,32 @@
 #![allow(unsafe_code)]
 
 use core::arch::naked_asm;
+use thiserror::Error;
 
 /// Maximum v1 instruction-stream size: 1 MiB container minus its 16-byte header.
 pub const MAX_RUNTIME_CODE_SIZE: usize = 1024 * 1024 - 16;
 
 const MAX_RUNTIME_STEPS: u32 = 1_000_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeTrap {
+    #[error("runtime bytecode size {size} exceeds {maximum}")]
     BytecodeTooLarge { size: usize, maximum: usize },
+    #[error("truncated runtime bytecode")]
     TruncatedBytecode,
+    #[error("unsupported runtime opcode")]
     UnsupportedOpcode,
+    #[error("invalid runtime operand")]
     InvalidOperand,
+    #[error("runtime VM stack underflow")]
     StackUnderflow,
+    #[error("runtime VM stack overflow")]
     StackOverflow,
+    #[error("runtime VM stack is not empty at return")]
     NonEmptyStack,
+    #[error("runtime RFLAGS restoration mismatch")]
     FlagRestoreMismatch,
+    #[error("runtime VM step limit reached")]
     StepLimit,
 }
 

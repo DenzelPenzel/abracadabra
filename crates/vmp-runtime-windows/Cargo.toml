@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+thiserror.workspace = true
 vmp-types = { version = "0.1.0", path = "../vmp-types" }
 
 [dev-dependencies]
