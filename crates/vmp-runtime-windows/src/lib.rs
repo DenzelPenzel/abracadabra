@@ -42,4 +42,55 @@ mod tests {
         assert_eq!(execution.rax, 3);
         assert_eq!(execution.rflags & 0x8d5, 0x15);
     }
+
+    #[test]
+    fn raw_gate_rejects_malformed_bytecode_without_reading_past_end() {
+        assert_eq!(
+            execute_raw_gate(&[], 1, 2),
+            Err(RuntimeTrap::TruncatedBytecode)
+        );
+        assert_eq!(
+            execute_raw_gate(&[0x11, 8], 1, 2),
+            Err(RuntimeTrap::TruncatedBytecode)
+        );
+        assert_eq!(
+            execute_raw_gate(&[0xff], 1, 2),
+            Err(RuntimeTrap::UnsupportedOpcode)
+        );
+        assert_eq!(
+            execute_raw_gate(&[0x11, 8, 3], 1, 2),
+            Err(RuntimeTrap::InvalidOperand)
+        );
+    }
+
+    #[test]
+    fn raw_gate_enforces_operand_stack_contract() {
+        assert_eq!(
+            execute_raw_gate(&[0x20, 8], 1, 2),
+            Err(RuntimeTrap::StackUnderflow)
+        );
+        assert_eq!(
+            execute_raw_gate(&[0x11, 8, 1, 0x01], 1, 2),
+            Err(RuntimeTrap::NonEmptyStack)
+        );
+
+        let seventeen_pushes = [0x11, 8, 1].repeat(17);
+        assert_eq!(
+            execute_raw_gate(&seventeen_pushes, 1, 2),
+            Err(RuntimeTrap::StackOverflow)
+        );
+    }
+
+    #[test]
+    fn raw_gate_rejects_bytecode_over_the_v1_code_limit_before_dispatch() {
+        let oversized = vec![0x01; MAX_RUNTIME_CODE_SIZE + 1];
+
+        assert_eq!(
+            execute_raw_gate(&oversized, 1, 2),
+            Err(RuntimeTrap::BytecodeTooLarge {
+                size: MAX_RUNTIME_CODE_SIZE + 1,
+                maximum: MAX_RUNTIME_CODE_SIZE,
+            })
+        );
+    }
 }
