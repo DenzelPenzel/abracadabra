@@ -1,14 +1,7 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Embedded Windows x64 VM runtime.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[cfg(target_arch = "x86_64")]
+mod runtime_x64;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+#[cfg(target_arch = "x86_64")]
+pub use runtime_x64::{execute_raw_gate, RuntimeExecution, RuntimeTrap, MAX_RUNTIME_CODE_SIZE};
