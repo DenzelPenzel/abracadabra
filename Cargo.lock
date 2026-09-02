@@ -376,6 +376,7 @@ name = "vmp-runtime-windows"
 version = "0.1.0"
 dependencies = [
  "vmp-types",
+ "vmp-vm",
 ]
 
 [[package]]

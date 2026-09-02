@@ -6,5 +6,8 @@ edition = "2021"
 [dependencies]
 vmp-types = { version = "0.1.0", path = "../vmp-types" }
 
+[dev-dependencies]
+vmp-vm = { version = "0.1.0", path = "../vmp-vm" }
+
 [lints]
 workspace = true
