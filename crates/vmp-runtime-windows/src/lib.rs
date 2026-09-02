@@ -93,4 +93,26 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn runtime_traps_implement_the_workspace_error_contract() {
+        let trap = RuntimeTrap::BytecodeTooLarge {
+            size: MAX_RUNTIME_CODE_SIZE + 1,
+            maximum: MAX_RUNTIME_CODE_SIZE,
+        };
+        let error: &dyn std::error::Error = &trap;
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "runtime bytecode size {} exceeds {}",
+                MAX_RUNTIME_CODE_SIZE + 1,
+                MAX_RUNTIME_CODE_SIZE
+            )
+        );
+        assert_eq!(
+            RuntimeTrap::FlagRestoreMismatch.to_string(),
+            "runtime RFLAGS restoration mismatch"
+        );
+    }
 }
