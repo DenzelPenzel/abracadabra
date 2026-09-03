@@ -4,9 +4,10 @@
 
 use core::arch::naked_asm;
 use thiserror::Error;
+use vmp_vm::bytecode::{decode, DecodeError, MAX_CONTAINER_SIZE, V1_HEADER_SIZE};
 
 /// Maximum v1 instruction-stream size: 1 MiB container minus its 16-byte header.
-pub const MAX_RUNTIME_CODE_SIZE: usize = 1024 * 1024 - 16;
+pub const MAX_RUNTIME_CODE_SIZE: usize = MAX_CONTAINER_SIZE - V1_HEADER_SIZE;
 
 const MAX_RUNTIME_STEPS: u32 = 1_000_000;
 
@@ -33,6 +34,16 @@ pub enum RuntimeTrap {
     StepLimit,
 }
 
+/// Failure at the validated bytecode boundary or inside the native runtime.
+#[derive(Debug, Error, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RuntimeError {
+    #[error(transparent)]
+    Decode(#[from] DecodeError),
+    #[error(transparent)]
+    Trap(#[from] RuntimeTrap),
+}
+
 /// Guest state observable after the raw runtime returns to native code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeExecution {
@@ -52,11 +63,23 @@ struct GateOutput {
     rdx: u64,
 }
 
-/// Execute the first register-only runtime slice through a raw Win64 gate.
+/// Validate a v1 container before executing its entry point through a Win64 gate.
 ///
 /// The accepted bytecode subset is `PushReg` for RCX/RDX, qword `Add`,
 /// `PopReg` to RAX, and `Ret`. All bytecode fetches and operand-stack accesses
 /// are bounded and fail closed with [`RuntimeTrap`].
+pub fn execute_validated_gate(
+    container: &[u8],
+    lhs: u64,
+    rhs: u64,
+) -> Result<RuntimeExecution, RuntimeError> {
+    let program = decode(container)?;
+    let entry = V1_HEADER_SIZE + program.entry_offset() as usize;
+    let code = &container[entry..];
+    Ok(execute_raw_gate(code, lhs, rhs)?)
+}
+
+#[inline(never)]
 pub fn execute_raw_gate(code: &[u8], lhs: u64, rhs: u64) -> Result<RuntimeExecution, RuntimeTrap> {
     if code.len() > MAX_RUNTIME_CODE_SIZE {
         return Err(RuntimeTrap::BytecodeTooLarge {

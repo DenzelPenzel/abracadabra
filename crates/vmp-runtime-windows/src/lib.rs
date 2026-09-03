@@ -4,7 +4,12 @@
 mod runtime_x64;
 
 #[cfg(target_arch = "x86_64")]
-pub use runtime_x64::{execute_raw_gate, RuntimeExecution, RuntimeTrap, MAX_RUNTIME_CODE_SIZE};
+pub use runtime_x64::{
+    execute_validated_gate, RuntimeError, RuntimeExecution, RuntimeTrap, MAX_RUNTIME_CODE_SIZE,
+};
+
+#[cfg(all(test, target_arch = "x86_64"))]
+use runtime_x64::execute_raw_gate;
 
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
