@@ -14,13 +14,33 @@ use runtime_x64::execute_raw_gate;
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
     use super::*;
-    use vmp_vm::bytecode::{encode, Instruction, Program, Register, Width};
+    use vmp_vm::bytecode::{decode, encode, DecodeError, Instruction, Program, Register, Width};
+    use vmp_vm::host::{execute, MachineState, Termination};
 
     #[test]
-    fn raw_gate_executes_qword_add_and_returns_to_native_caller() {
-        let container = encode(&Program::new(
+    fn validated_gate_rejects_a_later_unknown_opcode_before_execution() {
+        let mut container = encode(&Program::new(
             0,
+            vec![Instruction::Add(Width::Qword), Instruction::Ret],
+        ))
+        .expect("fixture must encode");
+        container[18] = 0xff;
+
+        assert!(matches!(
+            execute_validated_gate(&container, 1, 2),
+            Err(RuntimeError::Decode(DecodeError::UnknownOpcode {
+                code_offset: 2,
+                opcode: 0xff,
+            }))
+        ));
+    }
+
+    #[test]
+    fn validated_gate_matches_host_for_qword_add_corpus() {
+        let container = encode(&Program::new(
+            1,
             vec![
+                Instruction::Ret,
                 Instruction::PushReg {
                     width: Width::Qword,
                     register: Register::Rcx,
@@ -39,13 +59,36 @@ mod tests {
         ))
         .expect("fixture must encode");
         let code = &container[16..];
-        assert_eq!(code, [0x11, 8, 1, 0x11, 8, 2, 0x20, 8, 0x12, 8, 0, 0x01]);
+        assert_eq!(
+            code,
+            [0x01, 0x11, 8, 1, 0x11, 8, 2, 0x20, 8, 0x12, 8, 0, 0x01]
+        );
+        let program = decode(&container).expect("fixture must validate");
 
-        let execution = execute_raw_gate(code, 0xffff_ffff_ffff_fffe, 5)
-            .expect("valid bytecode must return to the native caller");
+        for (lhs, rhs) in [
+            (0, 0),
+            (1, 2),
+            (u64::MAX, 1),
+            (i64::MAX as u64, 1),
+            (0xffff_ffff_ffff_fffe, 5),
+            (0x0f, 1),
+        ] {
+            let mut initial = MachineState::default();
+            initial.set_register(Register::Rax, 0xfeed_face_cafe_beef);
+            initial.set_register(Register::Rcx, lhs);
+            initial.set_register(Register::Rdx, rhs);
+            let host = execute(&program, initial).expect("host must execute validated fixture");
+            let native = execute_validated_gate(&container, lhs, rhs)
+                .expect("native runtime must execute validated fixture");
+            let defined = host.state().flags_defined();
 
-        assert_eq!(execution.rax, 3);
-        assert_eq!(execution.rflags & 0x8d5, 0x15);
+            assert_eq!(host.termination(), Termination::Ret);
+            assert_eq!(defined, 0x8d5);
+            assert_eq!(native.rax, host.state().register(Register::Rax));
+            assert_eq!(native.rcx, host.state().register(Register::Rcx));
+            assert_eq!(native.rdx, host.state().register(Register::Rdx));
+            assert_eq!(native.rflags & defined, host.state().flags_bits() & defined);
+        }
     }
 
     #[test]
