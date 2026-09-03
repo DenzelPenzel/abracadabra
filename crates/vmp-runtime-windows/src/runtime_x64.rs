@@ -37,6 +37,8 @@ pub enum RuntimeTrap {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeExecution {
     pub rax: u64,
+    pub rcx: u64,
+    pub rdx: u64,
     pub rflags: u64,
 }
 
@@ -46,6 +48,8 @@ struct GateOutput {
     rax: u64,
     runtime_rflags: u64,
     observed_rflags: u64,
+    rcx: u64,
+    rdx: u64,
 }
 
 /// Execute the first register-only runtime slice through a raw Win64 gate.
@@ -66,6 +70,8 @@ pub fn execute_raw_gate(code: &[u8], lhs: u64, rhs: u64) -> Result<RuntimeExecut
         rax: 0,
         runtime_rflags: 0,
         observed_rflags: 0,
+        rcx: 0,
+        rdx: 0,
     };
     let code_end = code.as_ptr().wrapping_add(code.len());
 
@@ -84,6 +90,8 @@ pub fn execute_raw_gate(code: &[u8], lhs: u64, rhs: u64) -> Result<RuntimeExecut
     match output.status {
         0 if output.runtime_rflags == output.observed_rflags => Ok(RuntimeExecution {
             rax: output.rax,
+            rcx: output.rcx,
+            rdx: output.rdx,
             rflags: output.observed_rflags,
         }),
         0 => Err(RuntimeTrap::FlagRestoreMismatch),
@@ -123,6 +131,8 @@ unsafe extern "win64" fn raw_gate(
         // changing any guest register or flag.
         "push r10",
         "mov r10, qword ptr [rsp + 48]",
+        "mov qword ptr [r10 + 32], rcx",
+        "mov qword ptr [r10 + 40], rdx",
         "push rax",
         "pushfq",
         "pop rax",
