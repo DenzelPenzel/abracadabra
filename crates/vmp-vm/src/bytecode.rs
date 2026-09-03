@@ -4,7 +4,8 @@ use thiserror::Error;
 
 const MAGIC: &[u8; 4] = b"VMPB";
 const VERSION: u16 = 1;
-pub(crate) const HEADER_SIZE: usize = 16;
+/// Fixed byte size of the v1 container header.
+pub const V1_HEADER_SIZE: usize = 16;
 
 /// Maximum accepted or emitted v1 container size.
 pub const MAX_CONTAINER_SIZE: usize = 1024 * 1024;
@@ -316,7 +317,7 @@ pub fn encode(program: &Program) -> Result<Vec<u8>, EncodeError> {
             }
         }
     }
-    let total_size = HEADER_SIZE
+    let total_size = V1_HEADER_SIZE
         .checked_add(code_size)
         .ok_or(EncodeError::SizeOverflow)?;
     if total_size > MAX_CONTAINER_SIZE {
@@ -336,7 +337,7 @@ pub fn encode(program: &Program) -> Result<Vec<u8>, EncodeError> {
         })?;
     output.extend_from_slice(MAGIC);
     output.extend_from_slice(&VERSION.to_le_bytes());
-    output.extend_from_slice(&(HEADER_SIZE as u16).to_le_bytes());
+    output.extend_from_slice(&(V1_HEADER_SIZE as u16).to_le_bytes());
     output.extend_from_slice(&code_size_u32.to_le_bytes());
     output.extend_from_slice(&program.entry_offset.to_le_bytes());
     for instruction in &program.instructions {
@@ -405,9 +406,9 @@ pub fn decode(input: &[u8]) -> Result<Program, DecodeError> {
             maximum: MAX_CONTAINER_SIZE,
         });
     }
-    if input.len() < HEADER_SIZE {
+    if input.len() < V1_HEADER_SIZE {
         return Err(DecodeError::TruncatedHeader {
-            needed: HEADER_SIZE,
+            needed: V1_HEADER_SIZE,
             actual: input.len(),
         });
     }
@@ -419,13 +420,13 @@ pub fn decode(input: &[u8]) -> Result<Program, DecodeError> {
         return Err(DecodeError::UnsupportedVersion { version });
     }
     let header_size = read_header_u16(input, 6)?;
-    if usize::from(header_size) != HEADER_SIZE {
+    if usize::from(header_size) != V1_HEADER_SIZE {
         return Err(DecodeError::UnsupportedHeaderSize { size: header_size });
     }
     let code_size =
         usize::try_from(read_header_u32(input, 8)?).map_err(|_| DecodeError::SizeOverflow)?;
     let entry_offset = read_header_u32(input, 12)?;
-    let declared = HEADER_SIZE
+    let declared = V1_HEADER_SIZE
         .checked_add(code_size)
         .ok_or(DecodeError::SizeOverflow)?;
     if declared > MAX_CONTAINER_SIZE {
@@ -441,7 +442,7 @@ pub fn decode(input: &[u8]) -> Result<Program, DecodeError> {
         });
     }
     let code = input
-        .get(HEADER_SIZE..declared)
+        .get(V1_HEADER_SIZE..declared)
         .ok_or(DecodeError::LengthMismatch {
             declared,
             actual: input.len(),

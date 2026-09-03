@@ -3,8 +3,8 @@
 use thiserror::Error;
 
 use crate::bytecode::{
-    Condition, Instruction, Program, Register, Width, HEADER_SIZE, MAX_CONTAINER_SIZE,
-    MAX_INSTRUCTIONS,
+    Condition, Instruction, Program, Register, Width, MAX_CONTAINER_SIZE, MAX_INSTRUCTIONS,
+    V1_HEADER_SIZE,
 };
 
 const MAX_STACK_SLOTS: usize = 4_096;
@@ -278,7 +278,7 @@ fn instruction_offsets(program: &Program) -> Result<Vec<u32>, ExecutionError> {
             .checked_add(instruction.encoded_len())
             .ok_or(ExecutionError::SizeOverflow)?;
     }
-    let container_size = HEADER_SIZE
+    let container_size = V1_HEADER_SIZE
         .checked_add(code_size)
         .ok_or(ExecutionError::SizeOverflow)?;
     if container_size > MAX_CONTAINER_SIZE {
