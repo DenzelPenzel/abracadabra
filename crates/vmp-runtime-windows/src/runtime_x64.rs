@@ -681,4 +681,32 @@ mod tests {
 
         assert_eq!(observed.status, status::OK);
     }
+
+    #[test]
+    fn production_entry_rejects_malformed_code_bounds_before_fetch() {
+        let code = [0xff, 0x01];
+        let start = code.as_ptr();
+        let end = start.wrapping_add(code.len());
+        let blob = emit_interpreter().expect("the interpreter must assemble");
+        let mapping = map_executable(blob.bytes()).expect("the mapping must succeed");
+        // SAFETY: the mapping contains the emitted test adapter at this offset.
+        let gate = unsafe { gate_at(mapping + blob.test_entry_offset() as usize) };
+
+        for (base, entry, code_end, expected) in [
+            (start.wrapping_add(1), start, end, status::INVALID_OPERAND),
+            (
+                start.wrapping_add(1),
+                start.wrapping_add(1),
+                start,
+                status::INVALID_OPERAND,
+            ),
+            (start, end, end, status::TRUNCATED_BYTECODE),
+            (start, end.wrapping_add(1), end, status::INVALID_OPERAND),
+        ] {
+            let observed = run_gate_observed_bounds(gate, base, entry, code_end, sentinel_state())
+                .expect("malformed bounds must return through the adapter");
+
+            assert_eq!(observed.status, expected);
+        }
+    }
 }
