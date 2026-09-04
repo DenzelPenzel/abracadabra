@@ -372,6 +372,12 @@ fn emit_dispatcher(
     asm.mov(rsi, qword_ptr(r15 + ENTRY_CODE_BASE))?;
     asm.mov(r13, qword_ptr(r15 + ENTRY_PC))?;
     asm.mov(r12, qword_ptr(r15 + ENTRY_CODE_END))?;
+    asm.cmp(rsi, r12)?;
+    asm.ja(invalid_operand)?;
+    asm.cmp(r13, rsi)?;
+    asm.jb(invalid_operand)?;
+    asm.cmp(r13, r12)?;
+    asm.ja(invalid_operand)?;
     // Reserve a bounded operand stack above RSP and keep its empty top in R11,
     // so the dispatcher's own pushes below RSP cannot reach operand slots.
     asm.sub(rsp, OPERAND_STACK_BYTES)?;
