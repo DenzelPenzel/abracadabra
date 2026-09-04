@@ -299,6 +299,19 @@ are places where C++ is **not** a usable template.
   succeeds. The Unix mapping path needs no flush: it only ever compiles for x86-64.
 - C++ has no host reference interpreter at all. `vmp-vm::host` is a new Rust safety oracle,
   and it — not the C++ — is the normative model the native runtime must match.
+- C++ `check_stack` protects its internal `REP MOVS` with `PUSHF; CLD; ...; POPF`
+  (`core/intel.cc:28809-28815`), so it restores the incoming `DF`. Variant A deliberately keeps
+  VM-visible flags in its control frame but normalises `DF=0` before native Win64 continuation.
+  `IF` is preserved. Active `TF`/`AC` are target-exception cases and belong to the
+  registered-unwind proof, not the pre-unwind normal-return harness.
+- A defense-in-depth status after canonical v1 validation is an internal contract violation:
+  the production trampoline uses `FAST_FAIL_FATAL_APP_EXIT` and never resumes the original
+  function. The standalone status slot remains test transport, not part of the protected
+  function ABI.
+- Variant A touches at most 272 bytes below the emitted production-entry `RSP`: 128 bytes of
+  saved GPR/RFLAGS context, up to eight bytes of alignment, the 128-byte operand stack, and one
+  transient handler qword. The complete protected-function extent is 320 bytes below its
+  original Win64 entry `RSP` after adding five metadata qwords and the dispatcher call return.
 
 ## Open decisions — do not settle these unilaterally
 

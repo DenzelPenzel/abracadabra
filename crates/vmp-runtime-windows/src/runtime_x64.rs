@@ -786,6 +786,28 @@ mod tests {
     }
 
     #[test]
+    fn production_entry_clears_df_before_native_continuation() {
+        const DF: u64 = 1 << 10;
+        const IF: u64 = 1 << 9;
+
+        let code = [0x01];
+        let blob = emit_interpreter().expect("the interpreter must assemble");
+        let mapping = map_executable(blob.bytes()).expect("the mapping must succeed");
+        // SAFETY: the mapping contains the emitted test adapter at this offset.
+        let gate = unsafe { gate_at(mapping + blob.test_entry_offset() as usize) };
+        let mut initial = sentinel_state();
+        initial.rflags |= DF;
+
+        let observed = run_gate_observed(gate, &code, 0, initial)
+            .expect("the production entry must return through the adapter");
+
+        assert_eq!(observed.status, status::OK);
+        assert_eq!(observed.runtime_rflags & DF, DF);
+        assert_eq!(observed.observed_rflags & DF, 0);
+        assert_eq!(observed.observed_rflags & IF, initial.rflags & IF);
+    }
+
+    #[test]
     fn production_entry_receives_code_base_and_entry_pc_separately() {
         let code = [0xff, 0x01];
         let blob = emit_interpreter().expect("the interpreter must assemble");

@@ -3,6 +3,9 @@ name = "vmp-runtime-windows"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+windows-runtime-probe = []
+
 [dependencies]
 iced-x86.workspace = true
 thiserror.workspace = true
@@ -11,3 +14,8 @@ vmp-vm = { version = "0.1.0", path = "../vmp-vm" }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "windows_runtime"
+path = "tests/windows_runtime.rs"
+required-features = ["windows-runtime-probe"]
