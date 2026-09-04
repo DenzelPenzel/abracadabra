@@ -88,6 +88,34 @@ jobs:
           echo VMP_SDK_REGISTER_PROBE=%GITHUB_WORKSPACE%\ci-fixtures\sdk-register-probe.exe>>%GITHUB_ENV%
           echo VMP_SDK_STATIC_PROBE=%GITHUB_WORKSPACE%\ci-fixtures\sdk-static-probe.exe>>%GITHUB_ENV%
 
+      - name: Build VM runtime production-entry probe
+        shell: cmd
+        run: ml64 /nologo /c /Foci-fixtures\runtime-probe.obj crates\vmp-runtime-windows\tests\fixtures\runtime_probe.asm
+
+      - name: VM runtime production-entry gate
+        run: |
+          $object = Join-Path $env:GITHUB_WORKSPACE "ci-fixtures\runtime-probe.obj"
+          $env:RUSTFLAGS = "-C link-arg=$object"
+          $env:CARGO_TERM_COLOR = "never"
+          cargo clean -p vmp-runtime-windows
+
+          cargo test -p vmp-runtime-windows --features windows-runtime-probe --test windows_runtime -- --nocapture 2>&1 | Tee-Object -Variable debugOutput
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          cargo test -p vmp-runtime-windows --features windows-runtime-probe --test windows_runtime --release -- --nocapture 2>&1 | Tee-Object -Variable releaseOutput
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          $summaryPattern = '^test result: ok[.] 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in [0-9]+([.][0-9]+)?s$'
+          foreach ($output in @($debugOutput, $releaseOutput)) {
+            $matchingSummaries = @($output | Where-Object { $_ -match $summaryPattern })
+            if ($matchingSummaries.Count -ne 1) {
+              throw "production-entry gate did not execute exactly five passing tests"
+            }
+          }
+
       - name: Parser and writer suite over the built corpus
         env:
           VMP_CORPUS_DIR: ${{ github.workspace }}/ci-fixtures

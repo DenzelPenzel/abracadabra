@@ -4,7 +4,10 @@ mod emit;
 #[cfg(target_arch = "x86_64")]
 mod runtime_x64;
 
-pub use emit::{emit_interpreter, CodeRange, EmitError, RuntimeBlob};
+pub use emit::{
+    emit_interpreter, CodeRange, EmitError, RuntimeBlob, MAX_PRODUCTION_ENTRY_STACK_USAGE,
+    MAX_PROTECTED_FUNCTION_STACK_USAGE,
+};
 
 #[cfg(target_arch = "x86_64")]
 pub use runtime_x64::{

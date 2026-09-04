@@ -45,6 +45,18 @@ const ENTRY_RUNTIME_RFLAGS: i32 = 168;
 /// Bytes reserved for the bounded VM operand stack, above the native RSP.
 const OPERAND_STACK_BYTES: i32 = 128;
 
+/// Maximum bytes touched below the emitted production-entry RSP.
+///
+/// This includes the saved native context, alignment padding, the operand
+/// stack, and one transient handler push.
+pub const MAX_PRODUCTION_ENTRY_STACK_USAGE: usize = 272;
+
+/// Maximum bytes touched below the original protected-function entry RSP.
+///
+/// This adds five trampoline metadata slots and the production-entry return
+/// address to the emitted entry's physical stack depth.
+pub const MAX_PROTECTED_FUNCTION_STACK_USAGE: usize = 320;
+
 // Field offsets of the test adapter input and output records. They must agree
 // with the `#[repr(C)]` layouts in `runtime_x64`.
 const IN_CODE_BASE: i32 = 0;
@@ -517,6 +529,8 @@ fn emit_dispatcher(
     asm.pop(rcx)?;
     asm.pop(rax)?;
     asm.popfq()?;
+    // Native Win64 continuation always starts with forward string direction
+    asm.cld()?;
     asm.ret()?;
 
     Ok(())
@@ -531,6 +545,8 @@ mod tests {
     fn the_emitted_blob_separates_test_and_production_ranges() {
         let blob = emit_interpreter().expect("the interpreter must assemble");
 
+        assert_eq!(MAX_PRODUCTION_ENTRY_STACK_USAGE, 272);
+        assert_eq!(MAX_PROTECTED_FUNCTION_STACK_USAGE, 320);
         assert_eq!(blob.test_entry_offset(), 0);
         assert_ne!(blob.test_entry_offset(), blob.production_entry_offset());
         assert_eq!(blob.test_adapter_range().start(), blob.test_entry_offset());
