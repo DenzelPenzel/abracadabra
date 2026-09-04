@@ -1,5 +1,8 @@
 //! Embedded Windows x64 VM runtime.
 
+mod emit;
+pub use emit::{emit_interpreter, EmitError, RuntimeBlob};
+
 #[cfg(target_arch = "x86_64")]
 mod runtime_x64;
 
