@@ -2,7 +2,7 @@ use iced_x86::code_asm::{
     al, byte_ptr, eax, ebp, qword_ptr, r10, r11, r12, r13, r14, r15, r8, r9, rax, rbp, rbx, rcx,
     rdi, rdx, rsi, rsp, CodeAssembler, CodeLabel,
 };
-use iced_x86::IcedError;
+use iced_x86::{BlockEncoderOptions, IcedError};
 use thiserror::Error;
 
 /// Bytecode steps one gate entry may dispatch before it fails closed.
@@ -72,7 +72,26 @@ impl From<IcedError> for EmitError {
     }
 }
 
-/// Emitted interpreter bytes and the offset of their Win64 entry point.
+/// Half-open machine-code range within an emitted runtime blob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodeRange {
+    start: u32,
+    end: u32,
+}
+
+impl CodeRange {
+    /// Offset of the first byte in the range.
+    pub fn start(self) -> u32 {
+        self.start
+    }
+
+    /// Offset immediately after the range.
+    pub fn end(self) -> u32 {
+        self.end
+    }
+}
+
+/// Emitted interpreter bytes and offsets of its callable entry points.
 ///
 /// The bytes are position-independent: every branch is relative and stays
 /// inside the blob, and no operand holds an absolute address. Nothing in here
@@ -80,7 +99,11 @@ impl From<IcedError> for EmitError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeBlob {
     bytes: Vec<u8>,
-    entry_offset: u32,
+    test_entry_offset: u32,
+    production_entry_offset: u32,
+    test_adapter_range: CodeRange,
+    dispatcher_range: CodeRange,
+    handlers_range: CodeRange,
 }
 
 impl RuntimeBlob {
@@ -89,19 +112,38 @@ impl RuntimeBlob {
         &self.bytes
     }
 
-    /// Offset of the Win64 gate entry point within [`RuntimeBlob::bytes`].
-    pub fn entry_offset(&self) -> u32 {
-        self.entry_offset
+    /// Offset of the Win64 test adapter within [`RuntimeBlob::bytes`].
+    pub fn test_entry_offset(&self) -> u32 {
+        self.test_entry_offset
+    }
+
+    /// Offset of the native-state capture entry within [`RuntimeBlob::bytes`].
+    pub fn production_entry_offset(&self) -> u32 {
+        self.production_entry_offset
+    }
+
+    /// Machine-code range occupied by the Win64 test adapter.
+    pub fn test_adapter_range(&self) -> CodeRange {
+        self.test_adapter_range
+    }
+
+    /// Machine-code range occupied by state capture and opcode dispatch.
+    pub fn dispatcher_range(&self) -> CodeRange {
+        self.dispatcher_range
+    }
+
+    /// Machine-code range occupied by handlers and state restoration.
+    pub fn handlers_range(&self) -> CodeRange {
+        self.handlers_range
     }
 }
 
 /// Assemble the v1 interpreter.
 ///
-/// The blob holds two parts: a Win64 gate at [`RuntimeBlob::entry_offset`] that
-/// converts normal arguments into the dispatcher's entry frame and reports the
-/// guest state observed after the return, and the dispatcher itself. The
-/// accepted bytecode subset is `PushReg` for RCX/RDX, qword `Add`, `PopReg` to
-/// RAX, and `Ret`; everything else fails closed with a status code.
+/// The blob contains a Win64 test adapter, a separate native-state capture
+/// entry, the dispatcher, and its handlers. The accepted bytecode subset is
+/// `PushReg` for RCX/RDX, qword `Add`, `PopReg` to RAX, and `Ret`; everything
+/// else fails closed with a status code.
 pub fn emit_interpreter() -> Result<RuntimeBlob, EmitError> {
     emit_interpreter_at(0)
 }
@@ -114,6 +156,7 @@ pub fn emit_interpreter() -> Result<RuntimeBlob, EmitError> {
 pub(crate) fn emit_interpreter_at(ip: u64) -> Result<RuntimeBlob, EmitError> {
     let mut asm = CodeAssembler::new(64)?;
     let mut dispatch = asm.create_label();
+    let mut handlers = asm.create_label();
 
     // The Win64 gate: RCX is the bytecode pointer, RDX its end, R8 and R9 the
     // guest RCX and RDX, and the fifth stack argument the outcome record.
@@ -138,12 +181,48 @@ pub(crate) fn emit_interpreter_at(ip: u64) -> Result<RuntimeBlob, EmitError> {
     asm.pop(r10)?;
     asm.ret()?;
 
-    emit_dispatcher(&mut asm, &mut dispatch)?;
+    emit_dispatcher(&mut asm, &mut dispatch, &mut handlers)?;
 
-    let bytes = asm.assemble(ip)?;
+    let assembled =
+        asm.assemble_options(ip, BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS)?;
+    let production_entry_offset = label_offset(&assembled, &dispatch, ip)?;
+    let handlers_offset = label_offset(&assembled, &handlers, ip)?;
+    let bytes = assembled.inner.code_buffer;
+    let blob_end = u32::try_from(bytes.len()).map_err(|_| EmitError::Assembly {
+        reason: "interpreter exceeds the 32-bit blob offset range".to_owned(),
+    })?;
     Ok(RuntimeBlob {
         bytes,
-        entry_offset: 0,
+        test_entry_offset: 0,
+        production_entry_offset,
+        test_adapter_range: CodeRange {
+            start: 0,
+            end: production_entry_offset,
+        },
+        dispatcher_range: CodeRange {
+            start: production_entry_offset,
+            end: handlers_offset,
+        },
+        handlers_range: CodeRange {
+            start: handlers_offset,
+            end: blob_end,
+        },
+    })
+}
+
+fn label_offset(
+    assembled: &iced_x86::code_asm::CodeAssemblerResult,
+    label: &CodeLabel,
+    origin: u64,
+) -> Result<u32, EmitError> {
+    let offset = assembled
+        .label_ip(label)?
+        .checked_sub(origin)
+        .ok_or_else(|| EmitError::Assembly {
+            reason: "interpreter label precedes the blob origin".to_owned(),
+        })?;
+    u32::try_from(offset).map_err(|_| EmitError::Assembly {
+        reason: "interpreter label exceeds the 32-bit blob offset range".to_owned(),
     })
 }
 
@@ -152,9 +231,13 @@ pub(crate) fn emit_interpreter_at(ip: u64) -> Result<RuntimeBlob, EmitError> {
 /// Entry stack above the return address: bytecode begin, bytecode end, outcome
 /// pointer. The dispatcher captures all modeled GPRs and RFLAGS before it uses
 /// any of them as runtime scratch registers, and restores them on every exit.
-fn emit_dispatcher(asm: &mut CodeAssembler, dispatch: &mut CodeLabel) -> Result<(), EmitError> {
+fn emit_dispatcher(
+    asm: &mut CodeAssembler,
+    dispatch: &mut CodeLabel,
+    handlers: &mut CodeLabel,
+) -> Result<(), EmitError> {
     let mut fetch = asm.create_label();
-    let mut op_push_reg = asm.create_label();
+    let op_push_reg = *handlers;
     let mut push_rcx = asm.create_label();
     let mut push_store = asm.create_label();
     let mut op_pop_reg = asm.create_label();
@@ -219,7 +302,7 @@ fn emit_dispatcher(asm: &mut CodeAssembler, dispatch: &mut CodeLabel) -> Result<
     asm.jmp(unsupported)?;
 
     // PUSH_REG qword, bounded to RCX and RDX for this vertical slice.
-    asm.set_label(&mut op_push_reg)?;
+    asm.set_label(handlers)?;
     asm.mov(rax, r12)?;
     asm.sub(rax, r13)?;
     asm.cmp(rax, 2)?;
@@ -343,10 +426,22 @@ mod tests {
     use iced_x86::{Decoder, DecoderOptions, FlowControl, OpKind, Register};
 
     #[test]
-    fn the_emitted_blob_starts_at_its_win64_gate() {
+    fn the_emitted_blob_separates_test_and_production_ranges() {
         let blob = emit_interpreter().expect("the interpreter must assemble");
 
-        assert_eq!(blob.entry_offset(), 0);
+        assert_eq!(blob.test_entry_offset(), 0);
+        assert_ne!(blob.test_entry_offset(), blob.production_entry_offset());
+        assert_eq!(blob.test_adapter_range().start(), blob.test_entry_offset());
+        assert_eq!(
+            blob.test_adapter_range().end(),
+            blob.production_entry_offset()
+        );
+        assert_eq!(
+            blob.dispatcher_range().start(),
+            blob.production_entry_offset()
+        );
+        assert_eq!(blob.dispatcher_range().end(), blob.handlers_range().start());
+        assert_eq!(blob.handlers_range().end() as usize, blob.bytes().len());
         assert!(!blob.bytes().is_empty());
         // A single page keeps the eventual PE section arithmetic trivial.
         assert!(
@@ -363,7 +458,14 @@ mod tests {
             .expect("the interpreter must assemble at a mapped address");
 
         assert_eq!(low.bytes(), high.bytes());
-        assert_eq!(low.entry_offset(), high.entry_offset());
+        assert_eq!(low.test_entry_offset(), high.test_entry_offset());
+        assert_eq!(
+            low.production_entry_offset(),
+            high.production_entry_offset()
+        );
+        assert_eq!(low.test_adapter_range(), high.test_adapter_range());
+        assert_eq!(low.dispatcher_range(), high.dispatcher_range());
+        assert_eq!(low.handlers_range(), high.handlers_range());
     }
 
     #[test]

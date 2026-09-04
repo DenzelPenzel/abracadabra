@@ -195,7 +195,7 @@ fn mapped_gate() -> Result<GateFn, RuntimeError> {
     let cached = GATE.load(Ordering::Acquire);
     let entry = if cached == 0 {
         let blob = emit_interpreter()?;
-        let entry = map_executable(blob.bytes())? + blob.entry_offset() as usize;
+        let entry = map_executable(blob.bytes())? + blob.test_entry_offset() as usize;
         GATE.store(entry, Ordering::Release);
         entry
     } else {
@@ -428,8 +428,8 @@ mod tests {
         // offset.
         let (first_gate, second_gate) = unsafe {
             (
-                gate_at(first + blob.entry_offset() as usize),
-                gate_at(second + blob.entry_offset() as usize),
+                gate_at(first + blob.test_entry_offset() as usize),
+                gate_at(second + blob.test_entry_offset() as usize),
             )
         };
 
