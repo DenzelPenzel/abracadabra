@@ -219,7 +219,9 @@ allocator now**; it only pays off on x86, and it is useless without a link layer
 references after addresses are handed out (20 `lt*` link types in C++, whereas today
 `BlockEncoder` does the late binding within a single function).
 
-## 5. VM v1: the comparison discipline — `vmp-vm`
+## 5. VM v1 and the runtime — `vmp-vm`, `vmp-runtime-windows`
+
+### 5.1 The comparison discipline a lowering slice must satisfy
 
 Beyond what `bytecode.rs` encodes, ADR-0003 fixes how a lowering slice is allowed to be
 declared correct:
@@ -245,6 +247,58 @@ declared correct:
   flag tests → lowering with an independent oracle → full host-equivalence gate → **only
   then** Windows runtime and PE integration. Starting at the runtime before the earlier
   steps are independently green violates the ADR.
+
+### 5.2 The C++ VM processor, and where variant A deliberately differs
+
+Measured against `../core/`, not remembered. Read this before touching a runtime handler:
+three of these facts look like defects in our code until you know the C++ shape, and two
+are places where C++ is **not** a usable template.
+
+- **The interpreter is generated, not shipped as a blob.**
+  `IntelVirtualMachineProcessor : public IntelFunction` (`core/intel.h:1485`): the processor
+  is a function in the function list, emitted one instruction at a time through
+  `processor_->AddCommand(...)` and serialised by the ordinary writer. Open decision 7 was
+  closed on this anchor — `vmp-runtime-windows` emits bytes instead of carrying `naked_asm!`.
+- **Guest registers live in an indexed context based at the native RSP.** The push-register
+  handler reads one operand byte from the stream and uses it as an index:
+  `mov/movzx reg2, [rsp + reg1]` (`otMemory | otBaseRegistr | otRegistr, (regESP << 4) | reg1`,
+  `core/intel.cc:28850`). Under `cpEncryptBytecode` that byte is decrypted by a per-file
+  `registr_cryptor` (`:28840-28843`). The context is 24 slots on x64 and 16 on x86, reserved
+  below RSP together with 128 bytes of red zone and `and rsp, -16` (`:28701`, `:28724-28727`).
+  There is no push-order offset arithmetic anywhere in the C++.
+- **The VM operand stack is the native stack, and it carries no type tags.**
+  `mov stack_registr_, regESP` (`:28724`) seeds it from the entry RSP and it grows downward.
+  Width is a property of the **opcode**, not of a slot: a separate handler and opcode number
+  is generated per width (`opcode_list_.Add(cmPush, otRegistr, size, ...)`, `:28859`), and each
+  handler moves the pointer by the exact byte size of its own operand
+  (`sub stack_registr_, result_size`, `:28853-28857`). A byte operand is stored as a word
+  (`mov_size = (size == osByte) ? osWord : size`, `:28838`). Our typed `Slot { width, value }`
+  and `PopWidthMismatch` have **no C++ counterpart**; they are a Rust addition, so the C++
+  stack model cannot be copied into the native runtime.
+- **Running out of VM stack is not an error there.** `check_stack` compares the VM stack
+  pointer against `[rsp + (context_registr_count + 8) * 8]` and, when it gets too close,
+  relocates the guest context lower and copies it instead of refusing (`:28783-28812`). Any
+  bound we keep is ours, not parity, and must be recorded as such.
+- **Scratch registers are randomized per file.** `pcode_registr_`, `stack_registr_`,
+  `jmp_registr_` and `crypt_registr_` are drawn with `work_registr_list.GetRandom()`
+  (`:28630-28635`); the fixed `regESI`/`regEBP`/`regEDI`/`regR11` assignment applies only to
+  the demo/unregistered branch (`:28601-28609`). Our fixed assignment is ADR-0002 variant A
+  and is knowingly weaker protection, not an oversight.
+- **Dispatch is address-baked, not position-independent.** Advanced mode adds a dword delta
+  read from the bytecode stream to `jmp_registr_` and jumps through the register
+  (`AddEndHandlerCommands`, `:27836-27859`), so the stream carries handler offsets rather than
+  opcode numbers and there is no central switch. x64 Classic jumps through a table of absolute
+  handler addresses — `jmp qword ptr [jmp_reg + reg*8]`, scale 3 (`:28770-28771`). The base is
+  seeded by a `lea` whose operand is resolved by a compile-time link to its own address
+  (`AddLink(1, ltOffset, opcode_entry)`, `:28746-28747`), and on x86 that operand receives a
+  base relocation (`NEED_FIXUP` -> `fixup_list()->AddDefault(...)`, `:8687-8691`; sentinels in
+  `core/files.h:519-520`). The position independence of our emitted blob is an addition that
+  buys embedding without a single relocation entry — not a ported property.
+- **Windows needs an explicit instruction-cache flush** after a page is made executable and
+  before generated code runs, so the mapping is published only after `FlushInstructionCache`
+  succeeds. The Unix mapping path needs no flush: it only ever compiles for x86-64.
+- C++ has no host reference interpreter at all. `vmp-vm::host` is a new Rust safety oracle,
+  and it — not the C++ — is the normative model the native runtime must match.
 
 ## Open decisions — do not settle these unilaterally
 

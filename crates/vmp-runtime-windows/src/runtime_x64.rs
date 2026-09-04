@@ -82,27 +82,91 @@ pub struct RuntimeExecution {
 }
 
 #[repr(C)]
-struct GateOutput {
-    status: u64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GuestState {
+    rflags: u64,
     rax: u64,
-    runtime_rflags: u64,
-    observed_rflags: u64,
     rcx: u64,
     rdx: u64,
+    rbx: u64,
+    rbp: u64,
+    rsi: u64,
+    rdi: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+}
+
+#[repr(C)]
+struct GateInput {
+    code_base: *const u8,
+    entry_pc: *const u8,
+    code_end: *const u8,
+    state: GuestState,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GateOutput {
+    status: u64,
+    runtime_rflags: u64,
+    observed_rflags: u64,
+    rsp_before: u64,
+    rsp_after: u64,
+    rax: u64,
+    rcx: u64,
+    rdx: u64,
+    rbx: u64,
+    rbp: u64,
+    rsi: u64,
+    rdi: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+}
+
+impl GateOutput {
+    fn empty() -> Self {
+        Self {
+            status: u64::MAX,
+            runtime_rflags: 0,
+            observed_rflags: 0,
+            rsp_before: 0,
+            rsp_after: 0,
+            rax: 0,
+            rcx: 0,
+            rdx: 0,
+            rbx: 0,
+            rbp: 0,
+            rsi: 0,
+            rdi: 0,
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+        }
+    }
 }
 
 /// Win64 entry point of the emitted interpreter.
 ///
-/// It converts normal Win64 arguments into the dispatcher's entry frame:
-/// bytecode pointer, bytecode end, then an outcome pointer. RCX and RDX are
-/// loaded with the guest values before control reaches the dispatcher.
-type GateFn = unsafe extern "win64" fn(
-    code: *const u8,
-    code_end: *const u8,
-    lhs: u64,
-    rhs: u64,
-    output: *mut GateOutput,
-) -> u64;
+/// It loads a complete guest context from the input record and observes the
+/// state that the separate production entry restores.
+type GateFn = unsafe extern "win64" fn(input: *const GateInput, output: *mut GateOutput) -> u64;
 
 /// Validate a v1 container before executing its entry point through the gate.
 ///
@@ -115,13 +179,22 @@ pub fn execute_validated_gate(
     rhs: u64,
 ) -> Result<RuntimeExecution, RuntimeError> {
     let program = decode(container)?;
-    let entry = V1_HEADER_SIZE + program.entry_offset() as usize;
-    let code = &container[entry..];
-    execute_raw_gate(code, lhs, rhs)
+    let code = &container[V1_HEADER_SIZE..];
+    run_gate(
+        mapped_gate()?,
+        code,
+        program.entry_offset() as usize,
+        lhs,
+        rhs,
+    )
 }
 
-#[inline(never)]
-pub fn execute_raw_gate(code: &[u8], lhs: u64, rhs: u64) -> Result<RuntimeExecution, RuntimeError> {
+#[cfg(test)]
+pub(crate) fn execute_raw_gate(
+    code: &[u8],
+    lhs: u64,
+    rhs: u64,
+) -> Result<RuntimeExecution, RuntimeError> {
     if code.len() > MAX_RUNTIME_CODE_SIZE {
         return Err(RuntimeTrap::BytecodeTooLarge {
             size: code.len(),
@@ -129,38 +202,35 @@ pub fn execute_raw_gate(code: &[u8], lhs: u64, rhs: u64) -> Result<RuntimeExecut
         }
         .into());
     }
-    run_gate(mapped_gate()?, code, lhs, rhs)
+    run_gate(mapped_gate()?, code, 0, lhs, rhs)
 }
 
 fn run_gate(
     gate: GateFn,
     code: &[u8],
+    entry_offset: usize,
     lhs: u64,
     rhs: u64,
 ) -> Result<RuntimeExecution, RuntimeError> {
-    let mut output = GateOutput {
-        status: u64::MAX,
-        rax: 0,
-        runtime_rflags: 0,
-        observed_rflags: 0,
-        rcx: 0,
-        rdx: 0,
+    let initial = GuestState {
+        rflags: 0x202,
+        rax: 0xfeed_face_cafe_beef,
+        rcx: lhs,
+        rdx: rhs,
+        rbx: 0x0303_0303_0303_0303,
+        rbp: 0x0404_0404_0404_0404,
+        rsi: 0x0505_0505_0505_0505,
+        rdi: 0x0606_0606_0606_0606,
+        r8: 0x0808_0808_0808_0808,
+        r9: 0x0909_0909_0909_0909,
+        r10: 0x1010_1010_1010_1010,
+        r11: 0x1111_1111_1111_1111,
+        r12: 0x1212_1212_1212_1212,
+        r13: 0x1313_1313_1313_1313,
+        r14: 0x1414_1414_1414_1414,
+        r15: 0x1515_1515_1515_1515,
     };
-    let code_end = code.as_ptr().wrapping_add(code.len());
-
-    // SAFETY: `gate` points at the read-execute mapping of the emitted
-    // interpreter, whose entry point is the Win64 signature `GateFn` describes.
-    // It receives valid bounds from `code`, a valid outcome pointer, and
-    // restores the Win64 nonvolatile registers before returning.
-    unsafe {
-        gate(
-            code.as_ptr(),
-            code_end,
-            lhs,
-            rhs,
-            core::ptr::addr_of_mut!(output),
-        )
-    };
+    let output = run_gate_observed(gate, code, entry_offset, initial)?;
 
     match output.status {
         status::OK if output.runtime_rflags == output.observed_rflags => Ok(RuntimeExecution {
@@ -181,6 +251,47 @@ fn run_gate(
     }
 }
 
+fn run_gate_observed(
+    gate: GateFn,
+    code: &[u8],
+    entry_offset: usize,
+    initial: GuestState,
+) -> Result<GateOutput, RuntimeError> {
+    let entry = code
+        .get(entry_offset..)
+        .ok_or(RuntimeTrap::InvalidOperand)?;
+    run_gate_observed_bounds(
+        gate,
+        code.as_ptr(),
+        entry.as_ptr(),
+        code.as_ptr().wrapping_add(code.len()),
+        initial,
+    )
+}
+
+fn run_gate_observed_bounds(
+    gate: GateFn,
+    code_base: *const u8,
+    entry_pc: *const u8,
+    code_end: *const u8,
+    initial: GuestState,
+) -> Result<GateOutput, RuntimeError> {
+    let mut output = GateOutput::empty();
+    let input = GateInput {
+        code_base,
+        entry_pc,
+        code_end,
+        state: initial,
+    };
+
+    // SAFETY: `gate` points at the read-execute mapping of the emitted
+    // interpreter, whose entry point is the Win64 signature `GateFn` describes.
+    // Both records remain valid for the call, their code pointers describe one
+    // live slice, and the adapter restores its caller's nonvolatile registers.
+    unsafe { gate(core::ptr::addr_of!(input), core::ptr::addr_of_mut!(output)) };
+    Ok(output)
+}
+
 /// Address of the interpreter's entry point in an executable mapping.
 ///
 /// Zero means "not mapped yet"; the emitted entry point can never be zero.
@@ -195,7 +306,7 @@ fn mapped_gate() -> Result<GateFn, RuntimeError> {
     let cached = GATE.load(Ordering::Acquire);
     let entry = if cached == 0 {
         let blob = emit_interpreter()?;
-        let entry = map_executable(blob.bytes())? + blob.entry_offset() as usize;
+        let entry = map_executable(blob.bytes())? + blob.test_entry_offset() as usize;
         GATE.store(entry, Ordering::Release);
         entry
     } else {
@@ -387,7 +498,166 @@ fn map_executable(bytes: &[u8]) -> Result<usize, RuntimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iced_x86::code_asm::{
+        qword_ptr, r10, r12, r13, r14, r15, r8, r9, rax, rbp, rbx, rcx, rdi, rdx, rsi, rsp,
+        CodeAssembler,
+    };
     use vmp_vm::bytecode::{encode, Instruction, Program, Register, Width};
+
+    const ABI_RBX: u64 = 0xb0b0_b0b0_b0b0_b0b0;
+    const ABI_RBP: u64 = 0xb1b1_b1b1_b1b1_b1b1;
+    const ABI_RSI: u64 = 0xb2b2_b2b2_b2b2_b2b2;
+    const ABI_RDI: u64 = 0xb3b3_b3b3_b3b3_b3b3;
+    const ABI_R12: u64 = 0xb4b4_b4b4_b4b4_b4b4;
+    const ABI_R13: u64 = 0xb5b5_b5b5_b5b5_b5b5;
+    const ABI_R14: u64 = 0xb6b6_b6b6_b6b6_b6b6;
+    const ABI_R15: u64 = 0xb7b7_b7b7_b7b7_b7b7;
+
+    #[derive(Debug, Default)]
+    #[repr(C)]
+    struct AdapterAbiProbe {
+        rsp_before: u64,
+        rsp_after: u64,
+        rbx: u64,
+        rbp: u64,
+        rsi: u64,
+        rdi: u64,
+        r12: u64,
+        r13: u64,
+        r14: u64,
+        r15: u64,
+    }
+
+    type AdapterAbiProbeFn =
+        unsafe extern "win64" fn(GateFn, *const GateInput, *mut GateOutput, *mut AdapterAbiProbe);
+
+    fn sentinel_state() -> GuestState {
+        GuestState {
+            rflags: 0x202,
+            rax: 0x0101_0101_0101_0101,
+            rcx: 0xffff_ffff_ffff_fffe,
+            rdx: 5,
+            rbx: 0x0303_0303_0303_0303,
+            rbp: 0x0404_0404_0404_0404,
+            rsi: 0x0505_0505_0505_0505,
+            rdi: 0x0606_0606_0606_0606,
+            r8: 0x0808_0808_0808_0808,
+            r9: 0x0909_0909_0909_0909,
+            r10: 0x1010_1010_1010_1010,
+            r11: 0x1111_1111_1111_1111,
+            r12: 0x1212_1212_1212_1212,
+            r13: 0x1313_1313_1313_1313,
+            r14: 0x1414_1414_1414_1414,
+            r15: 0x1515_1515_1515_1515,
+        }
+    }
+
+    fn observed_state(output: GateOutput) -> GuestState {
+        GuestState {
+            rflags: output.observed_rflags,
+            rax: output.rax,
+            rcx: output.rcx,
+            rdx: output.rdx,
+            rbx: output.rbx,
+            rbp: output.rbp,
+            rsi: output.rsi,
+            rdi: output.rdi,
+            r8: output.r8,
+            r9: output.r9,
+            r10: output.r10,
+            r11: output.r11,
+            r12: output.r12,
+            r13: output.r13,
+            r14: output.r14,
+            r15: output.r15,
+        }
+    }
+
+    fn emit_adapter_abi_probe() -> Result<Vec<u8>, EmitError> {
+        const RSP_BEFORE: i32 = core::mem::offset_of!(AdapterAbiProbe, rsp_before) as i32;
+        const RSP_AFTER: i32 = core::mem::offset_of!(AdapterAbiProbe, rsp_after) as i32;
+        const RBX: i32 = core::mem::offset_of!(AdapterAbiProbe, rbx) as i32;
+        const RBP: i32 = core::mem::offset_of!(AdapterAbiProbe, rbp) as i32;
+        const RSI: i32 = core::mem::offset_of!(AdapterAbiProbe, rsi) as i32;
+        const RDI: i32 = core::mem::offset_of!(AdapterAbiProbe, rdi) as i32;
+        const R12: i32 = core::mem::offset_of!(AdapterAbiProbe, r12) as i32;
+        const R13: i32 = core::mem::offset_of!(AdapterAbiProbe, r13) as i32;
+        const R14: i32 = core::mem::offset_of!(AdapterAbiProbe, r14) as i32;
+        const R15: i32 = core::mem::offset_of!(AdapterAbiProbe, r15) as i32;
+
+        let mut asm = CodeAssembler::new(64)?;
+        for register in [rbx, rbp, rsi, rdi, r12, r13, r14, r15] {
+            asm.push(register)?;
+        }
+        for register in [r9, r8, rdx, rcx] {
+            asm.push(register)?;
+        }
+        asm.sub(rsp, 40)?;
+
+        asm.mov(r10, qword_ptr(rsp + 64))?;
+        asm.mov(qword_ptr(r10 + RSP_BEFORE), rsp)?;
+        asm.mov(rbx, ABI_RBX)?;
+        asm.mov(rbp, ABI_RBP)?;
+        asm.mov(rsi, ABI_RSI)?;
+        asm.mov(rdi, ABI_RDI)?;
+        asm.mov(r12, ABI_R12)?;
+        asm.mov(r13, ABI_R13)?;
+        asm.mov(r14, ABI_R14)?;
+        asm.mov(r15, ABI_R15)?;
+
+        asm.mov(rcx, qword_ptr(rsp + 48))?;
+        asm.mov(rdx, qword_ptr(rsp + 56))?;
+        asm.mov(rax, qword_ptr(rsp + 40))?;
+        asm.call(rax)?;
+
+        asm.mov(r10, qword_ptr(rsp + 64))?;
+        asm.mov(qword_ptr(r10 + RSP_AFTER), rsp)?;
+        asm.mov(qword_ptr(r10 + RBX), rbx)?;
+        asm.mov(qword_ptr(r10 + RBP), rbp)?;
+        asm.mov(qword_ptr(r10 + RSI), rsi)?;
+        asm.mov(qword_ptr(r10 + RDI), rdi)?;
+        asm.mov(qword_ptr(r10 + R12), r12)?;
+        asm.mov(qword_ptr(r10 + R13), r13)?;
+        asm.mov(qword_ptr(r10 + R14), r14)?;
+        asm.mov(qword_ptr(r10 + R15), r15)?;
+
+        asm.lea(rsp, qword_ptr(rsp + 72))?;
+        for register in [r15, r14, r13, r12, rdi, rsi, rbp, rbx] {
+            asm.pop(register)?;
+        }
+        asm.ret()?;
+        Ok(asm.assemble(0)?)
+    }
+
+    fn probe_adapter_abi(
+        gate: GateFn,
+        code: &[u8],
+        initial: GuestState,
+    ) -> Result<AdapterAbiProbe, RuntimeError> {
+        let input = GateInput {
+            code_base: code.as_ptr(),
+            entry_pc: code.as_ptr(),
+            code_end: code.as_ptr().wrapping_add(code.len()),
+            state: initial,
+        };
+        let mut output = GateOutput::empty();
+        let mut probe = AdapterAbiProbe::default();
+        let mapping = map_executable(&emit_adapter_abi_probe()?)?;
+
+        // SAFETY: `mapping` contains the ABI probe emitted above, and every
+        // pointer remains valid until the probe and nested gate call return.
+        let probe_fn = unsafe { core::mem::transmute::<usize, AdapterAbiProbeFn>(mapping) };
+        // SAFETY: the function and pointer invariants are established above.
+        unsafe {
+            probe_fn(
+                gate,
+                core::ptr::addr_of!(input),
+                core::ptr::addr_of_mut!(output),
+                core::ptr::addr_of_mut!(probe),
+            )
+        };
+        Ok(probe)
+    }
 
     /// Two independent mappings of one blob must behave identically.
     ///
@@ -428,19 +698,154 @@ mod tests {
         // offset.
         let (first_gate, second_gate) = unsafe {
             (
-                gate_at(first + blob.entry_offset() as usize),
-                gate_at(second + blob.entry_offset() as usize),
+                gate_at(first + blob.test_entry_offset() as usize),
+                gate_at(second + blob.test_entry_offset() as usize),
             )
         };
 
         for (lhs, rhs) in [(0u64, 0u64), (1, 2), (u64::MAX, 1), (0x0f, 1)] {
             let from_first =
-                run_gate(first_gate, code, lhs, rhs).expect("the first mapping must execute");
+                run_gate(first_gate, code, 0, lhs, rhs).expect("the first mapping must execute");
             let from_second =
-                run_gate(second_gate, code, lhs, rhs).expect("the second mapping must execute");
+                run_gate(second_gate, code, 0, lhs, rhs).expect("the second mapping must execute");
 
             assert_eq!(from_first, from_second);
             assert_eq!(from_first.rax, lhs.wrapping_add(rhs));
         }
+    }
+
+    #[test]
+    fn production_entry_restores_the_complete_guest_context() {
+        let container = encode(&Program::new(
+            0,
+            vec![
+                Instruction::PushReg {
+                    width: Width::Qword,
+                    register: Register::Rcx,
+                },
+                Instruction::PushReg {
+                    width: Width::Qword,
+                    register: Register::Rdx,
+                },
+                Instruction::Add(Width::Qword),
+                Instruction::PopReg {
+                    width: Width::Qword,
+                    register: Register::Rax,
+                },
+                Instruction::Ret,
+            ],
+        ))
+        .expect("fixture must encode");
+        let code = &container[V1_HEADER_SIZE..];
+        let blob = emit_interpreter().expect("the interpreter must assemble");
+        let mapping = map_executable(blob.bytes()).expect("the mapping must succeed");
+        // SAFETY: the mapping contains the emitted test adapter at this offset.
+        let gate = unsafe { gate_at(mapping + blob.test_entry_offset() as usize) };
+        let initial = sentinel_state();
+
+        let observed = run_gate_observed(gate, code, 0, initial)
+            .expect("the production entry must return through the test adapter");
+
+        assert_eq!(observed.status, status::OK);
+        assert_eq!(observed.rax, initial.rcx.wrapping_add(initial.rdx));
+        assert_eq!(observed.rcx, initial.rcx);
+        assert_eq!(observed.rdx, initial.rdx);
+        assert_eq!(observed.rbx, initial.rbx);
+        assert_eq!(observed.rbp, initial.rbp);
+        assert_eq!(observed.rsi, initial.rsi);
+        assert_eq!(observed.rdi, initial.rdi);
+        assert_eq!(observed.r8, initial.r8);
+        assert_eq!(observed.r9, initial.r9);
+        assert_eq!(observed.r10, initial.r10);
+        assert_eq!(observed.r11, initial.r11);
+        assert_eq!(observed.r12, initial.r12);
+        assert_eq!(observed.r13, initial.r13);
+        assert_eq!(observed.r14, initial.r14);
+        assert_eq!(observed.r15, initial.r15);
+        assert_eq!(observed.runtime_rflags, observed.observed_rflags);
+        assert_eq!(observed.rsp_before, observed.rsp_after);
+        assert_eq!(observed.rsp_before & 0xf, 0);
+    }
+
+    #[test]
+    fn production_entry_restores_guest_context_on_a_trap() {
+        let code = [0xff];
+        let blob = emit_interpreter().expect("the interpreter must assemble");
+        let mapping = map_executable(blob.bytes()).expect("the mapping must succeed");
+        // SAFETY: the mapping contains the emitted test adapter at this offset.
+        let gate = unsafe { gate_at(mapping + blob.test_entry_offset() as usize) };
+        let initial = sentinel_state();
+
+        let observed = run_gate_observed(gate, &code, 0, initial)
+            .expect("the production trap path must return through the adapter");
+
+        assert_eq!(observed.status, status::UNSUPPORTED_OPCODE);
+        assert_eq!(observed_state(observed), initial);
+        assert_eq!(observed.runtime_rflags, initial.rflags);
+        assert_eq!(observed.rsp_before, observed.rsp_after);
+    }
+
+    #[test]
+    fn production_entry_receives_code_base_and_entry_pc_separately() {
+        let code = [0xff, 0x01];
+        let blob = emit_interpreter().expect("the interpreter must assemble");
+        let mapping = map_executable(blob.bytes()).expect("the mapping must succeed");
+        // SAFETY: the mapping contains the emitted test adapter at this offset.
+        let gate = unsafe { gate_at(mapping + blob.test_entry_offset() as usize) };
+
+        let observed = run_gate_observed(gate, &code, 1, sentinel_state())
+            .expect("the production entry must start at the supplied PC");
+
+        assert_eq!(observed.status, status::OK);
+    }
+
+    #[test]
+    fn production_entry_rejects_malformed_code_bounds_before_fetch() {
+        let code = [0xff, 0x01];
+        let start = code.as_ptr();
+        let end = start.wrapping_add(code.len());
+        let blob = emit_interpreter().expect("the interpreter must assemble");
+        let mapping = map_executable(blob.bytes()).expect("the mapping must succeed");
+        // SAFETY: the mapping contains the emitted test adapter at this offset.
+        let gate = unsafe { gate_at(mapping + blob.test_entry_offset() as usize) };
+
+        for (base, entry, code_end, expected) in [
+            (start.wrapping_add(1), start, end, status::INVALID_OPERAND),
+            (
+                start.wrapping_add(1),
+                start.wrapping_add(1),
+                start,
+                status::INVALID_OPERAND,
+            ),
+            (start, end, end, status::TRUNCATED_BYTECODE),
+            (start, end.wrapping_add(1), end, status::INVALID_OPERAND),
+        ] {
+            let observed = run_gate_observed_bounds(gate, base, entry, code_end, sentinel_state())
+                .expect("malformed bounds must return through the adapter");
+
+            assert_eq!(observed.status, expected);
+        }
+    }
+
+    #[test]
+    fn test_adapter_restores_its_win64_callers_nonvolatile_state() {
+        let code = [0x01];
+        let blob = emit_interpreter().expect("the interpreter must assemble");
+        let mapping = map_executable(blob.bytes()).expect("the mapping must succeed");
+        // SAFETY: the mapping contains the emitted test adapter at this offset.
+        let gate = unsafe { gate_at(mapping + blob.test_entry_offset() as usize) };
+
+        let observed = probe_adapter_abi(gate, &code, sentinel_state())
+            .expect("the ABI probe must return after the complete adapter epilogue");
+
+        assert_eq!(observed.rsp_before, observed.rsp_after);
+        assert_eq!(observed.rbx, ABI_RBX);
+        assert_eq!(observed.rbp, ABI_RBP);
+        assert_eq!(observed.rsi, ABI_RSI);
+        assert_eq!(observed.rdi, ABI_RDI);
+        assert_eq!(observed.r12, ABI_R12);
+        assert_eq!(observed.r13, ABI_R13);
+        assert_eq!(observed.r14, ABI_R14);
+        assert_eq!(observed.r15, ABI_R15);
     }
 }

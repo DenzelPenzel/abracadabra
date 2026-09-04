@@ -4,7 +4,7 @@ mod emit;
 #[cfg(target_arch = "x86_64")]
 mod runtime_x64;
 
-pub use emit::{emit_interpreter, EmitError, RuntimeBlob};
+pub use emit::{emit_interpreter, CodeRange, EmitError, RuntimeBlob};
 
 #[cfg(target_arch = "x86_64")]
 pub use runtime_x64::{

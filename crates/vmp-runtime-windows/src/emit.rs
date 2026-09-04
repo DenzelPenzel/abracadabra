@@ -2,7 +2,7 @@ use iced_x86::code_asm::{
     al, byte_ptr, eax, ebp, qword_ptr, r10, r11, r12, r13, r14, r15, r8, r9, rax, rbp, rbx, rcx,
     rdi, rdx, rsi, rsp, CodeAssembler, CodeLabel,
 };
-use iced_x86::IcedError;
+use iced_x86::{BlockEncoderOptions, IcedError};
 use thiserror::Error;
 
 /// Bytecode steps one gate entry may dispatch before it fails closed.
@@ -36,25 +36,57 @@ const SAVED_RDX: i32 = 96;
 const SAVED_RCX: i32 = 104;
 const SAVED_RAX: i32 = 112;
 const SAVED_RFLAGS: i32 = 120;
-const ENTRY_CODE: i32 = 136;
-const ENTRY_CODE_END: i32 = 144;
-const ENTRY_OUTPUT: i32 = 152;
+const ENTRY_CODE_BASE: i32 = 136;
+const ENTRY_PC: i32 = 144;
+const ENTRY_CODE_END: i32 = 152;
+const ENTRY_STATUS: i32 = 160;
+const ENTRY_RUNTIME_RFLAGS: i32 = 168;
 
 /// Bytes reserved for the bounded VM operand stack, above the native RSP.
 const OPERAND_STACK_BYTES: i32 = 128;
 
-// Field offsets of the outcome record the gate fills in. They must agree with
-// the `#[repr(C)]` layout in `runtime_x64`.
-const OUT_STATUS: i32 = 0;
-const OUT_RAX: i32 = 8;
-const OUT_RUNTIME_RFLAGS: i32 = 16;
-const OUT_OBSERVED_RFLAGS: i32 = 24;
-const OUT_RCX: i32 = 32;
-const OUT_RDX: i32 = 40;
+// Field offsets of the test adapter input and output records. They must agree
+// with the `#[repr(C)]` layouts in `runtime_x64`.
+const IN_CODE_BASE: i32 = 0;
+const IN_ENTRY_PC: i32 = 8;
+const IN_CODE_END: i32 = 16;
+const IN_RFLAGS: i32 = 24;
+const IN_RAX: i32 = 32;
+const IN_RCX: i32 = 40;
+const IN_RDX: i32 = 48;
+const IN_RBX: i32 = 56;
+const IN_RBP: i32 = 64;
+const IN_RSI: i32 = 72;
+const IN_RDI: i32 = 80;
+const IN_R8: i32 = 88;
+const IN_R9: i32 = 96;
+const IN_R10: i32 = 104;
+const IN_R11: i32 = 112;
+const IN_R12: i32 = 120;
+const IN_R13: i32 = 128;
+const IN_R14: i32 = 136;
+const IN_R15: i32 = 144;
 
-/// Win64 stack slot of the fifth argument at gate entry: return address plus
-/// the four-register shadow space.
-const GATE_ARG_OUTPUT: i32 = 40;
+const OUT_STATUS: i32 = 0;
+const OUT_RUNTIME_RFLAGS: i32 = 8;
+const OUT_OBSERVED_RFLAGS: i32 = 16;
+const OUT_RSP_BEFORE: i32 = 24;
+const OUT_RSP_AFTER: i32 = 32;
+const OUT_RAX: i32 = 40;
+const OUT_RCX: i32 = 48;
+const OUT_RDX: i32 = 56;
+const OUT_RBX: i32 = 64;
+const OUT_RBP: i32 = 72;
+const OUT_RSI: i32 = 80;
+const OUT_RDI: i32 = 88;
+const OUT_R8: i32 = 96;
+const OUT_R9: i32 = 104;
+const OUT_R10: i32 = 112;
+const OUT_R11: i32 = 120;
+const OUT_R12: i32 = 128;
+const OUT_R13: i32 = 136;
+const OUT_R14: i32 = 144;
+const OUT_R15: i32 = 152;
 
 /// Failure to assemble the interpreter.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -72,7 +104,26 @@ impl From<IcedError> for EmitError {
     }
 }
 
-/// Emitted interpreter bytes and the offset of their Win64 entry point.
+/// Half-open machine-code range within an emitted runtime blob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodeRange {
+    start: u32,
+    end: u32,
+}
+
+impl CodeRange {
+    /// Offset of the first byte in the range.
+    pub fn start(self) -> u32 {
+        self.start
+    }
+
+    /// Offset immediately after the range.
+    pub fn end(self) -> u32 {
+        self.end
+    }
+}
+
+/// Emitted interpreter bytes and offsets of its callable entry points.
 ///
 /// The bytes are position-independent: every branch is relative and stays
 /// inside the blob, and no operand holds an absolute address. Nothing in here
@@ -80,7 +131,11 @@ impl From<IcedError> for EmitError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeBlob {
     bytes: Vec<u8>,
-    entry_offset: u32,
+    test_entry_offset: u32,
+    production_entry_offset: u32,
+    test_adapter_range: CodeRange,
+    dispatcher_range: CodeRange,
+    handlers_range: CodeRange,
 }
 
 impl RuntimeBlob {
@@ -89,19 +144,41 @@ impl RuntimeBlob {
         &self.bytes
     }
 
-    /// Offset of the Win64 gate entry point within [`RuntimeBlob::bytes`].
-    pub fn entry_offset(&self) -> u32 {
-        self.entry_offset
+    /// Offset of the Win64 test adapter within [`RuntimeBlob::bytes`].
+    pub fn test_entry_offset(&self) -> u32 {
+        self.test_entry_offset
+    }
+
+    /// Offset of the native-state capture entry within [`RuntimeBlob::bytes`].
+    ///
+    /// Its stack frame contains bytecode base, entry PC, bytecode end, status,
+    /// and runtime-RFLAGS slots above the native return address.
+    pub fn production_entry_offset(&self) -> u32 {
+        self.production_entry_offset
+    }
+
+    /// Machine-code range occupied by the Win64 test adapter.
+    pub fn test_adapter_range(&self) -> CodeRange {
+        self.test_adapter_range
+    }
+
+    /// Machine-code range occupied by state capture and opcode dispatch.
+    pub fn dispatcher_range(&self) -> CodeRange {
+        self.dispatcher_range
+    }
+
+    /// Machine-code range occupied by handlers and state restoration.
+    pub fn handlers_range(&self) -> CodeRange {
+        self.handlers_range
     }
 }
 
 /// Assemble the v1 interpreter.
 ///
-/// The blob holds two parts: a Win64 gate at [`RuntimeBlob::entry_offset`] that
-/// converts normal arguments into the dispatcher's entry frame and reports the
-/// guest state observed after the return, and the dispatcher itself. The
-/// accepted bytecode subset is `PushReg` for RCX/RDX, qword `Add`, `PopReg` to
-/// RAX, and `Ret`; everything else fails closed with a status code.
+/// The blob contains a Win64 test adapter, a separate native-state capture
+/// entry, the dispatcher, and its handlers. The accepted bytecode subset is
+/// `PushReg` for RCX/RDX, qword `Add`, `PopReg` to RAX, and `Ret`; everything
+/// else fails closed with a status code.
 pub fn emit_interpreter() -> Result<RuntimeBlob, EmitError> {
     emit_interpreter_at(0)
 }
@@ -114,47 +191,151 @@ pub fn emit_interpreter() -> Result<RuntimeBlob, EmitError> {
 pub(crate) fn emit_interpreter_at(ip: u64) -> Result<RuntimeBlob, EmitError> {
     let mut asm = CodeAssembler::new(64)?;
     let mut dispatch = asm.create_label();
+    let mut handlers = asm.create_label();
 
-    // The Win64 gate: RCX is the bytecode pointer, RDX its end, R8 and R9 the
-    // guest RCX and RDX, and the fifth stack argument the outcome record.
-    asm.push(qword_ptr(rsp + GATE_ARG_OUTPUT))?;
+    // The Win64 test adapter receives input and output records in RCX and RDX.
+    // Preserve its caller's nonvolatile registers before loading guest values.
+    asm.push(rbx)?;
+    asm.push(rbp)?;
+    asm.push(rsi)?;
+    asm.push(rdi)?;
+    asm.push(r12)?;
+    asm.push(r13)?;
+    asm.push(r14)?;
+    asm.push(r15)?;
     asm.push(rdx)?;
     asm.push(rcx)?;
-    asm.mov(rcx, r8)?;
-    asm.mov(rdx, r9)?;
+
+    // Production metadata is passed outside guest registers. The two writable
+    // slots carry the native status and the flags selected by the last handler.
+    asm.push(0)?;
+    asm.push(-1)?;
+    asm.push(qword_ptr(rcx + IN_CODE_END))?;
+    asm.push(qword_ptr(rcx + IN_ENTRY_PC))?;
+    asm.push(qword_ptr(rcx + IN_CODE_BASE))?;
+    asm.mov(qword_ptr(rdx + OUT_RSP_BEFORE), rsp)?;
+
+    // Load the complete guest context without changing the supplied RFLAGS.
+    // R15 retains the input pointer until it is loaded last.
+    asm.mov(r15, rcx)?;
+    asm.mov(rax, qword_ptr(r15 + IN_RFLAGS))?;
+    asm.push(rax)?;
+    asm.popfq()?;
+    asm.mov(rax, qword_ptr(r15 + IN_RAX))?;
+    asm.mov(rcx, qword_ptr(r15 + IN_RCX))?;
+    asm.mov(rdx, qword_ptr(r15 + IN_RDX))?;
+    asm.mov(rbx, qword_ptr(r15 + IN_RBX))?;
+    asm.mov(rbp, qword_ptr(r15 + IN_RBP))?;
+    asm.mov(rsi, qword_ptr(r15 + IN_RSI))?;
+    asm.mov(rdi, qword_ptr(r15 + IN_RDI))?;
+    asm.mov(r8, qword_ptr(r15 + IN_R8))?;
+    asm.mov(r9, qword_ptr(r15 + IN_R9))?;
+    asm.mov(r10, qword_ptr(r15 + IN_R10))?;
+    asm.mov(r11, qword_ptr(r15 + IN_R11))?;
+    asm.mov(r12, qword_ptr(r15 + IN_R12))?;
+    asm.mov(r13, qword_ptr(r15 + IN_R13))?;
+    asm.mov(r14, qword_ptr(r15 + IN_R14))?;
+    asm.mov(r15, qword_ptr(r15 + IN_R15))?;
     asm.call(dispatch)?;
-    asm.lea(rsp, qword_ptr(rsp + 24))?;
-    // Observe the state that reached the native continuation without changing
-    // any guest register or flag; none of these moves writes RFLAGS.
+
+    // Observe the restored state without changing RFLAGS. The production core
+    // only addresses its inline control slots, never this test output record.
     asm.push(r10)?;
-    asm.mov(r10, qword_ptr(rsp + (GATE_ARG_OUTPUT + 8)))?;
+    asm.mov(r10, qword_ptr(rsp + 56))?;
+    asm.mov(qword_ptr(r10 + OUT_RAX), rax)?;
     asm.mov(qword_ptr(r10 + OUT_RCX), rcx)?;
     asm.mov(qword_ptr(r10 + OUT_RDX), rdx)?;
-    asm.push(rax)?;
+    asm.mov(qword_ptr(r10 + OUT_RBX), rbx)?;
+    asm.mov(qword_ptr(r10 + OUT_RBP), rbp)?;
+    asm.mov(qword_ptr(r10 + OUT_RSI), rsi)?;
+    asm.mov(qword_ptr(r10 + OUT_RDI), rdi)?;
+    asm.mov(qword_ptr(r10 + OUT_R8), r8)?;
+    asm.mov(qword_ptr(r10 + OUT_R9), r9)?;
+    asm.mov(qword_ptr(r10 + OUT_R11), r11)?;
+    asm.mov(qword_ptr(r10 + OUT_R12), r12)?;
+    asm.mov(qword_ptr(r10 + OUT_R13), r13)?;
+    asm.mov(qword_ptr(r10 + OUT_R14), r14)?;
+    asm.mov(qword_ptr(r10 + OUT_R15), r15)?;
+    asm.mov(rax, qword_ptr(rsp))?;
+    asm.mov(qword_ptr(r10 + OUT_R10), rax)?;
+    asm.mov(rax, qword_ptr(rsp + 32))?;
+    asm.mov(qword_ptr(r10 + OUT_STATUS), rax)?;
+    asm.mov(rax, qword_ptr(rsp + 40))?;
+    asm.mov(qword_ptr(r10 + OUT_RUNTIME_RFLAGS), rax)?;
     asm.pushfq()?;
     asm.pop(rax)?;
     asm.mov(qword_ptr(r10 + OUT_OBSERVED_RFLAGS), rax)?;
-    asm.pop(rax)?;
+    asm.lea(rax, qword_ptr(rsp + 8))?;
+    asm.mov(qword_ptr(r10 + OUT_RSP_AFTER), rax)?;
     asm.pop(r10)?;
+    asm.lea(rsp, qword_ptr(rsp + 56))?;
+    asm.pop(r15)?;
+    asm.pop(r14)?;
+    asm.pop(r13)?;
+    asm.pop(r12)?;
+    asm.pop(rdi)?;
+    asm.pop(rsi)?;
+    asm.pop(rbp)?;
+    asm.pop(rbx)?;
     asm.ret()?;
 
-    emit_dispatcher(&mut asm, &mut dispatch)?;
+    emit_dispatcher(&mut asm, &mut dispatch, &mut handlers)?;
 
-    let bytes = asm.assemble(ip)?;
+    let assembled =
+        asm.assemble_options(ip, BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS)?;
+    let production_entry_offset = label_offset(&assembled, &dispatch, ip)?;
+    let handlers_offset = label_offset(&assembled, &handlers, ip)?;
+    let bytes = assembled.inner.code_buffer;
+    let blob_end = u32::try_from(bytes.len()).map_err(|_| EmitError::Assembly {
+        reason: "interpreter exceeds the 32-bit blob offset range".to_owned(),
+    })?;
     Ok(RuntimeBlob {
         bytes,
-        entry_offset: 0,
+        test_entry_offset: 0,
+        production_entry_offset,
+        test_adapter_range: CodeRange {
+            start: 0,
+            end: production_entry_offset,
+        },
+        dispatcher_range: CodeRange {
+            start: production_entry_offset,
+            end: handlers_offset,
+        },
+        handlers_range: CodeRange {
+            start: handlers_offset,
+            end: blob_end,
+        },
+    })
+}
+
+fn label_offset(
+    assembled: &iced_x86::code_asm::CodeAssemblerResult,
+    label: &CodeLabel,
+    origin: u64,
+) -> Result<u32, EmitError> {
+    let offset = assembled
+        .label_ip(label)?
+        .checked_sub(origin)
+        .ok_or_else(|| EmitError::Assembly {
+            reason: "interpreter label precedes the blob origin".to_owned(),
+        })?;
+    u32::try_from(offset).map_err(|_| EmitError::Assembly {
+        reason: "interpreter label exceeds the 32-bit blob offset range".to_owned(),
     })
 }
 
 /// Emit the dispatch loop.
 ///
-/// Entry stack above the return address: bytecode begin, bytecode end, outcome
-/// pointer. The dispatcher captures all modeled GPRs and RFLAGS before it uses
-/// any of them as runtime scratch registers, and restores them on every exit.
-fn emit_dispatcher(asm: &mut CodeAssembler, dispatch: &mut CodeLabel) -> Result<(), EmitError> {
+/// Entry stack above the return address: bytecode base, entry PC, bytecode end,
+/// status slot, and runtime-RFLAGS slot. The dispatcher captures all modeled
+/// GPRs and RFLAGS before assigning scratch registers.
+fn emit_dispatcher(
+    asm: &mut CodeAssembler,
+    dispatch: &mut CodeLabel,
+    handlers: &mut CodeLabel,
+) -> Result<(), EmitError> {
     let mut fetch = asm.create_label();
-    let mut op_push_reg = asm.create_label();
+    let op_push_reg = *handlers;
     let mut push_rcx = asm.create_label();
     let mut push_store = asm.create_label();
     let mut op_pop_reg = asm.create_label();
@@ -188,8 +369,15 @@ fn emit_dispatcher(asm: &mut CodeAssembler, dispatch: &mut CodeLabel) -> Result<
     asm.push(r15)?;
     // R15 is the immutable saved-context base.
     asm.mov(r15, rsp)?;
-    asm.mov(r13, qword_ptr(r15 + ENTRY_CODE))?;
+    asm.mov(rsi, qword_ptr(r15 + ENTRY_CODE_BASE))?;
+    asm.mov(r13, qword_ptr(r15 + ENTRY_PC))?;
     asm.mov(r12, qword_ptr(r15 + ENTRY_CODE_END))?;
+    asm.cmp(rsi, r12)?;
+    asm.ja(invalid_operand)?;
+    asm.cmp(r13, rsi)?;
+    asm.jb(invalid_operand)?;
+    asm.cmp(r13, r12)?;
+    asm.ja(invalid_operand)?;
     // Reserve a bounded operand stack above RSP and keep its empty top in R11,
     // so the dispatcher's own pushes below RSP cannot reach operand slots.
     asm.sub(rsp, OPERAND_STACK_BYTES)?;
@@ -219,7 +407,7 @@ fn emit_dispatcher(asm: &mut CodeAssembler, dispatch: &mut CodeLabel) -> Result<
     asm.jmp(unsupported)?;
 
     // PUSH_REG qword, bounded to RCX and RDX for this vertical slice.
-    asm.set_label(&mut op_push_reg)?;
+    asm.set_label(handlers)?;
     asm.mov(rax, r12)?;
     asm.sub(rax, r13)?;
     asm.cmp(rax, 2)?;
@@ -306,15 +494,12 @@ fn emit_dispatcher(asm: &mut CodeAssembler, dispatch: &mut CodeLabel) -> Result<
     asm.set_label(&mut step_limit)?;
     asm.mov(eax, status::STEP_LIMIT as u32)?;
 
-    // Publish the outcome before restoring every captured register and RFLAGS.
-    // The restored RFLAGS carry the guest flags a handler last wrote.
+    // Publish control state into the production frame before restoring every
+    // captured register and RFLAGS.
     asm.set_label(&mut publish)?;
-    asm.mov(r10, qword_ptr(r15 + ENTRY_OUTPUT))?;
-    asm.mov(qword_ptr(r10 + OUT_STATUS), rax)?;
-    asm.mov(rax, qword_ptr(r15 + SAVED_RAX))?;
-    asm.mov(qword_ptr(r10 + OUT_RAX), rax)?;
+    asm.mov(qword_ptr(r15 + ENTRY_STATUS), rax)?;
     asm.mov(rax, qword_ptr(r15 + SAVED_RFLAGS))?;
-    asm.mov(qword_ptr(r10 + OUT_RUNTIME_RFLAGS), rax)?;
+    asm.mov(qword_ptr(r15 + ENTRY_RUNTIME_RFLAGS), rax)?;
     asm.mov(rsp, r15)?;
     asm.pop(r15)?;
     asm.pop(r14)?;
@@ -343,10 +528,22 @@ mod tests {
     use iced_x86::{Decoder, DecoderOptions, FlowControl, OpKind, Register};
 
     #[test]
-    fn the_emitted_blob_starts_at_its_win64_gate() {
+    fn the_emitted_blob_separates_test_and_production_ranges() {
         let blob = emit_interpreter().expect("the interpreter must assemble");
 
-        assert_eq!(blob.entry_offset(), 0);
+        assert_eq!(blob.test_entry_offset(), 0);
+        assert_ne!(blob.test_entry_offset(), blob.production_entry_offset());
+        assert_eq!(blob.test_adapter_range().start(), blob.test_entry_offset());
+        assert_eq!(
+            blob.test_adapter_range().end(),
+            blob.production_entry_offset()
+        );
+        assert_eq!(
+            blob.dispatcher_range().start(),
+            blob.production_entry_offset()
+        );
+        assert_eq!(blob.dispatcher_range().end(), blob.handlers_range().start());
+        assert_eq!(blob.handlers_range().end() as usize, blob.bytes().len());
         assert!(!blob.bytes().is_empty());
         // A single page keeps the eventual PE section arithmetic trivial.
         assert!(
@@ -363,7 +560,14 @@ mod tests {
             .expect("the interpreter must assemble at a mapped address");
 
         assert_eq!(low.bytes(), high.bytes());
-        assert_eq!(low.entry_offset(), high.entry_offset());
+        assert_eq!(low.test_entry_offset(), high.test_entry_offset());
+        assert_eq!(
+            low.production_entry_offset(),
+            high.production_entry_offset()
+        );
+        assert_eq!(low.test_adapter_range(), high.test_adapter_range());
+        assert_eq!(low.dispatcher_range(), high.dispatcher_range());
+        assert_eq!(low.handlers_range(), high.handlers_range());
     }
 
     #[test]
