@@ -336,3 +336,94 @@ fn emit_dispatcher(asm: &mut CodeAssembler, dispatch: &mut CodeLabel) -> Result<
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced_x86::{Decoder, DecoderOptions, FlowControl, OpKind, Register};
+
+    #[test]
+    fn the_emitted_blob_starts_at_its_win64_gate() {
+        let blob = emit_interpreter().expect("the interpreter must assemble");
+
+        assert_eq!(blob.entry_offset(), 0);
+        assert!(!blob.bytes().is_empty());
+        // A single page keeps the eventual PE section arithmetic trivial.
+        assert!(
+            blob.bytes().len() < 4096,
+            "blob is {} bytes",
+            blob.bytes().len()
+        );
+    }
+
+    #[test]
+    fn the_emitted_blob_does_not_depend_on_where_it_is_assembled() {
+        let low = emit_interpreter_at(0).expect("the interpreter must assemble at zero");
+        let high = emit_interpreter_at(0x7fff_0000_1000)
+            .expect("the interpreter must assemble at a mapped address");
+
+        assert_eq!(low.bytes(), high.bytes());
+        assert_eq!(low.entry_offset(), high.entry_offset());
+    }
+
+    #[test]
+    fn the_emitted_blob_references_nothing_outside_itself() {
+        let blob = emit_interpreter().expect("the interpreter must assemble");
+        let length = blob.bytes().len() as u64;
+        let mut decoder = Decoder::with_ip(64, blob.bytes(), 0, DecoderOptions::NONE);
+        let mut decoded = 0usize;
+        let mut end = 0u64;
+
+        for instruction in decoder.iter() {
+            assert!(
+                !instruction.is_invalid(),
+                "byte {} does not decode",
+                instruction.ip()
+            );
+            decoded += 1;
+            end = instruction.next_ip();
+
+            if matches!(
+                instruction.flow_control(),
+                FlowControl::UnconditionalBranch
+                    | FlowControl::ConditionalBranch
+                    | FlowControl::Call
+            ) {
+                assert_eq!(instruction.op0_kind(), OpKind::NearBranch64);
+                let target = instruction.near_branch64();
+                assert!(
+                    target < length,
+                    "branch at {} leaves the blob for {target}",
+                    instruction.ip()
+                );
+            }
+
+            for index in 0..instruction.op_count() {
+                match instruction.op_kind(index) {
+                    OpKind::Memory => {
+                        assert_ne!(
+                            instruction.memory_base(),
+                            Register::RIP,
+                            "instruction at {} is RIP-relative",
+                            instruction.ip()
+                        );
+                        assert!(
+                            instruction.memory_base() != Register::None
+                                || instruction.memory_index() != Register::None,
+                            "instruction at {} holds an absolute address",
+                            instruction.ip()
+                        );
+                    }
+                    OpKind::Immediate64 => panic!(
+                        "instruction at {} carries a 64-bit immediate",
+                        instruction.ip()
+                    ),
+                    _ => {}
+                }
+            }
+        }
+
+        assert_eq!(end, length, "decoding stopped before the end of the blob");
+        assert!(decoded > 60, "only {decoded} instructions decoded");
+    }
+}
