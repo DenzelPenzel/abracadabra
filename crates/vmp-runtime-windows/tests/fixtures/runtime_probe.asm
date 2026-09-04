@@ -1,5 +1,7 @@
 PUBLIC vmp_runtime_production_probe
 PUBLIC vmp_runtime_probe_abi
+PUBLIC vmp_runtime_fastfail_begin
+PUBLIC vmp_runtime_fastfail_end
 
 HOST_ALLOC             EQU 208h
 HOST_MXCSR              EQU 0A0h
@@ -301,8 +303,10 @@ restore_host:
     ret
 
 production_fastfail:
+vmp_runtime_fastfail_begin:
     mov ecx, FAST_FAIL_FATAL_APP_EXIT
     int 29h
+vmp_runtime_fastfail_end:
 vmp_runtime_production_probe ENDP
 
 vmp_runtime_probe_abi PROC FRAME
