@@ -498,7 +498,38 @@ fn map_executable(bytes: &[u8]) -> Result<usize, RuntimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iced_x86::code_asm::{
+        qword_ptr, r10, r12, r13, r14, r15, r8, r9, rax, rbp, rbx, rcx, rdi, rdx, rsi, rsp,
+        CodeAssembler,
+    };
     use vmp_vm::bytecode::{encode, Instruction, Program, Register, Width};
+
+    const ABI_RBX: u64 = 0xb0b0_b0b0_b0b0_b0b0;
+    const ABI_RBP: u64 = 0xb1b1_b1b1_b1b1_b1b1;
+    const ABI_RSI: u64 = 0xb2b2_b2b2_b2b2_b2b2;
+    const ABI_RDI: u64 = 0xb3b3_b3b3_b3b3_b3b3;
+    const ABI_R12: u64 = 0xb4b4_b4b4_b4b4_b4b4;
+    const ABI_R13: u64 = 0xb5b5_b5b5_b5b5_b5b5;
+    const ABI_R14: u64 = 0xb6b6_b6b6_b6b6_b6b6;
+    const ABI_R15: u64 = 0xb7b7_b7b7_b7b7_b7b7;
+
+    #[derive(Debug, Default)]
+    #[repr(C)]
+    struct AdapterAbiProbe {
+        rsp_before: u64,
+        rsp_after: u64,
+        rbx: u64,
+        rbp: u64,
+        rsi: u64,
+        rdi: u64,
+        r12: u64,
+        r13: u64,
+        r14: u64,
+        r15: u64,
+    }
+
+    type AdapterAbiProbeFn =
+        unsafe extern "win64" fn(GateFn, *const GateInput, *mut GateOutput, *mut AdapterAbiProbe);
 
     fn sentinel_state() -> GuestState {
         GuestState {
@@ -540,6 +571,92 @@ mod tests {
             r14: output.r14,
             r15: output.r15,
         }
+    }
+
+    fn emit_adapter_abi_probe() -> Result<Vec<u8>, EmitError> {
+        const RSP_BEFORE: i32 = core::mem::offset_of!(AdapterAbiProbe, rsp_before) as i32;
+        const RSP_AFTER: i32 = core::mem::offset_of!(AdapterAbiProbe, rsp_after) as i32;
+        const RBX: i32 = core::mem::offset_of!(AdapterAbiProbe, rbx) as i32;
+        const RBP: i32 = core::mem::offset_of!(AdapterAbiProbe, rbp) as i32;
+        const RSI: i32 = core::mem::offset_of!(AdapterAbiProbe, rsi) as i32;
+        const RDI: i32 = core::mem::offset_of!(AdapterAbiProbe, rdi) as i32;
+        const R12: i32 = core::mem::offset_of!(AdapterAbiProbe, r12) as i32;
+        const R13: i32 = core::mem::offset_of!(AdapterAbiProbe, r13) as i32;
+        const R14: i32 = core::mem::offset_of!(AdapterAbiProbe, r14) as i32;
+        const R15: i32 = core::mem::offset_of!(AdapterAbiProbe, r15) as i32;
+
+        let mut asm = CodeAssembler::new(64)?;
+        for register in [rbx, rbp, rsi, rdi, r12, r13, r14, r15] {
+            asm.push(register)?;
+        }
+        for register in [r9, r8, rdx, rcx] {
+            asm.push(register)?;
+        }
+        asm.sub(rsp, 40)?;
+
+        asm.mov(r10, qword_ptr(rsp + 64))?;
+        asm.mov(qword_ptr(r10 + RSP_BEFORE), rsp)?;
+        asm.mov(rbx, ABI_RBX)?;
+        asm.mov(rbp, ABI_RBP)?;
+        asm.mov(rsi, ABI_RSI)?;
+        asm.mov(rdi, ABI_RDI)?;
+        asm.mov(r12, ABI_R12)?;
+        asm.mov(r13, ABI_R13)?;
+        asm.mov(r14, ABI_R14)?;
+        asm.mov(r15, ABI_R15)?;
+
+        asm.mov(rcx, qword_ptr(rsp + 48))?;
+        asm.mov(rdx, qword_ptr(rsp + 56))?;
+        asm.mov(rax, qword_ptr(rsp + 40))?;
+        asm.call(rax)?;
+
+        asm.mov(r10, qword_ptr(rsp + 64))?;
+        asm.mov(qword_ptr(r10 + RSP_AFTER), rsp)?;
+        asm.mov(qword_ptr(r10 + RBX), rbx)?;
+        asm.mov(qword_ptr(r10 + RBP), rbp)?;
+        asm.mov(qword_ptr(r10 + RSI), rsi)?;
+        asm.mov(qword_ptr(r10 + RDI), rdi)?;
+        asm.mov(qword_ptr(r10 + R12), r12)?;
+        asm.mov(qword_ptr(r10 + R13), r13)?;
+        asm.mov(qword_ptr(r10 + R14), r14)?;
+        asm.mov(qword_ptr(r10 + R15), r15)?;
+
+        asm.lea(rsp, qword_ptr(rsp + 72))?;
+        for register in [r15, r14, r13, r12, rdi, rsi, rbp, rbx] {
+            asm.pop(register)?;
+        }
+        asm.ret()?;
+        Ok(asm.assemble(0)?)
+    }
+
+    fn probe_adapter_abi(
+        gate: GateFn,
+        code: &[u8],
+        initial: GuestState,
+    ) -> Result<AdapterAbiProbe, RuntimeError> {
+        let input = GateInput {
+            code_base: code.as_ptr(),
+            entry_pc: code.as_ptr(),
+            code_end: code.as_ptr().wrapping_add(code.len()),
+            state: initial,
+        };
+        let mut output = GateOutput::empty();
+        let mut probe = AdapterAbiProbe::default();
+        let mapping = map_executable(&emit_adapter_abi_probe()?)?;
+
+        // SAFETY: `mapping` contains the ABI probe emitted above, and every
+        // pointer remains valid until the probe and nested gate call return.
+        let probe_fn = unsafe { core::mem::transmute::<usize, AdapterAbiProbeFn>(mapping) };
+        // SAFETY: the function and pointer invariants are established above.
+        unsafe {
+            probe_fn(
+                gate,
+                core::ptr::addr_of!(input),
+                core::ptr::addr_of_mut!(output),
+                core::ptr::addr_of_mut!(probe),
+            )
+        };
+        Ok(probe)
     }
 
     /// Two independent mappings of one blob must behave identically.
@@ -708,5 +825,27 @@ mod tests {
 
             assert_eq!(observed.status, expected);
         }
+    }
+
+    #[test]
+    fn test_adapter_restores_its_win64_callers_nonvolatile_state() {
+        let code = [0x01];
+        let blob = emit_interpreter().expect("the interpreter must assemble");
+        let mapping = map_executable(blob.bytes()).expect("the mapping must succeed");
+        // SAFETY: the mapping contains the emitted test adapter at this offset.
+        let gate = unsafe { gate_at(mapping + blob.test_entry_offset() as usize) };
+
+        let observed = probe_adapter_abi(gate, &code, sentinel_state())
+            .expect("the ABI probe must return after the complete adapter epilogue");
+
+        assert_eq!(observed.rsp_before, observed.rsp_after);
+        assert_eq!(observed.rbx, ABI_RBX);
+        assert_eq!(observed.rbp, ABI_RBP);
+        assert_eq!(observed.rsi, ABI_RSI);
+        assert_eq!(observed.rdi, ABI_RDI);
+        assert_eq!(observed.r12, ABI_R12);
+        assert_eq!(observed.r13, ABI_R13);
+        assert_eq!(observed.r14, ABI_R14);
+        assert_eq!(observed.r15, ABI_R15);
     }
 }
