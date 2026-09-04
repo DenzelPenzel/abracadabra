@@ -36,25 +36,57 @@ const SAVED_RDX: i32 = 96;
 const SAVED_RCX: i32 = 104;
 const SAVED_RAX: i32 = 112;
 const SAVED_RFLAGS: i32 = 120;
-const ENTRY_CODE: i32 = 136;
-const ENTRY_CODE_END: i32 = 144;
-const ENTRY_OUTPUT: i32 = 152;
+const ENTRY_CODE_BASE: i32 = 136;
+const ENTRY_PC: i32 = 144;
+const ENTRY_CODE_END: i32 = 152;
+const ENTRY_STATUS: i32 = 160;
+const ENTRY_RUNTIME_RFLAGS: i32 = 168;
 
 /// Bytes reserved for the bounded VM operand stack, above the native RSP.
 const OPERAND_STACK_BYTES: i32 = 128;
 
-// Field offsets of the outcome record the gate fills in. They must agree with
-// the `#[repr(C)]` layout in `runtime_x64`.
-const OUT_STATUS: i32 = 0;
-const OUT_RAX: i32 = 8;
-const OUT_RUNTIME_RFLAGS: i32 = 16;
-const OUT_OBSERVED_RFLAGS: i32 = 24;
-const OUT_RCX: i32 = 32;
-const OUT_RDX: i32 = 40;
+// Field offsets of the test adapter input and output records. They must agree
+// with the `#[repr(C)]` layouts in `runtime_x64`.
+const IN_CODE_BASE: i32 = 0;
+const IN_ENTRY_PC: i32 = 8;
+const IN_CODE_END: i32 = 16;
+const IN_RFLAGS: i32 = 24;
+const IN_RAX: i32 = 32;
+const IN_RCX: i32 = 40;
+const IN_RDX: i32 = 48;
+const IN_RBX: i32 = 56;
+const IN_RBP: i32 = 64;
+const IN_RSI: i32 = 72;
+const IN_RDI: i32 = 80;
+const IN_R8: i32 = 88;
+const IN_R9: i32 = 96;
+const IN_R10: i32 = 104;
+const IN_R11: i32 = 112;
+const IN_R12: i32 = 120;
+const IN_R13: i32 = 128;
+const IN_R14: i32 = 136;
+const IN_R15: i32 = 144;
 
-/// Win64 stack slot of the fifth argument at gate entry: return address plus
-/// the four-register shadow space.
-const GATE_ARG_OUTPUT: i32 = 40;
+const OUT_STATUS: i32 = 0;
+const OUT_RUNTIME_RFLAGS: i32 = 8;
+const OUT_OBSERVED_RFLAGS: i32 = 16;
+const OUT_RSP_BEFORE: i32 = 24;
+const OUT_RSP_AFTER: i32 = 32;
+const OUT_RAX: i32 = 40;
+const OUT_RCX: i32 = 48;
+const OUT_RDX: i32 = 56;
+const OUT_RBX: i32 = 64;
+const OUT_RBP: i32 = 72;
+const OUT_RSI: i32 = 80;
+const OUT_RDI: i32 = 88;
+const OUT_R8: i32 = 96;
+const OUT_R9: i32 = 104;
+const OUT_R10: i32 = 112;
+const OUT_R11: i32 = 120;
+const OUT_R12: i32 = 128;
+const OUT_R13: i32 = 136;
+const OUT_R14: i32 = 144;
+const OUT_R15: i32 = 152;
 
 /// Failure to assemble the interpreter.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -118,6 +150,9 @@ impl RuntimeBlob {
     }
 
     /// Offset of the native-state capture entry within [`RuntimeBlob::bytes`].
+    ///
+    /// Its stack frame contains bytecode base, entry PC, bytecode end, status,
+    /// and runtime-RFLAGS slots above the native return address.
     pub fn production_entry_offset(&self) -> u32 {
         self.production_entry_offset
     }
@@ -158,27 +193,90 @@ pub(crate) fn emit_interpreter_at(ip: u64) -> Result<RuntimeBlob, EmitError> {
     let mut dispatch = asm.create_label();
     let mut handlers = asm.create_label();
 
-    // The Win64 gate: RCX is the bytecode pointer, RDX its end, R8 and R9 the
-    // guest RCX and RDX, and the fifth stack argument the outcome record.
-    asm.push(qword_ptr(rsp + GATE_ARG_OUTPUT))?;
+    // The Win64 test adapter receives input and output records in RCX and RDX.
+    // Preserve its caller's nonvolatile registers before loading guest values.
+    asm.push(rbx)?;
+    asm.push(rbp)?;
+    asm.push(rsi)?;
+    asm.push(rdi)?;
+    asm.push(r12)?;
+    asm.push(r13)?;
+    asm.push(r14)?;
+    asm.push(r15)?;
     asm.push(rdx)?;
     asm.push(rcx)?;
-    asm.mov(rcx, r8)?;
-    asm.mov(rdx, r9)?;
+
+    // Production metadata is passed outside guest registers. The two writable
+    // slots carry the native status and the flags selected by the last handler.
+    asm.push(0)?;
+    asm.push(-1)?;
+    asm.push(qword_ptr(rcx + IN_CODE_END))?;
+    asm.push(qword_ptr(rcx + IN_ENTRY_PC))?;
+    asm.push(qword_ptr(rcx + IN_CODE_BASE))?;
+    asm.mov(qword_ptr(rdx + OUT_RSP_BEFORE), rsp)?;
+
+    // Load the complete guest context without changing the supplied RFLAGS.
+    // R15 retains the input pointer until it is loaded last.
+    asm.mov(r15, rcx)?;
+    asm.mov(rax, qword_ptr(r15 + IN_RFLAGS))?;
+    asm.push(rax)?;
+    asm.popfq()?;
+    asm.mov(rax, qword_ptr(r15 + IN_RAX))?;
+    asm.mov(rcx, qword_ptr(r15 + IN_RCX))?;
+    asm.mov(rdx, qword_ptr(r15 + IN_RDX))?;
+    asm.mov(rbx, qword_ptr(r15 + IN_RBX))?;
+    asm.mov(rbp, qword_ptr(r15 + IN_RBP))?;
+    asm.mov(rsi, qword_ptr(r15 + IN_RSI))?;
+    asm.mov(rdi, qword_ptr(r15 + IN_RDI))?;
+    asm.mov(r8, qword_ptr(r15 + IN_R8))?;
+    asm.mov(r9, qword_ptr(r15 + IN_R9))?;
+    asm.mov(r10, qword_ptr(r15 + IN_R10))?;
+    asm.mov(r11, qword_ptr(r15 + IN_R11))?;
+    asm.mov(r12, qword_ptr(r15 + IN_R12))?;
+    asm.mov(r13, qword_ptr(r15 + IN_R13))?;
+    asm.mov(r14, qword_ptr(r15 + IN_R14))?;
+    asm.mov(r15, qword_ptr(r15 + IN_R15))?;
     asm.call(dispatch)?;
-    asm.lea(rsp, qword_ptr(rsp + 24))?;
-    // Observe the state that reached the native continuation without changing
-    // any guest register or flag; none of these moves writes RFLAGS.
+
+    // Observe the restored state without changing RFLAGS. The production core
+    // only addresses its inline control slots, never this test output record.
     asm.push(r10)?;
-    asm.mov(r10, qword_ptr(rsp + (GATE_ARG_OUTPUT + 8)))?;
+    asm.mov(r10, qword_ptr(rsp + 56))?;
+    asm.mov(qword_ptr(r10 + OUT_RAX), rax)?;
     asm.mov(qword_ptr(r10 + OUT_RCX), rcx)?;
     asm.mov(qword_ptr(r10 + OUT_RDX), rdx)?;
-    asm.push(rax)?;
+    asm.mov(qword_ptr(r10 + OUT_RBX), rbx)?;
+    asm.mov(qword_ptr(r10 + OUT_RBP), rbp)?;
+    asm.mov(qword_ptr(r10 + OUT_RSI), rsi)?;
+    asm.mov(qword_ptr(r10 + OUT_RDI), rdi)?;
+    asm.mov(qword_ptr(r10 + OUT_R8), r8)?;
+    asm.mov(qword_ptr(r10 + OUT_R9), r9)?;
+    asm.mov(qword_ptr(r10 + OUT_R11), r11)?;
+    asm.mov(qword_ptr(r10 + OUT_R12), r12)?;
+    asm.mov(qword_ptr(r10 + OUT_R13), r13)?;
+    asm.mov(qword_ptr(r10 + OUT_R14), r14)?;
+    asm.mov(qword_ptr(r10 + OUT_R15), r15)?;
+    asm.mov(rax, qword_ptr(rsp))?;
+    asm.mov(qword_ptr(r10 + OUT_R10), rax)?;
+    asm.mov(rax, qword_ptr(rsp + 32))?;
+    asm.mov(qword_ptr(r10 + OUT_STATUS), rax)?;
+    asm.mov(rax, qword_ptr(rsp + 40))?;
+    asm.mov(qword_ptr(r10 + OUT_RUNTIME_RFLAGS), rax)?;
     asm.pushfq()?;
     asm.pop(rax)?;
     asm.mov(qword_ptr(r10 + OUT_OBSERVED_RFLAGS), rax)?;
-    asm.pop(rax)?;
+    asm.lea(rax, qword_ptr(rsp + 8))?;
+    asm.mov(qword_ptr(r10 + OUT_RSP_AFTER), rax)?;
     asm.pop(r10)?;
+    asm.lea(rsp, qword_ptr(rsp + 56))?;
+    asm.pop(r15)?;
+    asm.pop(r14)?;
+    asm.pop(r13)?;
+    asm.pop(r12)?;
+    asm.pop(rdi)?;
+    asm.pop(rsi)?;
+    asm.pop(rbp)?;
+    asm.pop(rbx)?;
     asm.ret()?;
 
     emit_dispatcher(&mut asm, &mut dispatch, &mut handlers)?;
@@ -228,9 +326,9 @@ fn label_offset(
 
 /// Emit the dispatch loop.
 ///
-/// Entry stack above the return address: bytecode begin, bytecode end, outcome
-/// pointer. The dispatcher captures all modeled GPRs and RFLAGS before it uses
-/// any of them as runtime scratch registers, and restores them on every exit.
+/// Entry stack above the return address: bytecode base, entry PC, bytecode end,
+/// status slot, and runtime-RFLAGS slot. The dispatcher captures all modeled
+/// GPRs and RFLAGS before assigning scratch registers.
 fn emit_dispatcher(
     asm: &mut CodeAssembler,
     dispatch: &mut CodeLabel,
@@ -271,7 +369,8 @@ fn emit_dispatcher(
     asm.push(r15)?;
     // R15 is the immutable saved-context base.
     asm.mov(r15, rsp)?;
-    asm.mov(r13, qword_ptr(r15 + ENTRY_CODE))?;
+    asm.mov(rsi, qword_ptr(r15 + ENTRY_CODE_BASE))?;
+    asm.mov(r13, qword_ptr(r15 + ENTRY_PC))?;
     asm.mov(r12, qword_ptr(r15 + ENTRY_CODE_END))?;
     // Reserve a bounded operand stack above RSP and keep its empty top in R11,
     // so the dispatcher's own pushes below RSP cannot reach operand slots.
@@ -389,15 +488,12 @@ fn emit_dispatcher(
     asm.set_label(&mut step_limit)?;
     asm.mov(eax, status::STEP_LIMIT as u32)?;
 
-    // Publish the outcome before restoring every captured register and RFLAGS.
-    // The restored RFLAGS carry the guest flags a handler last wrote.
+    // Publish control state into the production frame before restoring every
+    // captured register and RFLAGS.
     asm.set_label(&mut publish)?;
-    asm.mov(r10, qword_ptr(r15 + ENTRY_OUTPUT))?;
-    asm.mov(qword_ptr(r10 + OUT_STATUS), rax)?;
-    asm.mov(rax, qword_ptr(r15 + SAVED_RAX))?;
-    asm.mov(qword_ptr(r10 + OUT_RAX), rax)?;
+    asm.mov(qword_ptr(r15 + ENTRY_STATUS), rax)?;
     asm.mov(rax, qword_ptr(r15 + SAVED_RFLAGS))?;
-    asm.mov(qword_ptr(r10 + OUT_RUNTIME_RFLAGS), rax)?;
+    asm.mov(qword_ptr(r15 + ENTRY_RUNTIME_RFLAGS), rax)?;
     asm.mov(rsp, r15)?;
     asm.pop(r15)?;
     asm.pop(r14)?;

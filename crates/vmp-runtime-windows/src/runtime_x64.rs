@@ -82,27 +82,91 @@ pub struct RuntimeExecution {
 }
 
 #[repr(C)]
-struct GateOutput {
-    status: u64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GuestState {
+    rflags: u64,
     rax: u64,
-    runtime_rflags: u64,
-    observed_rflags: u64,
     rcx: u64,
     rdx: u64,
+    rbx: u64,
+    rbp: u64,
+    rsi: u64,
+    rdi: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+}
+
+#[repr(C)]
+struct GateInput {
+    code_base: *const u8,
+    entry_pc: *const u8,
+    code_end: *const u8,
+    state: GuestState,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GateOutput {
+    status: u64,
+    runtime_rflags: u64,
+    observed_rflags: u64,
+    rsp_before: u64,
+    rsp_after: u64,
+    rax: u64,
+    rcx: u64,
+    rdx: u64,
+    rbx: u64,
+    rbp: u64,
+    rsi: u64,
+    rdi: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+}
+
+impl GateOutput {
+    fn empty() -> Self {
+        Self {
+            status: u64::MAX,
+            runtime_rflags: 0,
+            observed_rflags: 0,
+            rsp_before: 0,
+            rsp_after: 0,
+            rax: 0,
+            rcx: 0,
+            rdx: 0,
+            rbx: 0,
+            rbp: 0,
+            rsi: 0,
+            rdi: 0,
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+        }
+    }
 }
 
 /// Win64 entry point of the emitted interpreter.
 ///
-/// It converts normal Win64 arguments into the dispatcher's entry frame:
-/// bytecode pointer, bytecode end, then an outcome pointer. RCX and RDX are
-/// loaded with the guest values before control reaches the dispatcher.
-type GateFn = unsafe extern "win64" fn(
-    code: *const u8,
-    code_end: *const u8,
-    lhs: u64,
-    rhs: u64,
-    output: *mut GateOutput,
-) -> u64;
+/// It loads a complete guest context from the input record and observes the
+/// state that the separate production entry restores.
+type GateFn = unsafe extern "win64" fn(input: *const GateInput, output: *mut GateOutput) -> u64;
 
 /// Validate a v1 container before executing its entry point through the gate.
 ///
@@ -115,13 +179,22 @@ pub fn execute_validated_gate(
     rhs: u64,
 ) -> Result<RuntimeExecution, RuntimeError> {
     let program = decode(container)?;
-    let entry = V1_HEADER_SIZE + program.entry_offset() as usize;
-    let code = &container[entry..];
-    execute_raw_gate(code, lhs, rhs)
+    let code = &container[V1_HEADER_SIZE..];
+    run_gate(
+        mapped_gate()?,
+        code,
+        program.entry_offset() as usize,
+        lhs,
+        rhs,
+    )
 }
 
-#[inline(never)]
-pub fn execute_raw_gate(code: &[u8], lhs: u64, rhs: u64) -> Result<RuntimeExecution, RuntimeError> {
+#[cfg(test)]
+pub(crate) fn execute_raw_gate(
+    code: &[u8],
+    lhs: u64,
+    rhs: u64,
+) -> Result<RuntimeExecution, RuntimeError> {
     if code.len() > MAX_RUNTIME_CODE_SIZE {
         return Err(RuntimeTrap::BytecodeTooLarge {
             size: code.len(),
@@ -129,38 +202,35 @@ pub fn execute_raw_gate(code: &[u8], lhs: u64, rhs: u64) -> Result<RuntimeExecut
         }
         .into());
     }
-    run_gate(mapped_gate()?, code, lhs, rhs)
+    run_gate(mapped_gate()?, code, 0, lhs, rhs)
 }
 
 fn run_gate(
     gate: GateFn,
     code: &[u8],
+    entry_offset: usize,
     lhs: u64,
     rhs: u64,
 ) -> Result<RuntimeExecution, RuntimeError> {
-    let mut output = GateOutput {
-        status: u64::MAX,
-        rax: 0,
-        runtime_rflags: 0,
-        observed_rflags: 0,
-        rcx: 0,
-        rdx: 0,
+    let initial = GuestState {
+        rflags: 0x202,
+        rax: 0xfeed_face_cafe_beef,
+        rcx: lhs,
+        rdx: rhs,
+        rbx: 0x0303_0303_0303_0303,
+        rbp: 0x0404_0404_0404_0404,
+        rsi: 0x0505_0505_0505_0505,
+        rdi: 0x0606_0606_0606_0606,
+        r8: 0x0808_0808_0808_0808,
+        r9: 0x0909_0909_0909_0909,
+        r10: 0x1010_1010_1010_1010,
+        r11: 0x1111_1111_1111_1111,
+        r12: 0x1212_1212_1212_1212,
+        r13: 0x1313_1313_1313_1313,
+        r14: 0x1414_1414_1414_1414,
+        r15: 0x1515_1515_1515_1515,
     };
-    let code_end = code.as_ptr().wrapping_add(code.len());
-
-    // SAFETY: `gate` points at the read-execute mapping of the emitted
-    // interpreter, whose entry point is the Win64 signature `GateFn` describes.
-    // It receives valid bounds from `code`, a valid outcome pointer, and
-    // restores the Win64 nonvolatile registers before returning.
-    unsafe {
-        gate(
-            code.as_ptr(),
-            code_end,
-            lhs,
-            rhs,
-            core::ptr::addr_of_mut!(output),
-        )
-    };
+    let output = run_gate_observed(gate, code, entry_offset, initial)?;
 
     match output.status {
         status::OK if output.runtime_rflags == output.observed_rflags => Ok(RuntimeExecution {
@@ -179,6 +249,47 @@ fn run_gate(
         status::STEP_LIMIT => Err(RuntimeTrap::StepLimit.into()),
         _ => Err(RuntimeTrap::InvalidOperand.into()),
     }
+}
+
+fn run_gate_observed(
+    gate: GateFn,
+    code: &[u8],
+    entry_offset: usize,
+    initial: GuestState,
+) -> Result<GateOutput, RuntimeError> {
+    let entry = code
+        .get(entry_offset..)
+        .ok_or(RuntimeTrap::InvalidOperand)?;
+    run_gate_observed_bounds(
+        gate,
+        code.as_ptr(),
+        entry.as_ptr(),
+        code.as_ptr().wrapping_add(code.len()),
+        initial,
+    )
+}
+
+fn run_gate_observed_bounds(
+    gate: GateFn,
+    code_base: *const u8,
+    entry_pc: *const u8,
+    code_end: *const u8,
+    initial: GuestState,
+) -> Result<GateOutput, RuntimeError> {
+    let mut output = GateOutput::empty();
+    let input = GateInput {
+        code_base,
+        entry_pc,
+        code_end,
+        state: initial,
+    };
+
+    // SAFETY: `gate` points at the read-execute mapping of the emitted
+    // interpreter, whose entry point is the Win64 signature `GateFn` describes.
+    // Both records remain valid for the call, their code pointers describe one
+    // live slice, and the adapter restores its caller's nonvolatile registers.
+    unsafe { gate(core::ptr::addr_of!(input), core::ptr::addr_of_mut!(output)) };
+    Ok(output)
 }
 
 /// Address of the interpreter's entry point in an executable mapping.
@@ -435,9 +546,9 @@ mod tests {
 
         for (lhs, rhs) in [(0u64, 0u64), (1, 2), (u64::MAX, 1), (0x0f, 1)] {
             let from_first =
-                run_gate(first_gate, code, lhs, rhs).expect("the first mapping must execute");
+                run_gate(first_gate, code, 0, lhs, rhs).expect("the first mapping must execute");
             let from_second =
-                run_gate(second_gate, code, lhs, rhs).expect("the second mapping must execute");
+                run_gate(second_gate, code, 0, lhs, rhs).expect("the second mapping must execute");
 
             assert_eq!(from_first, from_second);
             assert_eq!(from_first.rax, lhs.wrapping_add(rhs));
