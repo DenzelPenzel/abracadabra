@@ -270,7 +270,7 @@ vectors_stored:
     mov QWORD PTR [r10 + OUT_LOW_WATERMARK], rax
 
     cmp QWORD PTR [r10 + OUT_STATUS], 0
-    jne production_fastfail
+    jne vmp_runtime_fastfail_begin
     mov DWORD PTR [r10 + OUT_CONTINUATION], 1
     cmp DWORD PTR [r15 + 192], 0
     je restore_host
@@ -302,12 +302,15 @@ restore_host:
     xor eax, eax
     ret
 
-production_fastfail:
-vmp_runtime_fastfail_begin:
+vmp_runtime_production_probe ENDP
+
+vmp_runtime_fastfail_begin PROC
     mov ecx, FAST_FAIL_FATAL_APP_EXIT
     int 29h
-vmp_runtime_fastfail_end:
-vmp_runtime_production_probe ENDP
+vmp_runtime_fastfail_begin ENDP
+
+vmp_runtime_fastfail_end PROC
+vmp_runtime_fastfail_end ENDP
 
 vmp_runtime_probe_abi PROC FRAME
     push rbx
