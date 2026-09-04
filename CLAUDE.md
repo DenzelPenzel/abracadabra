@@ -213,7 +213,8 @@ before changing behaviour in that layer — several of the divergences look like
 | `vmp-mutation` | §2 — the four rewrites and their side conditions, junk selection rule |
 | `vmp-pe` | §3 — coordinate traps, why the append-only writer refuses, writer divergences |
 | `vmp-emit` | §4 — prologue freeze, block placement, why the allocator is not worth porting |
-| `vmp-vm` | §5 — the flag/termination comparison discipline a lowering slice must satisfy |
+| `vmp-vm` | §5.1 — the flag/termination comparison discipline a lowering slice must satisfy |
+| `vmp-runtime-windows` | §5.2 — the C++ VM's register context, untyped stack and address-baked dispatch |
 | any of them | `## Open decisions` — six questions that are the owner's call, not yours |
 
 ## How work is sequenced
