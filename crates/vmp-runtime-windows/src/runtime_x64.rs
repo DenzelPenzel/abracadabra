@@ -1,15 +1,17 @@
-//! The unsafe surface is intentionally confined to the two naked x64 entry
-//! points. The public wrapper accepts bounded Rust slices.
+//! The unsafe surface is intentionally confined to mapping the emitted
+//! interpreter and calling its Win64 entry point. The public wrapper accepts
+//! bounded Rust slices.
 #![allow(unsafe_code)]
 
-use core::arch::naked_asm;
+use core::fmt;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error;
 use vmp_vm::bytecode::{decode, DecodeError, MAX_CONTAINER_SIZE, V1_HEADER_SIZE};
 
+use crate::emit::{emit_interpreter, status, EmitError};
+
 /// Maximum v1 instruction-stream size: 1 MiB container minus its 16-byte header.
 pub const MAX_RUNTIME_CODE_SIZE: usize = MAX_CONTAINER_SIZE - V1_HEADER_SIZE;
-
-const MAX_RUNTIME_STEPS: u32 = 1_000_000;
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -34,17 +36,43 @@ pub enum RuntimeTrap {
     StepLimit,
 }
 
-/// Failure at the validated bytecode boundary or inside the native runtime.
+/// Failure to prepare the runtime, to validate bytecode, or inside the runtime.
 #[derive(Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RuntimeError {
+    #[error(transparent)]
+    Emit(#[from] EmitError),
+    #[error("{step} the {size}-byte interpreter failed")]
+    Mapping { step: MappingStep, size: usize },
     #[error(transparent)]
     Decode(#[from] DecodeError),
     #[error(transparent)]
     Trap(#[from] RuntimeTrap),
 }
 
-/// Guest state observable after the raw runtime returns to native code.
+/// Operating-system step that failed while publishing the interpreter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MappingStep {
+    /// Reserving and committing the pages.
+    Reserve,
+    /// Making the filled pages executable.
+    Protect,
+    /// Making the instruction cache coherent with the written bytes.
+    Flush,
+}
+
+impl fmt::Display for MappingStep {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Reserve => "reserving pages for",
+            Self::Protect => "making the pages executable for",
+            Self::Flush => "flushing the instruction cache for",
+        })
+    }
+}
+
+/// Guest state observable after the runtime returns to native code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeExecution {
     pub rax: u64,
@@ -63,7 +91,20 @@ struct GateOutput {
     rdx: u64,
 }
 
-/// Validate a v1 container before executing its entry point through a Win64 gate.
+/// Win64 entry point of the emitted interpreter.
+///
+/// It converts normal Win64 arguments into the dispatcher's entry frame:
+/// bytecode pointer, bytecode end, then an outcome pointer. RCX and RDX are
+/// loaded with the guest values before control reaches the dispatcher.
+type GateFn = unsafe extern "win64" fn(
+    code: *const u8,
+    code_end: *const u8,
+    lhs: u64,
+    rhs: u64,
+    output: *mut GateOutput,
+) -> u64;
+
+/// Validate a v1 container before executing its entry point through the gate.
 ///
 /// The accepted bytecode subset is `PushReg` for RCX/RDX, qword `Add`,
 /// `PopReg` to RAX, and `Ret`. All bytecode fetches and operand-stack accesses
@@ -76,18 +117,27 @@ pub fn execute_validated_gate(
     let program = decode(container)?;
     let entry = V1_HEADER_SIZE + program.entry_offset() as usize;
     let code = &container[entry..];
-    Ok(execute_raw_gate(code, lhs, rhs)?)
+    execute_raw_gate(code, lhs, rhs)
 }
 
 #[inline(never)]
-pub fn execute_raw_gate(code: &[u8], lhs: u64, rhs: u64) -> Result<RuntimeExecution, RuntimeTrap> {
+pub fn execute_raw_gate(code: &[u8], lhs: u64, rhs: u64) -> Result<RuntimeExecution, RuntimeError> {
     if code.len() > MAX_RUNTIME_CODE_SIZE {
         return Err(RuntimeTrap::BytecodeTooLarge {
             size: code.len(),
             maximum: MAX_RUNTIME_CODE_SIZE,
-        });
+        }
+        .into());
     }
+    run_gate(mapped_gate()?, code, lhs, rhs)
+}
 
+fn run_gate(
+    gate: GateFn,
+    code: &[u8],
+    lhs: u64,
+    rhs: u64,
+) -> Result<RuntimeExecution, RuntimeError> {
     let mut output = GateOutput {
         status: u64::MAX,
         rax: 0,
@@ -98,10 +148,12 @@ pub fn execute_raw_gate(code: &[u8], lhs: u64, rhs: u64) -> Result<RuntimeExecut
     };
     let code_end = code.as_ptr().wrapping_add(code.len());
 
-    // SAFETY: `raw_gate` receives valid bounds from `code`, a valid status
-    // pointer, and restores the Win64 nonvolatile registers before returning.
+    // SAFETY: `gate` points at the read-execute mapping of the emitted
+    // interpreter, whose entry point is the Win64 signature `GateFn` describes.
+    // It receives valid bounds from `code`, a valid outcome pointer, and
+    // restores the Win64 nonvolatile registers before returning.
     unsafe {
-        raw_gate(
+        gate(
             code.as_ptr(),
             code_end,
             lhs,
@@ -111,232 +163,284 @@ pub fn execute_raw_gate(code: &[u8], lhs: u64, rhs: u64) -> Result<RuntimeExecut
     };
 
     match output.status {
-        0 if output.runtime_rflags == output.observed_rflags => Ok(RuntimeExecution {
+        status::OK if output.runtime_rflags == output.observed_rflags => Ok(RuntimeExecution {
             rax: output.rax,
             rcx: output.rcx,
             rdx: output.rdx,
             rflags: output.observed_rflags,
         }),
-        0 => Err(RuntimeTrap::FlagRestoreMismatch),
-        1 => Err(RuntimeTrap::TruncatedBytecode),
-        2 => Err(RuntimeTrap::UnsupportedOpcode),
-        3 => Err(RuntimeTrap::InvalidOperand),
-        4 => Err(RuntimeTrap::StackUnderflow),
-        5 => Err(RuntimeTrap::StackOverflow),
-        6 => Err(RuntimeTrap::NonEmptyStack),
-        7 => Err(RuntimeTrap::StepLimit),
-        _ => Err(RuntimeTrap::InvalidOperand),
+        status::OK => Err(RuntimeTrap::FlagRestoreMismatch.into()),
+        status::TRUNCATED_BYTECODE => Err(RuntimeTrap::TruncatedBytecode.into()),
+        status::UNSUPPORTED_OPCODE => Err(RuntimeTrap::UnsupportedOpcode.into()),
+        status::INVALID_OPERAND => Err(RuntimeTrap::InvalidOperand.into()),
+        status::STACK_UNDERFLOW => Err(RuntimeTrap::StackUnderflow.into()),
+        status::STACK_OVERFLOW => Err(RuntimeTrap::StackOverflow.into()),
+        status::NON_EMPTY_STACK => Err(RuntimeTrap::NonEmptyStack.into()),
+        status::STEP_LIMIT => Err(RuntimeTrap::StepLimit.into()),
+        _ => Err(RuntimeTrap::InvalidOperand.into()),
     }
 }
 
-/// Test gate using the Win64 calling convention on every x86-64 host.
+/// Address of the interpreter's entry point in an executable mapping.
 ///
-/// It converts normal Win64 arguments into the legacy-compatible entry frame:
-/// bytecode pointer, bytecode end, then an outcome pointer. RCX and RDX are
-/// loaded with guest values before control reaches the raw runtime entry.
-#[unsafe(naked)]
-unsafe extern "win64" fn raw_gate(
-    _code: *const u8,
-    _code_end: *const u8,
-    _lhs: u64,
-    _rhs: u64,
-    _output: *mut GateOutput,
-) -> u64 {
-    naked_asm!(
-        "push qword ptr [rsp + 40]",
-        "push rdx",
-        "push rcx",
-        "mov rcx, r8",
-        "mov rdx, r9",
-        "call {runtime_entry}",
-        "lea rsp, [rsp + 24]",
-        // Observe the flags that reached the native continuation without
-        // changing any guest register or flag.
-        "push r10",
-        "mov r10, qword ptr [rsp + 48]",
-        "mov qword ptr [r10 + 32], rcx",
-        "mov qword ptr [r10 + 40], rdx",
-        "push rax",
-        "pushfq",
-        "pop rax",
-        "mov qword ptr [r10 + 24], rax",
-        "pop rax",
-        "pop r10",
-        "ret",
-        runtime_entry = sym runtime_entry,
-    )
+/// Zero means "not mapped yet"; the emitted entry point can never be zero.
+static GATE: AtomicUsize = AtomicUsize::new(0);
+
+/// Return the entry point of the shared interpreter.
+///
+/// On first use, the interpreter is emitted, mapped, and cached for the life of
+/// the process. Concurrent first calls may create extra valid mappings that are
+/// not reused.
+fn mapped_gate() -> Result<GateFn, RuntimeError> {
+    let cached = GATE.load(Ordering::Acquire);
+    let entry = if cached == 0 {
+        let blob = emit_interpreter()?;
+        let entry = map_executable(blob.bytes())? + blob.entry_offset() as usize;
+        GATE.store(entry, Ordering::Release);
+        entry
+    } else {
+        cached
+    };
+
+    // SAFETY: `entry` is the entry point of a read-execute mapping of the
+    // emitted interpreter.
+    Ok(unsafe { gate_at(entry) })
 }
 
-/// Minimal native x64 VM processor entry.
+/// Reinterpret a mapped interpreter entry point as its Win64 signature.
 ///
-/// Entry stack, above the return address: bytecode begin, bytecode end, status
-/// pointer. The processor captures all modeled GPRs and RFLAGS before using any
-/// of them as runtime scratch registers.
-#[unsafe(naked)]
-unsafe extern "C" fn runtime_entry() {
-    naked_asm!(
-        "pushfq",
-        "push rax",
-        "push rcx",
-        "push rdx",
-        "push rbx",
-        "push rbp",
-        "push rsi",
-        "push rdi",
-        "push r8",
-        "push r9",
-        "push r10",
-        "push r11",
-        "push r12",
-        "push r13",
-        "push r14",
-        "push r15",
-        // R15 is the immutable saved-context base. Metadata follows the saved
-        // register frame at offsets 136, 144, and 152.
-        "mov r15, rsp",
-        "mov r13, qword ptr [r15 + 136]",
-        "mov r12, qword ptr [r15 + 144]",
-        // Reserve a bounded operand stack and keep its empty top in R11.
-        "sub rsp, 128",
-        "and rsp, -16",
-        "mov r14, rsp",
-        "mov r11, rsp",
-        "lea rbx, [rsp + 128]",
-        "mov ebp, {max_steps}",
-        // Fetch one opcode, failing closed at the bytecode boundary.
-        "2:",
-        "test ebp, ebp",
-        "jz 27f",
-        "dec ebp",
-        "cmp r13, r12",
-        "jae 20f",
-        "movzx eax, byte ptr [r13]",
-        "inc r13",
-        "cmp al, 0x01",
-        "je 10f",
-        "cmp al, 0x11",
-        "je 3f",
-        "cmp al, 0x12",
-        "je 5f",
-        "cmp al, 0x20",
-        "je 7f",
-        "jmp 21f",
-        // PUSH_REG qword, currently bounded to RCX and RDX for the first
-        // vertical proof slice.
-        "3:",
-        "mov rax, r12",
-        "sub rax, r13",
-        "cmp rax, 2",
-        "jb 20f",
-        "cmp byte ptr [r13], 8",
-        "jne 22f",
-        "movzx eax, byte ptr [r13 + 1]",
-        "add r13, 2",
-        "lea r10, [r14 + 8]",
-        "cmp r10, rbx",
-        "ja 24f",
-        "cmp al, 1",
-        "je 4f",
-        "cmp al, 2",
-        "jne 22f",
-        "mov rax, qword ptr [r15 + 96]",
-        "jmp 30f",
-        "4:",
-        "mov rax, qword ptr [r15 + 104]",
-        "30:",
-        "mov qword ptr [r14], rax",
-        "mov r14, r10",
-        "jmp 2b",
-        // POP_REG qword, bounded to RAX for this slice.
-        "5:",
-        "mov rax, r12",
-        "sub rax, r13",
-        "cmp rax, 2",
-        "jb 20f",
-        "cmp byte ptr [r13], 8",
-        "jne 22f",
-        "cmp byte ptr [r13 + 1], 0",
-        "jne 22f",
-        "add r13, 2",
-        "cmp r14, r11",
-        "je 23f",
-        "sub r14, 8",
-        "mov rax, qword ptr [r14]",
-        "mov qword ptr [r15 + 112], rax",
-        "jmp 2b",
-        // ADD qword: rhs and lhs are popped, result and native ADD flags are
-        // written back to the saved guest context.
-        "7:",
-        "cmp r13, r12",
-        "jae 20f",
-        "cmp byte ptr [r13], 8",
-        "jne 22f",
-        "inc r13",
-        "mov rax, r14",
-        "sub rax, r11",
-        "cmp rax, 16",
-        "jb 23f",
-        "sub r14, 8",
-        "mov rax, qword ptr [r14]",
-        "sub r14, 8",
-        "add qword ptr [r14], rax",
-        "pushfq",
-        "pop rax",
-        "mov qword ptr [r15 + 120], rax",
-        "add r14, 8",
-        "jmp 2b",
-        // RET requires an empty VM operand stack.
-        "10:",
-        "cmp r14, r11",
-        "jne 25f",
-        "xor eax, eax",
-        "jmp 26f",
-        "20:",
-        "mov eax, 1",
-        "jmp 26f",
-        "21:",
-        "mov eax, 2",
-        "jmp 26f",
-        "22:",
-        "mov eax, 3",
-        "jmp 26f",
-        "23:",
-        "mov eax, 4",
-        "jmp 26f",
-        "24:",
-        "mov eax, 5",
-        "jmp 26f",
-        "25:",
-        "mov eax, 6",
-        "jmp 26f",
-        "27:",
-        "mov eax, 7",
-        // Publish status before restoring every captured register and RFLAGS.
-        "26:",
-        "mov r10, qword ptr [r15 + 152]",
-        "mov qword ptr [r10], rax",
-        "mov rax, qword ptr [r15 + 112]",
-        "mov qword ptr [r10 + 8], rax",
-        "mov rax, qword ptr [r15 + 120]",
-        "mov qword ptr [r10 + 16], rax",
-        "mov rsp, r15",
-        "pop r15",
-        "pop r14",
-        "pop r13",
-        "pop r12",
-        "pop r11",
-        "pop r10",
-        "pop r9",
-        "pop r8",
-        "pop rdi",
-        "pop rsi",
-        "pop rbp",
-        "pop rbx",
-        "pop rdx",
-        "pop rcx",
-        "pop rax",
-        "popfq",
-        "ret",
-        max_steps = const MAX_RUNTIME_STEPS,
-    )
+/// # Safety
+///
+/// `entry` must be the entry point of a live read-execute mapping of the bytes
+/// [`emit_interpreter`] produced.
+unsafe fn gate_at(entry: usize) -> GateFn {
+    core::mem::transmute::<usize, GateFn>(entry)
+}
+
+/// Copy `bytes` into a fresh read-execute mapping and return its base address.
+///
+/// The mapping is filled while it is read-write and flipped to read-execute
+/// before it is returned, so the process never holds writable executable
+/// memory at a point where the runtime could be entered.
+#[cfg(unix)]
+fn map_executable(bytes: &[u8]) -> Result<usize, RuntimeError> {
+    const PROT_READ: i32 = 1;
+    const PROT_WRITE: i32 = 2;
+    const PROT_EXEC: i32 = 4;
+    const MAP_PRIVATE: i32 = 0x0002;
+    #[cfg(target_os = "macos")]
+    const MAP_ANONYMOUS: i32 = 0x1000;
+    #[cfg(target_os = "linux")]
+    const MAP_ANONYMOUS: i32 = 0x0020;
+
+    extern "C" {
+        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+        fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
+        fn munmap(addr: *mut u8, len: usize) -> i32;
+    }
+
+    let size = bytes.len();
+    if bytes.is_empty() {
+        return Err(RuntimeError::Mapping {
+            step: MappingStep::Reserve,
+            size,
+        });
+    }
+
+    // SAFETY: a null hint asks the kernel to choose the address, the length is
+    // non-zero, and an anonymous private mapping needs no file descriptor.
+    let page = unsafe {
+        mmap(
+            core::ptr::null_mut(),
+            bytes.len(),
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if page.is_null() || page as isize == -1 {
+        return Err(RuntimeError::Mapping {
+            step: MappingStep::Reserve,
+            size,
+        });
+    }
+
+    // SAFETY: the mapping is at least `size` long, writable, freshly allocated
+    // by the kernel, and cannot overlap `bytes`.
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), page, size) };
+
+    // SAFETY: `page` and the length are the mapping this function just created.
+    if unsafe { mprotect(page, size, PROT_READ | PROT_EXEC) } != 0 {
+        // SAFETY: the same mapping, which nothing else can hold yet.
+        unsafe { munmap(page, size) };
+        return Err(RuntimeError::Mapping {
+            step: MappingStep::Protect,
+            size,
+        });
+    }
+
+    // No instruction-cache flush is needed on this path. The module only ever
+    // compiles for x86-64, where the instruction cache is kept coherent with
+    // writes in hardware and the `mprotect` transition serialises. Windows
+    // documents an explicit requirement instead, which the other
+    // implementation honours.
+    Ok(page as usize)
+}
+
+#[cfg(windows)]
+fn map_executable(bytes: &[u8]) -> Result<usize, RuntimeError> {
+    const MEM_COMMIT: u32 = 0x0000_1000;
+    const MEM_RESERVE: u32 = 0x0000_2000;
+    const MEM_RELEASE: u32 = 0x0000_8000;
+    const PAGE_READWRITE: u32 = 0x04;
+    const PAGE_EXECUTE_READ: u32 = 0x20;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn VirtualAlloc(
+            address: *mut u8,
+            size: usize,
+            allocation_type: u32,
+            protect: u32,
+        ) -> *mut u8;
+        fn VirtualProtect(
+            address: *mut u8,
+            size: usize,
+            new_protect: u32,
+            old_protect: *mut u32,
+        ) -> i32;
+        fn VirtualFree(address: *mut u8, size: usize, free_type: u32) -> i32;
+        fn GetCurrentProcess() -> *mut u8;
+        fn FlushInstructionCache(process: *mut u8, base: *const u8, size: usize) -> i32;
+    }
+
+    let size = bytes.len();
+    if bytes.is_empty() {
+        return Err(RuntimeError::Mapping {
+            step: MappingStep::Reserve,
+            size,
+        });
+    }
+
+    // SAFETY: a null base lets the allocator choose the address, and the size
+    // is non-zero.
+    let page = unsafe {
+        VirtualAlloc(
+            core::ptr::null_mut(),
+            size,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        )
+    };
+    if page.is_null() {
+        return Err(RuntimeError::Mapping {
+            step: MappingStep::Reserve,
+            size,
+        });
+    }
+
+    // SAFETY: the allocation is at least `size` long, writable, freshly
+    // committed, and cannot overlap `bytes`.
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), page, size) };
+
+    let mut previous = 0u32;
+    // SAFETY: `page` and the length are the allocation this function just made,
+    // and `previous` is a valid output slot.
+    let changed = unsafe {
+        VirtualProtect(
+            page,
+            size,
+            PAGE_EXECUTE_READ,
+            core::ptr::addr_of_mut!(previous),
+        )
+    };
+    if changed == 0 {
+        // SAFETY: `page` is the base address of this allocation, nothing else
+        // can hold it yet, and MEM_RELEASE requires a zero size.
+        unsafe { VirtualFree(page, 0, MEM_RELEASE) };
+        return Err(RuntimeError::Mapping {
+            step: MappingStep::Protect,
+            size,
+        });
+    }
+
+    // Windows requires the instruction cache to be made coherent with freshly
+    // written code before it is executed, and documents that requirement on
+    // `VirtualProtect` itself. Until this succeeds the mapping is not returned,
+    // so no caller can reach the generated code through a stale cache.
+    //
+    // SAFETY: the pseudo-handle `GetCurrentProcess` returns needs no release,
+    // and `page` with the same length is the region just made executable.
+    let flushed = unsafe { FlushInstructionCache(GetCurrentProcess(), page, size) };
+    if flushed == 0 {
+        // SAFETY: as above; the region is still owned solely by this call.
+        unsafe { VirtualFree(page, 0, MEM_RELEASE) };
+        return Err(RuntimeError::Mapping {
+            step: MappingStep::Flush,
+            size,
+        });
+    }
+    Ok(page as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vmp_vm::bytecode::{encode, Instruction, Program, Register, Width};
+
+    /// Two independent mappings of one blob must behave identically.
+    ///
+    /// This is the execution-level position-independence proof: the emitter
+    /// test shows the bytes do not depend on the assembly address, and this
+    /// shows the mapped bytes do not depend on the address they run at.
+    #[test]
+    fn the_same_interpreter_bytes_run_identically_at_two_mappings() {
+        let container = encode(&Program::new(
+            0,
+            vec![
+                Instruction::PushReg {
+                    width: Width::Qword,
+                    register: Register::Rcx,
+                },
+                Instruction::PushReg {
+                    width: Width::Qword,
+                    register: Register::Rdx,
+                },
+                Instruction::Add(Width::Qword),
+                Instruction::PopReg {
+                    width: Width::Qword,
+                    register: Register::Rax,
+                },
+                Instruction::Ret,
+            ],
+        ))
+        .expect("fixture must encode");
+        let code = &container[V1_HEADER_SIZE..];
+
+        let blob = emit_interpreter().expect("the interpreter must assemble");
+        let first = map_executable(blob.bytes()).expect("the first mapping must succeed");
+        let second = map_executable(blob.bytes()).expect("the second mapping must succeed");
+        assert_ne!(first, second, "the two mappings must not share an address");
+
+        // SAFETY: both addresses are live read-execute mappings of the bytes
+        // `emit_interpreter` produced, so both hold the gate at its entry
+        // offset.
+        let (first_gate, second_gate) = unsafe {
+            (
+                gate_at(first + blob.entry_offset() as usize),
+                gate_at(second + blob.entry_offset() as usize),
+            )
+        };
+
+        for (lhs, rhs) in [(0u64, 0u64), (1, 2), (u64::MAX, 1), (0x0f, 1)] {
+            let from_first =
+                run_gate(first_gate, code, lhs, rhs).expect("the first mapping must execute");
+            let from_second =
+                run_gate(second_gate, code, lhs, rhs).expect("the second mapping must execute");
+
+            assert_eq!(from_first, from_second);
+            assert_eq!(from_first.rax, lhs.wrapping_add(rhs));
+        }
+    }
 }

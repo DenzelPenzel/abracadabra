@@ -12,6 +12,7 @@ iced-x86 = { version = "1", default-features = false, features = [
     "decoder",
     "encoder",
     "block_encoder",
+    "code_asm",
     "instr_info",
     "masm",
 ] }

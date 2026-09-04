@@ -375,6 +375,7 @@ dependencies = [
 name = "vmp-runtime-windows"
 version = "0.1.0"
 dependencies = [
+ "iced-x86",
  "thiserror",
  "vmp-types",
  "vmp-vm",
