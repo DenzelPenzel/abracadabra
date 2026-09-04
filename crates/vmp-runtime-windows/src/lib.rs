@@ -167,4 +167,26 @@ mod tests {
             "runtime RFLAGS restoration mismatch"
         );
     }
+
+    #[test]
+    fn mapping_failures_name_the_operating_system_step_that_failed() {
+        for (step, message) in [
+            (
+                MappingStep::Reserve,
+                "reserving pages for the 480-byte interpreter failed",
+            ),
+            (
+                MappingStep::Protect,
+                "making the pages executable for the 480-byte interpreter failed",
+            ),
+            (
+                MappingStep::Flush,
+                "flushing the instruction cache for the 480-byte interpreter failed",
+            ),
+        ] {
+            let error = RuntimeError::Mapping { step, size: 480 };
+
+            assert_eq!(error.to_string(), message);
+        }
+    }
 }
