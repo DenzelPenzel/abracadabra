@@ -500,6 +500,48 @@ mod tests {
     use super::*;
     use vmp_vm::bytecode::{encode, Instruction, Program, Register, Width};
 
+    fn sentinel_state() -> GuestState {
+        GuestState {
+            rflags: 0x202,
+            rax: 0x0101_0101_0101_0101,
+            rcx: 0xffff_ffff_ffff_fffe,
+            rdx: 5,
+            rbx: 0x0303_0303_0303_0303,
+            rbp: 0x0404_0404_0404_0404,
+            rsi: 0x0505_0505_0505_0505,
+            rdi: 0x0606_0606_0606_0606,
+            r8: 0x0808_0808_0808_0808,
+            r9: 0x0909_0909_0909_0909,
+            r10: 0x1010_1010_1010_1010,
+            r11: 0x1111_1111_1111_1111,
+            r12: 0x1212_1212_1212_1212,
+            r13: 0x1313_1313_1313_1313,
+            r14: 0x1414_1414_1414_1414,
+            r15: 0x1515_1515_1515_1515,
+        }
+    }
+
+    fn observed_state(output: GateOutput) -> GuestState {
+        GuestState {
+            rflags: output.observed_rflags,
+            rax: output.rax,
+            rcx: output.rcx,
+            rdx: output.rdx,
+            rbx: output.rbx,
+            rbp: output.rbp,
+            rsi: output.rsi,
+            rdi: output.rdi,
+            r8: output.r8,
+            r9: output.r9,
+            r10: output.r10,
+            r11: output.r11,
+            r12: output.r12,
+            r13: output.r13,
+            r14: output.r14,
+            r15: output.r15,
+        }
+    }
+
     /// Two independent mappings of one blob must behave identically.
     ///
     /// This is the execution-level position-independence proof: the emitter
@@ -553,5 +595,90 @@ mod tests {
             assert_eq!(from_first, from_second);
             assert_eq!(from_first.rax, lhs.wrapping_add(rhs));
         }
+    }
+
+    #[test]
+    fn production_entry_restores_the_complete_guest_context() {
+        let container = encode(&Program::new(
+            0,
+            vec![
+                Instruction::PushReg {
+                    width: Width::Qword,
+                    register: Register::Rcx,
+                },
+                Instruction::PushReg {
+                    width: Width::Qword,
+                    register: Register::Rdx,
+                },
+                Instruction::Add(Width::Qword),
+                Instruction::PopReg {
+                    width: Width::Qword,
+                    register: Register::Rax,
+                },
+                Instruction::Ret,
+            ],
+        ))
+        .expect("fixture must encode");
+        let code = &container[V1_HEADER_SIZE..];
+        let blob = emit_interpreter().expect("the interpreter must assemble");
+        let mapping = map_executable(blob.bytes()).expect("the mapping must succeed");
+        // SAFETY: the mapping contains the emitted test adapter at this offset.
+        let gate = unsafe { gate_at(mapping + blob.test_entry_offset() as usize) };
+        let initial = sentinel_state();
+
+        let observed = run_gate_observed(gate, code, 0, initial)
+            .expect("the production entry must return through the test adapter");
+
+        assert_eq!(observed.status, status::OK);
+        assert_eq!(observed.rax, initial.rcx.wrapping_add(initial.rdx));
+        assert_eq!(observed.rcx, initial.rcx);
+        assert_eq!(observed.rdx, initial.rdx);
+        assert_eq!(observed.rbx, initial.rbx);
+        assert_eq!(observed.rbp, initial.rbp);
+        assert_eq!(observed.rsi, initial.rsi);
+        assert_eq!(observed.rdi, initial.rdi);
+        assert_eq!(observed.r8, initial.r8);
+        assert_eq!(observed.r9, initial.r9);
+        assert_eq!(observed.r10, initial.r10);
+        assert_eq!(observed.r11, initial.r11);
+        assert_eq!(observed.r12, initial.r12);
+        assert_eq!(observed.r13, initial.r13);
+        assert_eq!(observed.r14, initial.r14);
+        assert_eq!(observed.r15, initial.r15);
+        assert_eq!(observed.runtime_rflags, observed.observed_rflags);
+        assert_eq!(observed.rsp_before, observed.rsp_after);
+        assert_eq!(observed.rsp_before & 0xf, 0);
+    }
+
+    #[test]
+    fn production_entry_restores_guest_context_on_a_trap() {
+        let code = [0xff];
+        let blob = emit_interpreter().expect("the interpreter must assemble");
+        let mapping = map_executable(blob.bytes()).expect("the mapping must succeed");
+        // SAFETY: the mapping contains the emitted test adapter at this offset.
+        let gate = unsafe { gate_at(mapping + blob.test_entry_offset() as usize) };
+        let initial = sentinel_state();
+
+        let observed = run_gate_observed(gate, &code, 0, initial)
+            .expect("the production trap path must return through the adapter");
+
+        assert_eq!(observed.status, status::UNSUPPORTED_OPCODE);
+        assert_eq!(observed_state(observed), initial);
+        assert_eq!(observed.runtime_rflags, initial.rflags);
+        assert_eq!(observed.rsp_before, observed.rsp_after);
+    }
+
+    #[test]
+    fn production_entry_receives_code_base_and_entry_pc_separately() {
+        let code = [0xff, 0x01];
+        let blob = emit_interpreter().expect("the interpreter must assemble");
+        let mapping = map_executable(blob.bytes()).expect("the mapping must succeed");
+        // SAFETY: the mapping contains the emitted test adapter at this offset.
+        let gate = unsafe { gate_at(mapping + blob.test_entry_offset() as usize) };
+
+        let observed = run_gate_observed(gate, &code, 1, sentinel_state())
+            .expect("the production entry must start at the supplied PC");
+
+        assert_eq!(observed.status, status::OK);
     }
 }
