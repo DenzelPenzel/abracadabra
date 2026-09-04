@@ -1,14 +1,15 @@
 //! Embedded Windows x64 VM runtime.
 
 mod emit;
-pub use emit::{emit_interpreter, EmitError, RuntimeBlob};
-
 #[cfg(target_arch = "x86_64")]
 mod runtime_x64;
 
+pub use emit::{emit_interpreter, EmitError, RuntimeBlob};
+
 #[cfg(target_arch = "x86_64")]
 pub use runtime_x64::{
-    execute_validated_gate, RuntimeError, RuntimeExecution, RuntimeTrap, MAX_RUNTIME_CODE_SIZE,
+    execute_validated_gate, MappingStep, RuntimeError, RuntimeExecution, RuntimeTrap,
+    MAX_RUNTIME_CODE_SIZE,
 };
 
 #[cfg(all(test, target_arch = "x86_64"))]
@@ -98,19 +99,19 @@ mod tests {
     fn raw_gate_rejects_malformed_bytecode_without_reading_past_end() {
         assert_eq!(
             execute_raw_gate(&[], 1, 2),
-            Err(RuntimeTrap::TruncatedBytecode)
+            Err(RuntimeError::Trap(RuntimeTrap::TruncatedBytecode))
         );
         assert_eq!(
             execute_raw_gate(&[0x11, 8], 1, 2),
-            Err(RuntimeTrap::TruncatedBytecode)
+            Err(RuntimeError::Trap(RuntimeTrap::TruncatedBytecode))
         );
         assert_eq!(
             execute_raw_gate(&[0xff], 1, 2),
-            Err(RuntimeTrap::UnsupportedOpcode)
+            Err(RuntimeError::Trap(RuntimeTrap::UnsupportedOpcode))
         );
         assert_eq!(
             execute_raw_gate(&[0x11, 8, 3], 1, 2),
-            Err(RuntimeTrap::InvalidOperand)
+            Err(RuntimeError::Trap(RuntimeTrap::InvalidOperand))
         );
     }
 
@@ -118,17 +119,17 @@ mod tests {
     fn raw_gate_enforces_operand_stack_contract() {
         assert_eq!(
             execute_raw_gate(&[0x20, 8], 1, 2),
-            Err(RuntimeTrap::StackUnderflow)
+            Err(RuntimeError::Trap(RuntimeTrap::StackUnderflow))
         );
         assert_eq!(
             execute_raw_gate(&[0x11, 8, 1, 0x01], 1, 2),
-            Err(RuntimeTrap::NonEmptyStack)
+            Err(RuntimeError::Trap(RuntimeTrap::NonEmptyStack))
         );
 
         let seventeen_pushes = [0x11, 8, 1].repeat(17);
         assert_eq!(
             execute_raw_gate(&seventeen_pushes, 1, 2),
-            Err(RuntimeTrap::StackOverflow)
+            Err(RuntimeError::Trap(RuntimeTrap::StackOverflow))
         );
     }
 
@@ -138,10 +139,10 @@ mod tests {
 
         assert_eq!(
             execute_raw_gate(&oversized, 1, 2),
-            Err(RuntimeTrap::BytecodeTooLarge {
+            Err(RuntimeError::Trap(RuntimeTrap::BytecodeTooLarge {
                 size: MAX_RUNTIME_CODE_SIZE + 1,
                 maximum: MAX_RUNTIME_CODE_SIZE,
-            })
+            }))
         );
     }
 
