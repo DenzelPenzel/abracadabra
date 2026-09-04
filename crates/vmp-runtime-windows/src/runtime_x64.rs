@@ -129,11 +129,7 @@ pub fn execute_raw_gate(code: &[u8], lhs: u64, rhs: u64) -> Result<RuntimeExecut
         }
         .into());
     }
-    let gate = match mapped_gate() {
-        Ok(gate) => gate,
-        Err(error) => return Err(error),
-    };
-    run_gate(gate, code, lhs, rhs)
+    run_gate(mapped_gate()?, code, lhs, rhs)
 }
 
 fn run_gate(
@@ -386,4 +382,65 @@ fn map_executable(bytes: &[u8]) -> Result<usize, RuntimeError> {
         });
     }
     Ok(page as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vmp_vm::bytecode::{encode, Instruction, Program, Register, Width};
+
+    /// Two independent mappings of one blob must behave identically.
+    ///
+    /// This is the execution-level position-independence proof: the emitter
+    /// test shows the bytes do not depend on the assembly address, and this
+    /// shows the mapped bytes do not depend on the address they run at.
+    #[test]
+    fn the_same_interpreter_bytes_run_identically_at_two_mappings() {
+        let container = encode(&Program::new(
+            0,
+            vec![
+                Instruction::PushReg {
+                    width: Width::Qword,
+                    register: Register::Rcx,
+                },
+                Instruction::PushReg {
+                    width: Width::Qword,
+                    register: Register::Rdx,
+                },
+                Instruction::Add(Width::Qword),
+                Instruction::PopReg {
+                    width: Width::Qword,
+                    register: Register::Rax,
+                },
+                Instruction::Ret,
+            ],
+        ))
+        .expect("fixture must encode");
+        let code = &container[V1_HEADER_SIZE..];
+
+        let blob = emit_interpreter().expect("the interpreter must assemble");
+        let first = map_executable(blob.bytes()).expect("the first mapping must succeed");
+        let second = map_executable(blob.bytes()).expect("the second mapping must succeed");
+        assert_ne!(first, second, "the two mappings must not share an address");
+
+        // SAFETY: both addresses are live read-execute mappings of the bytes
+        // `emit_interpreter` produced, so both hold the gate at its entry
+        // offset.
+        let (first_gate, second_gate) = unsafe {
+            (
+                gate_at(first + blob.entry_offset() as usize),
+                gate_at(second + blob.entry_offset() as usize),
+            )
+        };
+
+        for (lhs, rhs) in [(0u64, 0u64), (1, 2), (u64::MAX, 1), (0x0f, 1)] {
+            let from_first =
+                run_gate(first_gate, code, lhs, rhs).expect("the first mapping must execute");
+            let from_second =
+                run_gate(second_gate, code, lhs, rhs).expect("the second mapping must execute");
+
+            assert_eq!(from_first, from_second);
+            assert_eq!(from_first.rax, lhs.wrapping_add(rhs));
+        }
+    }
 }
