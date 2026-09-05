@@ -1,10 +1,10 @@
 //! Real processor exceptions on an ordinary Win64 thread stack, not the blob's test adapter
 
 use super::*;
-mod debugger;
+
 use iced_x86::code_asm::*;
 use std::mem::offset_of;
-use std::os::windows::process::CommandExt;
+
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use std::sync::Mutex;
@@ -30,7 +30,6 @@ static SERIAL: Mutex<()> = Mutex::new(());
 static ACTIVE: AtomicPtr<ProbeState> = AtomicPtr::new(null_mut());
 static OWNER_THREAD: AtomicU32 = AtomicU32::new(0);
 
-// The VEH entry clears live flags before Rust while preserving the fault's saved CONTEXT
 #[repr(C)]
 #[derive(Default)]
 struct Outcome {
@@ -42,6 +41,8 @@ struct Outcome {
     flags: u64,
     returned_rsp: u64,
     completed: u64,
+    returned_flags: u64,
+    guest_flags: u64,
 }
 
 #[repr(C)]
@@ -68,6 +69,7 @@ struct ProbeState {
     continuation_count: usize,
     seen: [u64; MAX_STEPS],
     exception_flags: u32,
+    saved_guest_flags: u64,
 }
 
 // This allocation has no runtime function table: the VEH never walks the assembly wrapper
@@ -189,22 +191,7 @@ fn recover(context: &mut CONTEXT, outcome: &Outcome) {
 }
 
 #[allow(unsafe_code)]
-#[unsafe(naked)]
-unsafe extern "system" fn exception_handler(_pointers: *mut EXCEPTION_POINTERS) -> i32 {
-    // SAFETY: The Win64 argument and return address stay untouched; the balanced flag push is aligned
-    // Windows can enter with AC active, so normalization must precede any compiler-generated code
-    core::arch::naked_asm!(
-        "pushfq",
-        "and qword ptr [rsp], {safe_flags}",
-        "popfq",
-        "jmp {handler}",
-        safe_flags = const !((TF | AC | DF) as i32),
-        handler = sym exception_handler_inner,
-    );
-}
-
-#[allow(unsafe_code)]
-unsafe extern "system" fn exception_handler_inner(pointers: *mut EXCEPTION_POINTERS) -> i32 {
+unsafe extern "system" fn exception_handler(pointers: *mut EXCEPTION_POINTERS) -> i32 {
     // SAFETY: Reject other threads before even reading the private state's address
     if unsafe { GetCurrentThreadId() } != OWNER_THREAD.load(Ordering::SeqCst) {
         return CONTINUE_SEARCH;
@@ -225,13 +212,7 @@ unsafe extern "system" fn exception_handler_inner(pointers: *mut EXCEPTION_POINT
         let outcome = &*state.outcome;
         let single_step = exception.ExceptionCode == EXCEPTION_SINGLE_STEP;
         let access_violation = exception.ExceptionCode == EXCEPTION_ACCESS_VIOLATION;
-        if state.ac {
-            eprintln!(
-                "AC exception diagnostic: code={:#x}, rip={:#x}, image offset={:#x}, rsp={:#x}, saved flags={:#x}",
-                exception.ExceptionCode, context.Rip, context.Rip.wrapping_sub(state.base),
-                context.Rsp, context.EFlags
-            );
-        }
+
         if state.steps == 0 {
             state.exception_flags = context.EFlags;
         }
@@ -258,13 +239,22 @@ unsafe extern "system" fn exception_handler_inner(pointers: *mut EXCEPTION_POINT
             state.exception_flags = context.EFlags;
             if !access_violation
                 || rip != state.fetch
-                || context.EFlags & AC == 0
+                || context.EFlags & AC != 0
                 || exception.NumberParameters != 2
                 || exception.ExceptionInformation[0] != 0
                 || exception.ExceptionInformation[1] as u64 != state.code
                 || context.R13 != state.code
             {
                 fail(state, 4, rip);
+            }
+            // The first fetch has the complete 128-byte snapshot below the independent caller
+            if rip == state.fetch && context.R15 == outcome.caller_rsp - 136 {
+                state.saved_guest_flags = std::ptr::read(context.R15 as *const u64);
+                if state.saved_guest_flags & u64::from(AC) == 0 {
+                    fail(state, 128, rip);
+                }
+            } else {
+                fail(state, 128, rip);
             }
         // Windows delivers #DB with TF cleared in CONTEXT; the code and observed RIP prove stepping
         } else if !single_step {
@@ -369,8 +359,19 @@ fn wrapper() -> Vec<u8> {
     asm.call(qword_ptr(rsp + 48))
         .expect("immediately enter production");
     asm.set_label(&mut continuation).expect("continuation");
+    asm.pushfq().expect("physical return flags");
+    asm.pop(r10).expect("retain return flags");
+    asm.push(r10).expect("temporary safe flags");
+    asm.and(qword_ptr(rsp), !((TF | AC | DF) as i32))
+        .expect("clear dangerous live flags before Rust");
+    asm.popfq().expect("safe live flags");
     asm.mov(r11, qword_ptr(rsp + 40))
         .expect("reload independent outcome");
+    asm.mov(
+        qword_ptr(r11 + offset_of!(Outcome, returned_flags) as i32),
+        r10,
+    )
+    .expect("record physical return flags");
     asm.mov(qword_ptr(r11 + offset_of!(Outcome, result) as i32), rax)
         .expect("physical result");
     for (index, reg) in regs.into_iter().enumerate() {
@@ -388,6 +389,13 @@ fn wrapper() -> Vec<u8> {
     asm.mov(rax, qword_ptr(rsp + 24)).expect("published status");
     asm.mov(qword_ptr(r11 + offset_of!(Outcome, status) as i32), rax)
         .expect("record status");
+    asm.mov(rax, qword_ptr(rsp + 32))
+        .expect("published guest flags");
+    asm.mov(
+        qword_ptr(r11 + offset_of!(Outcome, guest_flags) as i32),
+        rax,
+    )
+    .expect("record guest flags");
     asm.pushfq().expect("safe continuation flags");
     asm.pop(rax).expect("capture flags");
     asm.mov(qword_ptr(r11 + offset_of!(Outcome, flags) as i32), rax)
@@ -433,7 +441,7 @@ fn validated_add() -> Vec<u8> {
 }
 
 #[allow(unsafe_code)]
-fn run_probe(ac: bool) {
+fn run_probe(ac: bool, normal: bool) {
     let _serial = SERIAL.lock().expect("serialize VEH owner");
     let blob = emit_interpreter().expect("emit production runtime");
     let mapping = MappedImage::new(&blob);
@@ -460,7 +468,7 @@ fn run_probe(ac: bool) {
         unsafe { std::slice::from_raw_parts(code.0.as_ptr().cast::<u8>(), code_bytes.len()) },
         code_bytes
     );
-    if ac {
+    if ac && !normal {
         code.protect(code_bytes.len(), PAGE_NOACCESS);
         let mut information = MEMORY_BASIC_INFORMATION::default();
         // SAFETY: VirtualQuery observes the address without dereferencing its inaccessible bytes
@@ -494,6 +502,7 @@ fn run_probe(ac: bool) {
         continuation_count: 0,
         seen: [0; MAX_STEPS],
         exception_flags: 0,
+        saved_guest_flags: 0,
     });
     let input = ProbeInput {
         code: code.address(),
@@ -503,7 +512,6 @@ fn run_probe(ac: bool) {
         outcome: outcome_pointer,
     };
     let handler = Handler::install(&mut state);
-    eprintln!("PRE-INVOKE ac={ac} runtime={:#x} start={:#x} end={:#x} fetch={:#x} wrapper={:#x} veh={:#x} code={:#x}", state.base, state.start, state.end, state.fetch, wrapper.address(), exception_handler as *const () as usize, state.code);
 
     // SAFETY: This emitted Win64 wrapper preserves the host ABI and returns with TF/AC/DF clear
     // The VEH and every referenced allocation remain live, and only generated frames are skipped
@@ -536,10 +544,18 @@ fn run_probe(ac: bool) {
         0,
         "safe Rust ABI return"
     );
-    if ac {
+    if normal {
+        assert_eq!(state.steps, 0);
+        assert_eq!(state.av_count, 0);
+        assert_eq!(outcome.status, 0);
+        assert_eq!(outcome.result, 42);
+        assert_ne!(outcome.guest_flags & u64::from(AC), 0);
+        assert_ne!(outcome.returned_flags & u64::from(AC), 0);
+    } else if ac {
         assert_eq!(state.av_count, 1);
         assert_eq!(state.steps, 1);
-        assert_ne!(state.exception_flags & AC, 0);
+        assert_eq!(state.exception_flags & AC, 0);
+        assert_ne!(state.saved_guest_flags & u64::from(AC), 0);
         assert_eq!(
             outcome.status,
             u64::MAX,
@@ -590,27 +606,20 @@ fn run_probe(ac: bool) {
     );
 }
 
-fn isolated(name: &str, ac: bool) {
+fn isolated(name: &str, ac: bool, normal: bool) {
     if std::env::var(CHILD_ENV).as_deref() == Ok(name) {
-        run_probe(ac);
+        run_probe(ac, normal);
         return;
     }
     let exact = format!("unwind::windows_tests::exceptions::{name}");
     let mut child = Command::new(std::env::current_exe().expect("current test executable"))
         .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
         .env(CHILD_ENV, name)
-        .creation_flags(if ac {
-            windows_sys::Win32::System::Threading::DEBUG_ONLY_THIS_PROCESS
-        } else {
-            0
-        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn isolated real exception probe");
-    if ac {
-        debugger::observe(&mut child);
-    }
+
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.try_wait().expect("poll exception child") {
@@ -645,10 +654,24 @@ fn active_tf_steps_real_production_frame_through_add_and_ret() {
     isolated(
         "active_tf_steps_real_production_frame_through_add_and_ret",
         false,
+        false,
     );
 }
 
 #[test]
 fn active_ac_access_violation_unwinds_real_opcode_fetch() {
-    isolated("active_ac_access_violation_unwinds_real_opcode_fetch", true);
+    isolated(
+        "active_ac_access_violation_unwinds_real_opcode_fetch",
+        true,
+        false,
+    );
+}
+
+#[test]
+fn active_ac_normal_add_preserves_guest_and_physical_return_flags() {
+    isolated(
+        "active_ac_normal_add_preserves_guest_and_physical_return_flags",
+        true,
+        true,
+    );
 }
