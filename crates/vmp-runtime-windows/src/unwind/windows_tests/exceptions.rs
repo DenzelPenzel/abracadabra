@@ -223,6 +223,13 @@ unsafe extern "system" fn exception_handler_inner(pointers: *mut EXCEPTION_POINT
         let outcome = &*state.outcome;
         let single_step = exception.ExceptionCode == EXCEPTION_SINGLE_STEP;
         let access_violation = exception.ExceptionCode == EXCEPTION_ACCESS_VIOLATION;
+        if state.ac {
+            eprintln!(
+                "AC exception diagnostic: code={:#x}, rip={:#x}, image offset={:#x}, rsp={:#x}, saved flags={:#x}",
+                exception.ExceptionCode, context.Rip, context.Rip.wrapping_sub(state.base),
+                context.Rsp, context.EFlags
+            );
+        }
         if state.steps == 0 {
             state.exception_flags = context.EFlags;
         }
