@@ -1,8 +1,10 @@
 //! Real processor exceptions on an ordinary Win64 thread stack, not the blob's test adapter
 
 use super::*;
+mod debugger;
 use iced_x86::code_asm::*;
 use std::mem::offset_of;
+use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use std::sync::Mutex;
@@ -501,6 +503,7 @@ fn run_probe(ac: bool) {
         outcome: outcome_pointer,
     };
     let handler = Handler::install(&mut state);
+    eprintln!("PRE-INVOKE ac={ac} runtime={:#x} start={:#x} end={:#x} fetch={:#x} wrapper={:#x} veh={:#x} code={:#x}", state.base, state.start, state.end, state.fetch, wrapper.address(), exception_handler as *const () as usize, state.code);
 
     // SAFETY: This emitted Win64 wrapper preserves the host ABI and returns with TF/AC/DF clear
     // The VEH and every referenced allocation remain live, and only generated frames are skipped
@@ -596,10 +599,18 @@ fn isolated(name: &str, ac: bool) {
     let mut child = Command::new(std::env::current_exe().expect("current test executable"))
         .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
         .env(CHILD_ENV, name)
+        .creation_flags(if ac {
+            windows_sys::Win32::System::Threading::DEBUG_ONLY_THIS_PROCESS
+        } else {
+            0
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn isolated real exception probe");
+    if ac {
+        debugger::observe(&mut child);
+    }
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.try_wait().expect("poll exception child") {
