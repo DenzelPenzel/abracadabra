@@ -12,6 +12,9 @@ thiserror.workspace = true
 vmp-types = { version = "0.1.0", path = "../vmp-types" }
 vmp-vm = { version = "0.1.0", path = "../vmp-vm" }
 
+[dev-dependencies]
+vmp-pe = { version = "0.1.0", path = "../vmp-pe" }
+
 [lints]
 workspace = true
 

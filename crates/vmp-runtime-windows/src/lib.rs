@@ -3,6 +3,8 @@
 mod emit;
 #[cfg(target_arch = "x86_64")]
 mod runtime_x64;
+#[cfg(test)]
+mod unwind;
 
 pub use emit::{
     emit_interpreter, CodeRange, EmitError, RuntimeBlob, MAX_PRODUCTION_ENTRY_STACK_USAGE,
