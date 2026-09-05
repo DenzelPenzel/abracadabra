@@ -377,6 +377,7 @@ version = "0.1.0"
 dependencies = [
  "iced-x86",
  "thiserror",
+ "vmp-pe",
  "vmp-types",
  "vmp-vm",
 ]
