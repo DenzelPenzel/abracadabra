@@ -58,6 +58,19 @@ jobs:
         run: rustup target add i686-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
 
+      - name: Registered VM runtime unwind gate
+        timeout-minutes: 10
+        run: |
+          $env:CARGO_TERM_COLOR = "never"
+          cargo test -p vmp-runtime-windows --lib unwind::windows_tests -- --nocapture 2>&1 | Tee-Object -Variable debugUnwind
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p vmp-runtime-windows --lib --release unwind::windows_tests -- --nocapture 2>&1 | Tee-Object -Variable releaseUnwind
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($output in @($debugUnwind, $releaseUnwind)) {
+            $summaries = @($output | Where-Object { $_ -match '^test result: ok[.] 4 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' })
+            if ($summaries.Count -ne 1) { throw "unwind gate did not execute exactly four passing tests" }
+          }
+
       # Real PE32 and PE32+ fixtures, produced here by the MSVC linker. Pointing
       # `VMP_CORPUS_DIR` at them makes the property sweeps a hard gate on fresh
       # toolchain output as well as on the committed corpus; the pinned suites
