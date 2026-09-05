@@ -67,8 +67,8 @@ jobs:
           cargo test -p vmp-runtime-windows --lib --release unwind::windows_tests -- --nocapture 2>&1 | Tee-Object -Variable releaseUnwind
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           foreach ($output in @($debugUnwind, $releaseUnwind)) {
-            $summaries = @($output | Where-Object { $_ -match '^test result: ok[.] 4 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' })
-            if ($summaries.Count -ne 1) { throw "unwind gate did not execute exactly four passing tests" }
+            $summaries = @($output | Where-Object { $_ -match '^test result: ok[.] 6 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' })
+            if ($summaries.Count -ne 1) { throw "unwind gate did not execute exactly six passing tests" }
           }
 
       # Real PE32 and PE32+ fixtures, produced here by the MSVC linker. Pointing

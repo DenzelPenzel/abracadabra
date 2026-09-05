@@ -1,5 +1,7 @@
 //! Windows OS oracle for the standalone generated frame
 
+mod exceptions;
+
 use super::build_runtime_image;
 use crate::emit::{emit_interpreter, RuntimeBlob};
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, Register};
@@ -118,6 +120,14 @@ impl Drop for MappedImage {
                 "unregister must succeed before freeing its storage"
             );
             self.registered = false;
+            let mut image_base = 0;
+            // SAFETY: The mapping remains live, and lookup receives only a local output slot
+            let entry =
+                unsafe { RtlLookupFunctionEntry(self.address(0), &mut image_base, null_mut()) };
+            assert!(
+                entry.is_null(),
+                "the table must be absent before VirtualFree"
+            );
         }
         // SAFETY: No code is executing and the table no longer references this allocation
         let released = unsafe { VirtualFree(self.base.as_ptr(), 0, MEM_RELEASE) };
