@@ -960,6 +960,101 @@ mod tests {
     }
 
     #[test]
+    fn unwind_plan_rejects_a_function_outside_the_blob() {
+        assert_invalid_plan(
+            |blob, plan| plan.functions[1].range.end = blob.bytes().len() as u32 + 1,
+            UnwindPlanError::FunctionOutsideBlob { index: 1 },
+        );
+    }
+
+    #[test]
+    fn unwind_plan_rejects_overlapping_functions() {
+        assert_invalid_plan(
+            |_, plan| plan.functions[1].range.start = plan.functions[0].range.end - 1,
+            UnwindPlanError::FunctionsNotStrictlyOrdered { index: 1 },
+        );
+    }
+
+    #[test]
+    fn unwind_plan_rejects_a_prologue_outside_its_function() {
+        assert_invalid_plan(
+            |_, plan| {
+                plan.functions[0].range.end = plan.functions[0].range.start + 1;
+                plan.functions[0].prologue_size = 2;
+            },
+            UnwindPlanError::PrologueOutsideFunction { index: 0 },
+        );
+    }
+
+    #[test]
+    fn unwind_plan_rejects_an_operation_after_the_prologue() {
+        assert_invalid_plan(
+            |_, plan| {
+                let code_offset = plan.functions[0].prologue_size + 1;
+                plan.functions[0].operations[0] = UnwindOperation::StackAllocation { code_offset };
+            },
+            UnwindPlanError::OperationOutsidePrologue {
+                function: 0,
+                operation: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn unwind_plan_rejects_nonincreasing_operation_offsets() {
+        assert_invalid_plan(
+            |_, plan| plan.functions[0].operations.swap(0, 1),
+            UnwindPlanError::OperationsNotIncreasing {
+                function: 0,
+                operation: 1,
+            },
+        );
+    }
+
+    #[test]
+    fn unwind_plan_rejects_a_frame_header_without_matching_set_fpreg() {
+        assert_invalid_plan(
+            |_, plan| plan.functions[1].frame_register = None,
+            UnwindPlanError::FramePointerMismatch { function: 1 },
+        );
+    }
+
+    #[test]
+    fn unwind_plan_rejects_an_unencodable_frame_offset() {
+        assert_invalid_plan(
+            |_, plan| plan.functions[1].frame_offset = 16,
+            UnwindPlanError::FrameOffsetTooLarge { function: 1 },
+        );
+    }
+
+    #[test]
+    fn unwind_plan_rejects_an_operation_that_does_not_match_the_code() {
+        assert_invalid_plan(
+            |_, plan| {
+                let code_offset = plan.functions[0].operations[0].code_offset();
+                plan.functions[0].operations[0] = UnwindOperation::PushNonvolatile {
+                    code_offset,
+                    register: UnwindRegister::Rbp,
+                };
+            },
+            UnwindPlanError::OperationDoesNotMatchCode {
+                function: 0,
+                operation: 0,
+            },
+        );
+    }
+
+    fn assert_invalid_plan(
+        corrupt: impl FnOnce(&RuntimeBlob, &mut RuntimeUnwindPlan),
+        expected: UnwindPlanError,
+    ) {
+        let blob = emit_interpreter().expect("the interpreter must assemble");
+        let mut plan = blob.unwind_plan.clone();
+        corrupt(&blob, &mut plan);
+        assert_eq!(plan.validate(blob.bytes()), Err(expected));
+    }
+
+    #[test]
     fn the_emitted_blob_references_nothing_outside_itself() {
         let blob = emit_interpreter().expect("the interpreter must assemble");
         let length = blob.bytes().len() as u64;
