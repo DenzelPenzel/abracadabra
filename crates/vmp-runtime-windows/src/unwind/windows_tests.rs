@@ -6,8 +6,8 @@ use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, Register};
 use std::ffi::c_void;
 use std::ptr::{null, null_mut, NonNull};
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    FlushInstructionCache, RtlLookupFunctionEntry, RtlVirtualUnwind, CONTEXT, CONTEXT_ALL_AMD64,
-    IMAGE_RUNTIME_FUNCTION_ENTRY, UNW_FLAG_NHANDLER,
+    FlushInstructionCache, RtlAddFunctionTable, RtlDeleteFunctionTable, RtlLookupFunctionEntry,
+    RtlVirtualUnwind, CONTEXT, CONTEXT_ALL_AMD64, IMAGE_RUNTIME_FUNCTION_ENTRY, UNW_FLAG_NHANDLER,
 };
 use windows_sys::Win32::System::Memory::{
     VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
@@ -18,6 +18,7 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 struct MappedImage {
     base: NonNull<c_void>,
     table_offset: u32,
+    registered: bool,
 }
 
 impl MappedImage {
@@ -33,9 +34,10 @@ impl MappedImage {
                 PAGE_READWRITE,
             )
         };
-        let mapping = Self {
+        let mut mapping = Self {
             base: NonNull::new(base).expect("VirtualAlloc must allocate the proof image"),
             table_offset: image.function_table_offset,
+            registered: false,
         };
         // SAFETY: The fresh RW allocation holds the entire image and does not overlap its source
         unsafe {
@@ -64,8 +66,17 @@ impl MappedImage {
                 "FlushInstructionCache must synchronize the image"
             );
         }
-        // Registration is deliberately absent until the Windows lookup assertion proves RED
+        // SAFETY: Both table entries and their referenced code/xdata stay in this owned mapping
+        mapping.registered = unsafe { RtlAddFunctionTable(mapping.table(), 2, mapping.address(0)) };
+        assert!(
+            mapping.registered,
+            "RtlAddFunctionTable must register the image"
+        );
         mapping
+    }
+
+    fn table(&self) -> *const IMAGE_RUNTIME_FUNCTION_ENTRY {
+        self.address(self.table_offset) as *const IMAGE_RUNTIME_FUNCTION_ENTRY
     }
 
     fn address(&self, offset: u32) -> u64 {
@@ -99,7 +110,16 @@ impl MappedImage {
 impl Drop for MappedImage {
     #[allow(unsafe_code)]
     fn drop(&mut self) {
-        // SAFETY: No code is executing and no table is registered for this privately owned allocation
+        if self.registered {
+            // SAFETY: No probe is executing, and this exact table is still backed by live storage
+            let removed = unsafe { RtlDeleteFunctionTable(self.table()) };
+            assert!(
+                removed,
+                "unregister must succeed before freeing its storage"
+            );
+            self.registered = false;
+        }
+        // SAFETY: No code is executing and the table no longer references this allocation
         let released = unsafe { VirtualFree(self.base.as_ptr(), 0, MEM_RELEASE) };
         assert_ne!(released, 0, "VirtualFree must release the proof image");
     }
