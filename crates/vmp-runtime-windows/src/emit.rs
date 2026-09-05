@@ -2,7 +2,9 @@ use iced_x86::code_asm::{
     al, byte_ptr, eax, ebp, qword_ptr, r10, r11, r12, r13, r14, r15, r8, r9, rax, rbp, rbx, rcx,
     rdi, rdx, rsi, rsp, CodeAssembler, CodeLabel,
 };
-use iced_x86::{BlockEncoderOptions, IcedError};
+use iced_x86::{
+    BlockEncoderOptions, Decoder, DecoderOptions, IcedError, Mnemonic, OpKind, Register,
+};
 use thiserror::Error;
 
 /// Bytecode steps one gate entry may dispatch before it fails closed.
@@ -106,6 +108,8 @@ const OUT_R15: i32 = 152;
 pub enum EmitError {
     #[error("interpreter assembly failed: {reason}")]
     Assembly { reason: String },
+    #[error("generated an invalid unwind plan")]
+    UnwindPlan,
 }
 
 impl From<IcedError> for EmitError {
@@ -135,6 +139,164 @@ impl CodeRange {
     }
 }
 
+/// A nonvolatile Win64 register representable by `UNWIND_INFO`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum UnwindRegister {
+    Rbx = 3,
+    Rbp = 5,
+    Rsi = 6,
+    Rdi = 7,
+    R12 = 12,
+    R13 = 13,
+    R14 = 14,
+    R15 = 15,
+}
+
+/// One stack or frame-pointer effect at an emitted instruction boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnwindOperation {
+    PushNonvolatile {
+        code_offset: u8,
+        register: UnwindRegister,
+    },
+    StackAllocation {
+        code_offset: u8,
+    },
+    SetFramePointer {
+        code_offset: u8,
+    },
+}
+
+impl UnwindOperation {
+    fn code_offset(self) -> u8 {
+        match self {
+            Self::PushNonvolatile { code_offset, .. }
+            | Self::StackAllocation { code_offset, .. }
+            | Self::SetFramePointer { code_offset, .. } => code_offset,
+        }
+    }
+}
+
+/// Unwind contract of one contiguous emitted Win64 frame function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnwindFunction {
+    pub(crate) range: CodeRange,
+    pub(crate) prologue_size: u8,
+    pub(crate) frame_register: Option<UnwindRegister>,
+    pub(crate) frame_offset: u8,
+    pub(crate) operations: Vec<UnwindOperation>,
+}
+
+/// Complete unwind contract for the callable entries in one runtime blob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeUnwindPlan {
+    pub(crate) functions: [UnwindFunction; 2],
+}
+
+/// A generated unwind plan cannot describe the emitted runtime safely.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub(crate) enum UnwindPlanError {
+    #[error("runtime function {index} lies outside the emitted blob")]
+    FunctionOutsideBlob { index: usize },
+    #[error("runtime function {index} is not strictly ordered after its predecessor")]
+    FunctionsNotStrictlyOrdered { index: usize },
+    #[error("runtime function {index} has a prologue outside its range")]
+    PrologueOutsideFunction { index: usize },
+    #[error("unwind operation {operation} in function {function} lies outside its prologue")]
+    OperationOutsidePrologue { function: usize, operation: usize },
+    #[error("unwind operation {operation} in function {function} is not after its predecessor")]
+    OperationsNotIncreasing { function: usize, operation: usize },
+    #[error("runtime function {function} has inconsistent frame-pointer metadata")]
+    FramePointerMismatch { function: usize },
+    #[error("runtime function {function} has an unencodable frame offset")]
+    FrameOffsetTooLarge { function: usize },
+    #[error("unwind operation {operation} in function {function} does not match emitted code")]
+    OperationDoesNotMatchCode { function: usize, operation: usize },
+}
+
+impl RuntimeUnwindPlan {
+    pub(crate) fn validate(&self, bytes: &[u8]) -> Result<(), UnwindPlanError> {
+        let mut previous_end = 0;
+        for (index, function) in self.functions.iter().enumerate() {
+            let range = function.range;
+            if range.start >= range.end || range.end as usize > bytes.len() {
+                return Err(UnwindPlanError::FunctionOutsideBlob { index });
+            }
+            if index != 0 && range.start < previous_end {
+                return Err(UnwindPlanError::FunctionsNotStrictlyOrdered { index });
+            }
+            if range
+                .start
+                .checked_add(u32::from(function.prologue_size))
+                .is_none_or(|prologue_end| prologue_end > range.end)
+            {
+                return Err(UnwindPlanError::PrologueOutsideFunction { index });
+            }
+            let mut previous_code_offset = 0;
+            let mut has_set_frame_pointer = false;
+            for (operation, unwind) in function.operations.iter().copied().enumerate() {
+                let code_offset = unwind.code_offset();
+                if code_offset == 0 || code_offset > function.prologue_size {
+                    return Err(UnwindPlanError::OperationOutsidePrologue {
+                        function: index,
+                        operation,
+                    });
+                }
+                if code_offset <= previous_code_offset {
+                    return Err(UnwindPlanError::OperationsNotIncreasing {
+                        function: index,
+                        operation,
+                    });
+                }
+                previous_code_offset = code_offset;
+                if matches!(unwind, UnwindOperation::SetFramePointer { .. }) {
+                    if has_set_frame_pointer {
+                        return Err(UnwindPlanError::FramePointerMismatch { function: index });
+                    }
+                    has_set_frame_pointer = true;
+                }
+            }
+            let declared_frame = function
+                .frame_register
+                .map(|register| (register, function.frame_offset));
+            if function.frame_offset > 15 {
+                return Err(UnwindPlanError::FrameOffsetTooLarge { function: index });
+            }
+            if function.frame_register.is_some() != has_set_frame_pointer
+                || function.frame_register.is_none() && function.frame_offset != 0
+            {
+                return Err(UnwindPlanError::FramePointerMismatch { function: index });
+            }
+            let expected = derive_unwind_function(
+                bytes,
+                range,
+                u32::from(function.prologue_size),
+                declared_frame,
+            )
+            .map_err(|_| UnwindPlanError::OperationDoesNotMatchCode {
+                function: index,
+                operation: 0,
+            })?;
+            if expected.operations != function.operations {
+                let operation = expected
+                    .operations
+                    .iter()
+                    .zip(&function.operations)
+                    .position(|(expected, actual)| expected != actual)
+                    .unwrap_or(expected.operations.len().min(function.operations.len()));
+                return Err(UnwindPlanError::OperationDoesNotMatchCode {
+                    function: index,
+                    operation,
+                });
+            }
+            previous_end = range.end;
+        }
+        Ok(())
+    }
+}
+
 /// Emitted interpreter bytes and offsets of its callable entry points.
 ///
 /// The bytes are position-independent: every branch is relative and stays
@@ -148,6 +310,7 @@ pub struct RuntimeBlob {
     test_adapter_range: CodeRange,
     dispatcher_range: CodeRange,
     handlers_range: CodeRange,
+    pub(crate) unwind_plan: RuntimeUnwindPlan,
 }
 
 impl RuntimeBlob {
@@ -204,6 +367,8 @@ pub(crate) fn emit_interpreter_at(ip: u64) -> Result<RuntimeBlob, EmitError> {
     let mut asm = CodeAssembler::new(64)?;
     let mut dispatch = asm.create_label();
     let mut handlers = asm.create_label();
+    let mut test_prologue_end = asm.create_label();
+    let mut production_prologue_end = asm.create_label();
 
     // The Win64 test adapter receives input and output records in RCX and RDX.
     // Preserve its caller's nonvolatile registers before loading guest values.
@@ -225,6 +390,7 @@ pub(crate) fn emit_interpreter_at(ip: u64) -> Result<RuntimeBlob, EmitError> {
     asm.push(qword_ptr(rcx + IN_CODE_END))?;
     asm.push(qword_ptr(rcx + IN_ENTRY_PC))?;
     asm.push(qword_ptr(rcx + IN_CODE_BASE))?;
+    asm.set_label(&mut test_prologue_end)?;
     asm.mov(qword_ptr(rdx + OUT_RSP_BEFORE), rsp)?;
 
     // Load the complete guest context without changing the supplied RFLAGS.
@@ -291,24 +457,54 @@ pub(crate) fn emit_interpreter_at(ip: u64) -> Result<RuntimeBlob, EmitError> {
     asm.pop(rbx)?;
     asm.ret()?;
 
-    emit_dispatcher(&mut asm, &mut dispatch, &mut handlers)?;
+    emit_dispatcher(
+        &mut asm,
+        &mut dispatch,
+        &mut handlers,
+        &mut production_prologue_end,
+    )?;
 
     let assembled =
         asm.assemble_options(ip, BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS)?;
     let production_entry_offset = label_offset(&assembled, &dispatch, ip)?;
     let handlers_offset = label_offset(&assembled, &handlers, ip)?;
+    let test_prologue_size = label_offset(&assembled, &test_prologue_end, ip)?;
+    let production_prologue_size = label_offset(&assembled, &production_prologue_end, ip)?
+        .checked_sub(production_entry_offset)
+        .ok_or_else(|| EmitError::Assembly {
+            reason: "production prologue precedes its entry".to_owned(),
+        })?;
     let bytes = assembled.inner.code_buffer;
     let blob_end = u32::try_from(bytes.len()).map_err(|_| EmitError::Assembly {
         reason: "interpreter exceeds the 32-bit blob offset range".to_owned(),
     })?;
+    let test_adapter_range = CodeRange {
+        start: 0,
+        end: production_entry_offset,
+    };
+    let production_range = CodeRange {
+        start: production_entry_offset,
+        end: blob_end,
+    };
+    let unwind_plan = RuntimeUnwindPlan {
+        functions: [
+            derive_unwind_function(&bytes, test_adapter_range, test_prologue_size, None)?,
+            derive_unwind_function(
+                &bytes,
+                production_range,
+                production_prologue_size,
+                Some((UnwindRegister::R15, 0)),
+            )?,
+        ],
+    };
+    unwind_plan
+        .validate(&bytes)
+        .map_err(|_| EmitError::UnwindPlan)?;
     Ok(RuntimeBlob {
         bytes,
         test_entry_offset: 0,
         production_entry_offset,
-        test_adapter_range: CodeRange {
-            start: 0,
-            end: production_entry_offset,
-        },
+        test_adapter_range,
         dispatcher_range: CodeRange {
             start: production_entry_offset,
             end: handlers_offset,
@@ -317,6 +513,7 @@ pub(crate) fn emit_interpreter_at(ip: u64) -> Result<RuntimeBlob, EmitError> {
             start: handlers_offset,
             end: blob_end,
         },
+        unwind_plan,
     })
 }
 
@@ -336,6 +533,84 @@ fn label_offset(
     })
 }
 
+fn derive_unwind_function(
+    bytes: &[u8],
+    range: CodeRange,
+    prologue_size: u32,
+    frame: Option<(UnwindRegister, u8)>,
+) -> Result<UnwindFunction, EmitError> {
+    let prologue_size = u8::try_from(prologue_size).map_err(|_| EmitError::Assembly {
+        reason: "runtime prologue exceeds the Win64 unwind offset range".to_owned(),
+    })?;
+    let start = range.start as usize;
+    let end = start
+        .checked_add(prologue_size as usize)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| EmitError::Assembly {
+            reason: "runtime prologue lies outside its blob".to_owned(),
+        })?;
+    let mut operations = Vec::new();
+    let mut decoder = Decoder::with_ip(64, &bytes[start..end], 0, DecoderOptions::NONE);
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if instruction.is_invalid() || instruction.next_ip() > u64::from(prologue_size) {
+            return Err(EmitError::Assembly {
+                reason: "runtime prologue does not end at an instruction boundary".to_owned(),
+            });
+        }
+        let code_offset = instruction.next_ip() as u8;
+        let operation = match instruction.mnemonic() {
+            Mnemonic::Push if instruction.op0_kind() == OpKind::Register => {
+                match unwind_register(instruction.op0_register()) {
+                    Some(register) => UnwindOperation::PushNonvolatile {
+                        code_offset,
+                        register,
+                    },
+                    None => UnwindOperation::StackAllocation { code_offset },
+                }
+            }
+            Mnemonic::Push | Mnemonic::Pushfq => UnwindOperation::StackAllocation { code_offset },
+            Mnemonic::Mov
+                if instruction.op0_register() == Register::R15
+                    && instruction.op1_register() == Register::RSP =>
+            {
+                frame.ok_or_else(|| EmitError::Assembly {
+                    reason: "runtime prologue sets an undeclared frame pointer".to_owned(),
+                })?;
+                UnwindOperation::SetFramePointer { code_offset }
+            }
+            _ => {
+                return Err(EmitError::Assembly {
+                    reason: "runtime prologue contains an unsupported instruction".to_owned(),
+                });
+            }
+        };
+        operations.push(operation);
+    }
+    let (frame_register, frame_offset) = frame.unzip();
+    Ok(UnwindFunction {
+        range,
+        prologue_size,
+        frame_register,
+        frame_offset: frame_offset.unwrap_or(0),
+        operations,
+    })
+}
+
+fn unwind_register(register: Register) -> Option<UnwindRegister> {
+    match register {
+        Register::RBX => Some(UnwindRegister::Rbx),
+        Register::RBP => Some(UnwindRegister::Rbp),
+        Register::RSI => Some(UnwindRegister::Rsi),
+        Register::RDI => Some(UnwindRegister::Rdi),
+        Register::R12 => Some(UnwindRegister::R12),
+        Register::R13 => Some(UnwindRegister::R13),
+        Register::R14 => Some(UnwindRegister::R14),
+        Register::R15 => Some(UnwindRegister::R15),
+        _ => None,
+    }
+}
+
 /// Emit the dispatch loop.
 ///
 /// Entry stack above the return address: bytecode base, entry PC, bytecode end,
@@ -345,6 +620,7 @@ fn emit_dispatcher(
     asm: &mut CodeAssembler,
     dispatch: &mut CodeLabel,
     handlers: &mut CodeLabel,
+    prologue_end: &mut CodeLabel,
 ) -> Result<(), EmitError> {
     let mut fetch = asm.create_label();
     let op_push_reg = *handlers;
@@ -381,6 +657,7 @@ fn emit_dispatcher(
     asm.pushfq()?;
     // R15 is the immutable saved-context base.
     asm.mov(r15, rsp)?;
+    asm.set_label(prologue_end)?;
     asm.mov(rsi, qword_ptr(r15 + ENTRY_CODE_BASE))?;
     asm.mov(r13, qword_ptr(r15 + ENTRY_PC))?;
     asm.mov(r12, qword_ptr(r15 + ENTRY_CODE_END))?;
@@ -629,6 +906,57 @@ mod tests {
             assert_eq!(instruction.op0_register(), register);
         }
         assert_eq!(tail[19].mnemonic(), Mnemonic::Ret);
+    }
+
+    #[test]
+    fn unwind_plan_describes_both_real_prologues() {
+        let blob = emit_interpreter().expect("the interpreter must assemble");
+        let functions = &blob.unwind_plan.functions;
+
+        assert_eq!(functions.len(), 2);
+        let adapter = &functions[0];
+        assert_eq!(adapter.range, blob.test_adapter_range());
+        assert_eq!((adapter.frame_register, adapter.frame_offset), (None, 0));
+        assert_eq!(operation_counts(&adapter.operations), (8, 7));
+
+        let production = &functions[1];
+        assert_eq!(production.range.start(), blob.production_entry_offset());
+        assert_eq!(production.range.end() as usize, blob.bytes().len());
+        assert_eq!(
+            (production.frame_register, production.frame_offset),
+            (Some(UnwindRegister::R15), 0)
+        );
+        assert!(matches!(
+            production.operations.last(),
+            Some(UnwindOperation::SetFramePointer { .. })
+        ));
+        assert_eq!(operation_counts(&production.operations), (8, 8));
+
+        for function in functions {
+            let instruction_ends: Vec<u8> = Decoder::with_ip(
+                64,
+                &blob.bytes()[function.range.start() as usize..],
+                0,
+                DecoderOptions::NONE,
+            )
+            .into_iter()
+            .map(|instruction| instruction.next_ip() as u8)
+            .take_while(|offset| *offset <= function.prologue_size)
+            .collect();
+            for operation in &function.operations {
+                assert!(instruction_ends.contains(&operation.code_offset()));
+            }
+        }
+    }
+
+    fn operation_counts(operations: &[UnwindOperation]) -> (usize, usize) {
+        operations
+            .iter()
+            .fold((0, 0), |(pushes, allocations), operation| match operation {
+                UnwindOperation::PushNonvolatile { .. } => (pushes + 1, allocations),
+                UnwindOperation::StackAllocation { .. } => (pushes, allocations + 1),
+                UnwindOperation::SetFramePointer { .. } => (pushes, allocations),
+            })
     }
 
     #[test]
