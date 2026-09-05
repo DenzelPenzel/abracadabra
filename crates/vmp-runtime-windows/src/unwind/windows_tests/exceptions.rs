@@ -28,7 +28,7 @@ static SERIAL: Mutex<()> = Mutex::new(());
 static ACTIVE: AtomicPtr<ProbeState> = AtomicPtr::new(null_mut());
 static OWNER_THREAD: AtomicU32 = AtomicU32::new(0);
 
-// Only generated instructions run while TF/AC is set; Windows delivers the VEH with safe flags
+// The VEH entry clears live flags before Rust while preserving the fault's saved CONTEXT
 #[repr(C)]
 #[derive(Default)]
 struct Outcome {
@@ -187,7 +187,22 @@ fn recover(context: &mut CONTEXT, outcome: &Outcome) {
 }
 
 #[allow(unsafe_code)]
-unsafe extern "system" fn exception_handler(pointers: *mut EXCEPTION_POINTERS) -> i32 {
+#[unsafe(naked)]
+unsafe extern "system" fn exception_handler(_pointers: *mut EXCEPTION_POINTERS) -> i32 {
+    // SAFETY: The Win64 argument and return address stay untouched; the balanced flag push is aligned
+    // Windows can enter with AC active, so normalization must precede any compiler-generated code
+    core::arch::naked_asm!(
+        "pushfq",
+        "and qword ptr [rsp], {safe_flags}",
+        "popfq",
+        "jmp {handler}",
+        safe_flags = const !((TF | AC | DF) as i32),
+        handler = sym exception_handler_inner,
+    );
+}
+
+#[allow(unsafe_code)]
+unsafe extern "system" fn exception_handler_inner(pointers: *mut EXCEPTION_POINTERS) -> i32 {
     // SAFETY: Reject other threads before even reading the private state's address
     if unsafe { GetCurrentThreadId() } != OWNER_THREAD.load(Ordering::SeqCst) {
         return CONTINUE_SEARCH;
@@ -208,8 +223,8 @@ unsafe extern "system" fn exception_handler(pointers: *mut EXCEPTION_POINTERS) -
         let outcome = &*state.outcome;
         let single_step = exception.ExceptionCode == EXCEPTION_SINGLE_STEP;
         let access_violation = exception.ExceptionCode == EXCEPTION_ACCESS_VIOLATION;
-        if state.ac || state.steps == 0 {
-            eprintln!("VEH diagnostic: ac={} code={:#x} rip={:#x} relative={:#x} flags={:#x} rsp={:#x} caller={:#x}/{:#x}", state.ac, exception.ExceptionCode, context.Rip, context.Rip.wrapping_sub(state.base), context.EFlags, context.Rsp, outcome.caller_rip, outcome.caller_rsp);
+        if state.steps == 0 {
+            state.exception_flags = context.EFlags;
         }
         if !single_step && !access_violation {
             return CONTINUE_SEARCH;
@@ -242,7 +257,8 @@ unsafe extern "system" fn exception_handler(pointers: *mut EXCEPTION_POINTERS) -
             {
                 fail(state, 4, rip);
             }
-        } else if !single_step || context.EFlags & TF == 0 {
+        // Windows delivers #DB with TF cleared in CONTEXT; the code and observed RIP prove stepping
+        } else if !single_step {
             fail(state, 8, rip);
         }
         if let Some(slot) = state.seen.get_mut(state.steps) {
@@ -273,9 +289,7 @@ unsafe extern "system" fn exception_handler(pointers: *mut EXCEPTION_POINTERS) -
             &mut establisher,
             null_mut(),
         );
-        if state.ac {
-            eprintln!("unwind diagnostic: rip={:#x} rsp={:#x} flags={:#x} context_flags={:#x} nonvol={:x?}", copy.Rip, copy.Rsp, copy.EFlags, copy.ContextFlags, nonvolatiles(&copy));
-        }
+
         if language_handler.is_some()
             || copy.Rip != outcome.caller_rip
             || copy.Rsp != outcome.caller_rsp
@@ -480,13 +494,7 @@ fn run_probe(ac: bool) {
         outcome: outcome_pointer,
     };
     let handler = Handler::install(&mut state);
-    eprintln!(
-        "invoke diagnostic: ac={ac} base={:#x} wrapper={:#x} code={:#x} fetch={:#x}",
-        state.base,
-        wrapper.address(),
-        code.address(),
-        state.fetch
-    );
+
     // SAFETY: This emitted Win64 wrapper preserves the host ABI and returns with TF/AC/DF clear
     // The VEH and every referenced allocation remain live, and only generated frames are skipped
     unsafe {
@@ -496,9 +504,11 @@ fn run_probe(ac: bool) {
     }
     drop(handler);
     assert_eq!(
-        state.failures, 0,
-        "VEH failure bits, first RIP {:#x}",
-        state.first_bad_rip
+        state.failures,
+        0,
+        "VEH failure bits, first image offset {:#x}, first saved flags {:#x}",
+        state.first_bad_rip.wrapping_sub(state.base),
+        state.exception_flags
     );
     assert_eq!(outcome.completed, 1);
     assert_eq!(
@@ -565,8 +575,8 @@ fn run_probe(ac: bool) {
         }
     }
     eprintln!(
-        "real exception proof: ac={ac}, steps={}, av={}, continuation={}",
-        state.steps, state.av_count, state.continuation_count
+        "real exception proof: ac={ac}, steps={}, av={}, continuation={}, first saved flags={:#x}",
+        state.steps, state.av_count, state.continuation_count, state.exception_flags
     );
 }
 
