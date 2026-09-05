@@ -3,10 +3,13 @@
 use super::*;
 use std::os::windows::io::AsRawHandle;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, EXCEPTION_BREAKPOINT,
+    CloseHandle, GetLastError, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, EXCEPTION_BREAKPOINT,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::*;
 use windows_sys::Win32::System::Threading::{OpenThread, THREAD_GET_CONTEXT};
+
+#[repr(align(16))]
+struct AlignedContext(CONTEXT);
 
 #[allow(unsafe_code)]
 pub(super) fn observe(child: &mut std::process::Child) {
@@ -28,6 +31,12 @@ pub(super) fn observe(child: &mut std::process::Child) {
                 EXCEPTION_DEBUG_EVENT => {
                     let exception = event.u.Exception;
                     let record = exception.ExceptionRecord;
+                    eprintln!(
+                        "DEBUG record first={} code={:#x} address={:#x}",
+                        exception.dwFirstChance,
+                        record.ExceptionCode,
+                        record.ExceptionAddress as usize
+                    );
                     let mut module = [0u16; 1024];
                     let length = windows_sys::Win32::System::ProcessStatus::GetMappedFileNameW(
                         child.as_raw_handle(),
@@ -41,13 +50,15 @@ pub(super) fn observe(child: &mut std::process::Child) {
                     );
                     let thread = OpenThread(THREAD_GET_CONTEXT, 0, event.dwThreadId);
                     assert!(!thread.is_null(), "open stopped exception thread");
-                    let mut context = CONTEXT {
+                    let mut aligned = AlignedContext(CONTEXT {
                         ContextFlags: CONTEXT_ALL_AMD64,
                         ..Default::default()
-                    };
-                    let got = GetThreadContext(thread, &mut context);
+                    });
+                    let context = &mut aligned.0;
+                    let got = GetThreadContext(thread, context);
+                    let error = GetLastError();
                     CloseHandle(thread);
-                    assert_ne!(got, 0, "read stopped context");
+                    assert_ne!(got, 0, "read stopped context: Win32 error {error}");
                     eprintln!("DEBUG exception first={} code={:#x} address={:#x} tid={} RIP={:#x} RSP={:#x} EFLAGS={:#x} RAX={:#x} RCX={:#x} RDX={:#x} RBX={:#x} RBP={:#x} RSI={:#x} RDI={:#x} R8={:#x} R9={:#x} R10={:#x} R11={:#x} R12={:#x} R13={:#x} R14={:#x} R15={:#x} parameters={:?}", exception.dwFirstChance, record.ExceptionCode, record.ExceptionAddress as usize, event.dwThreadId, context.Rip, context.Rsp, context.EFlags, context.Rax, context.Rcx, context.Rdx, context.Rbx, context.Rbp, context.Rsi, context.Rdi, context.R8, context.R9, context.R10, context.R11, context.R12, context.R13, context.R14, context.R15, &record.ExceptionInformation[..record.NumberParameters.min(15) as usize]);
                     let mut bytes = [0u8; 64];
                     let mut read = 0;
