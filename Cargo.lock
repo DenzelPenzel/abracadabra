@@ -380,6 +380,7 @@ dependencies = [
  "vmp-pe",
  "vmp-types",
  "vmp-vm",
+ "windows-sys",
 ]
 
 [[package]]

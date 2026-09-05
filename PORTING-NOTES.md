@@ -302,8 +302,14 @@ are places where C++ is **not** a usable template.
 - C++ `check_stack` protects its internal `REP MOVS` with `PUSHF; CLD; ...; POPF`
   (`core/intel.cc:28809-28815`), so it restores the incoming `DF`. Variant A deliberately keeps
   VM-visible flags in its control frame but normalises `DF=0` before native Win64 continuation.
-  `IF` is preserved. Active `TF`/`AC` are target-exception cases and belong to the
-  registered-unwind proof, not the pre-unwind normal-return harness.
+  `IF` is preserved. Active `TF` belongs to the registered-unwind proof. Incoming `AC`
+  stays in the saved VM flags, but live `AC` is cleared after the immutable frame is
+  established and restored on normal return. Arithmetic handlers update only their
+  defined arithmetic flags, not the saved control bits. This is an explicit Rust policy,
+  not C++ parity: Windows run `33970576704` first observed the intended bytecode-fetch AV,
+  then recursive alignment faults in `ntdll.dll` before VEH delivery with live `AC` set.
+  Body exception proof therefore requires normalized live `AC` and preserved saved `AC`;
+  it does not cover AC-active exceptions before normalization or after exit restoration.
 - A defense-in-depth status after canonical v1 validation is an internal contract violation:
   the production trampoline uses `FAST_FAIL_FATAL_APP_EXIT` and never resumes the original
   function. The standalone status slot remains test transport, not part of the protected

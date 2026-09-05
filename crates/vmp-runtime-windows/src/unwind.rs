@@ -9,6 +9,9 @@ const UWOP_PUSH_NONVOL: u8 = 0;
 const UWOP_ALLOC_SMALL: u8 = 2;
 const UWOP_SET_FPREG: u8 = 3;
 
+#[cfg(all(test, windows, target_arch = "x86_64"))]
+mod windows_tests;
+
 #[derive(Debug, Error)]
 pub(crate) enum UnwindBuildError {
     #[error("vmp-pe rejected the runtime unwind data: {0}")]
