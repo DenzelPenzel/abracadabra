@@ -208,6 +208,9 @@ unsafe extern "system" fn exception_handler(pointers: *mut EXCEPTION_POINTERS) -
         let outcome = &*state.outcome;
         let single_step = exception.ExceptionCode == EXCEPTION_SINGLE_STEP;
         let access_violation = exception.ExceptionCode == EXCEPTION_ACCESS_VIOLATION;
+        if state.ac || state.steps == 0 {
+            eprintln!("VEH diagnostic: ac={} code={:#x} rip={:#x} relative={:#x} flags={:#x} rsp={:#x} caller={:#x}/{:#x}", state.ac, exception.ExceptionCode, context.Rip, context.Rip.wrapping_sub(state.base), context.EFlags, context.Rsp, outcome.caller_rip, outcome.caller_rsp);
+        }
         if !single_step && !access_violation {
             return CONTINUE_SEARCH;
         }
@@ -270,6 +273,9 @@ unsafe extern "system" fn exception_handler(pointers: *mut EXCEPTION_POINTERS) -
             &mut establisher,
             null_mut(),
         );
+        if state.ac {
+            eprintln!("unwind diagnostic: rip={:#x} rsp={:#x} flags={:#x} context_flags={:#x} nonvol={:x?}", copy.Rip, copy.Rsp, copy.EFlags, copy.ContextFlags, nonvolatiles(&copy));
+        }
         if language_handler.is_some()
             || copy.Rip != outcome.caller_rip
             || copy.Rsp != outcome.caller_rsp
@@ -474,6 +480,13 @@ fn run_probe(ac: bool) {
         outcome: outcome_pointer,
     };
     let handler = Handler::install(&mut state);
+    eprintln!(
+        "invoke diagnostic: ac={ac} base={:#x} wrapper={:#x} code={:#x} fetch={:#x}",
+        state.base,
+        wrapper.address(),
+        code.address(),
+        state.fetch
+    );
     // SAFETY: This emitted Win64 wrapper preserves the host ABI and returns with TF/AC/DF clear
     // The VEH and every referenced allocation remain live, and only generated frames are skipped
     unsafe {
