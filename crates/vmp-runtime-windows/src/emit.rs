@@ -30,12 +30,12 @@ const REG_RCX: i32 = 1;
 const REG_RDX: i32 = 2;
 
 // Offsets from the immutable saved-context base in R15. The dispatcher pushes
-// RFLAGS and all fifteen modeled GPRs, so the saved frame is 128 bytes and the
-// entry metadata follows the return address above it.
-const SAVED_RDX: i32 = 96;
-const SAVED_RCX: i32 = 104;
-const SAVED_RAX: i32 = 112;
-const SAVED_RFLAGS: i32 = 120;
+// all fifteen modeled GPRs and then RFLAGS, so the saved frame is 128 bytes and
+// the entry metadata follows the return address above it.
+const SAVED_RFLAGS: i32 = 0;
+const SAVED_RDX: i32 = 104;
+const SAVED_RCX: i32 = 112;
+const SAVED_RAX: i32 = 120;
 const ENTRY_CODE_BASE: i32 = 136;
 const ENTRY_PC: i32 = 144;
 const ENTRY_CODE_END: i32 = 152;
@@ -363,7 +363,6 @@ fn emit_dispatcher(
     let mut publish = asm.create_label();
 
     asm.set_label(dispatch)?;
-    asm.pushfq()?;
     asm.push(rax)?;
     asm.push(rcx)?;
     asm.push(rdx)?;
@@ -379,6 +378,7 @@ fn emit_dispatcher(
     asm.push(r13)?;
     asm.push(r14)?;
     asm.push(r15)?;
+    asm.pushfq()?;
     // R15 is the immutable saved-context base.
     asm.mov(r15, rsp)?;
     asm.mov(rsi, qword_ptr(r15 + ENTRY_CODE_BASE))?;
@@ -512,7 +512,11 @@ fn emit_dispatcher(
     asm.mov(qword_ptr(r15 + ENTRY_STATUS), rax)?;
     asm.mov(rax, qword_ptr(r15 + SAVED_RFLAGS))?;
     asm.mov(qword_ptr(r15 + ENTRY_RUNTIME_RFLAGS), rax)?;
-    asm.mov(rsp, r15)?;
+    asm.push(qword_ptr(r15 + SAVED_RFLAGS))?;
+    asm.popfq()?;
+    // Native Win64 continuation always starts with forward string direction.
+    asm.cld()?;
+    asm.lea(rsp, qword_ptr(r15 + 8))?;
     asm.pop(r15)?;
     asm.pop(r14)?;
     asm.pop(r13)?;
@@ -528,9 +532,6 @@ fn emit_dispatcher(
     asm.pop(rdx)?;
     asm.pop(rcx)?;
     asm.pop(rax)?;
-    asm.popfq()?;
-    // Native Win64 continuation always starts with forward string direction
-    asm.cld()?;
     asm.ret()?;
 
     Ok(())
@@ -539,7 +540,7 @@ fn emit_dispatcher(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iced_x86::{Decoder, DecoderOptions, FlowControl, OpKind, Register};
+    use iced_x86::{Decoder, DecoderOptions, FlowControl, Mnemonic, OpKind, Register};
 
     #[test]
     fn the_emitted_blob_separates_test_and_production_ranges() {
@@ -584,6 +585,50 @@ mod tests {
         assert_eq!(low.test_adapter_range(), high.test_adapter_range());
         assert_eq!(low.dispatcher_range(), high.dispatcher_range());
         assert_eq!(low.handlers_range(), high.handlers_range());
+    }
+
+    #[test]
+    fn production_exit_has_a_canonical_frame_pointer_epilog() {
+        let blob = emit_interpreter().expect("the interpreter must assemble");
+        let instructions: Vec<_> = Decoder::with_ip(64, blob.bytes(), 0, DecoderOptions::NONE)
+            .into_iter()
+            .collect();
+        let tail = instructions
+            .get(instructions.len().saturating_sub(20)..)
+            .expect("the production exit has twenty instructions");
+
+        assert_eq!(tail[0].mnemonic(), Mnemonic::Push);
+        assert_eq!(tail[0].memory_base(), Register::R15);
+        assert_eq!(tail[0].memory_displacement64(), 0);
+        assert_eq!(tail[1].mnemonic(), Mnemonic::Popfq);
+        assert_eq!(tail[2].mnemonic(), Mnemonic::Cld);
+        assert_eq!(tail[3].mnemonic(), Mnemonic::Lea);
+        assert_eq!(tail[3].op0_register(), Register::RSP);
+        assert_eq!(tail[3].memory_base(), Register::R15);
+        assert_eq!(tail[3].memory_displacement64(), 8);
+
+        let expected_pops = [
+            Register::R15,
+            Register::R14,
+            Register::R13,
+            Register::R12,
+            Register::R11,
+            Register::R10,
+            Register::R9,
+            Register::R8,
+            Register::RDI,
+            Register::RSI,
+            Register::RBP,
+            Register::RBX,
+            Register::RDX,
+            Register::RCX,
+            Register::RAX,
+        ];
+        for (instruction, register) in tail[4..19].iter().zip(expected_pops) {
+            assert_eq!(instruction.mnemonic(), Mnemonic::Pop);
+            assert_eq!(instruction.op0_register(), register);
+        }
+        assert_eq!(tail[19].mnemonic(), Mnemonic::Ret);
     }
 
     #[test]
