@@ -579,6 +579,73 @@ mod v2 {
     use vmp_vm::bytecode_v2::{decode, encode, Error, Instruction as I, Program};
     use vmp_vm::stack_v2::Instruction as S;
 
+    #[test]
+    fn shl_wire_widths_and_malformed_fields() {
+        for (width, tag) in [
+            (Width::Byte, 1),
+            (Width::Word, 2),
+            (Width::Dword, 4),
+            (Width::Qword, 8),
+        ] {
+            let bytes = wire(&[0x25, tag, 1], 0);
+            let p = Program::new(0, vec![I::Shl { width }, I::Ret]).expect("program");
+            assert_eq!(encode(&p).expect("encode"), bytes);
+            assert_eq!(decode(&bytes).expect("decode"), p);
+        }
+        assert!(matches!(
+            decode(&wire(&[0x25], 0)),
+            Err(Error::TruncatedInstruction { .. })
+        ));
+        assert!(matches!(
+            decode(&wire(&[0x25, 3], 0)),
+            Err(Error::InvalidWidth { .. })
+        ));
+        assert!(matches!(
+            decode(&wire(&[0x25, 8, 1], 1)),
+            Err(Error::EntryNotBoundary { .. })
+        ));
+        assert!(matches!(
+            decode(&wire(&[0x30, 6, 0, 0, 0, 0x25, 8, 1], 0)),
+            Err(Error::BranchTargetNotBoundary { .. })
+        ));
+    }
+
+    #[test]
+    fn add_wire_widths_and_malformed_fields() {
+        for (width, tag) in [
+            (Width::Byte, 1),
+            (Width::Word, 2),
+            (Width::Dword, 4),
+            (Width::Qword, 8),
+        ] {
+            let literal = wire(&[0x20, tag, 1], 0);
+            let decoded = decode(&literal).expect("ADD is allocated in v2");
+            assert_eq!(decoded.instructions(), [I::Add { width }, I::Ret]);
+            assert_eq!(encode(&decoded).expect("encode"), literal);
+            assert!(matches!(
+                decode(&wire(&[0x20, tag, 1], 1)),
+                Err(Error::EntryNotBoundary { .. })
+            ));
+            assert!(matches!(
+                decode(&wire(&[0x30, 6, 0, 0, 0, 0x20, tag, 1], 0)),
+                Err(Error::BranchTargetNotBoundary { .. })
+            ));
+        }
+        assert_eq!(
+            decode(&wire(&[0x20], 0)),
+            Err(Error::TruncatedInstruction { code_offset: 0 })
+        );
+        for value in [0, 3, 16, 255] {
+            assert_eq!(
+                decode(&wire(&[0x20, value], 0)),
+                Err(Error::InvalidWidth {
+                    code_offset: 0,
+                    value
+                })
+            );
+        }
+    }
+
     fn wire(code: &[u8], entry: u32) -> Vec<u8> {
         let mut bytes = b"VMPB\x02\x00\x10\x00".to_vec();
         bytes.extend_from_slice(&(code.len() as u32).to_le_bytes());
@@ -680,7 +747,7 @@ mod v2 {
             decode(&wire(&[0x31, 16, 0, 0, 0, 0], 0)),
             Err(Error::InvalidCondition { .. })
         ));
-        for opcode in [0, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 255] {
+        for opcode in [0, 0x21, 0x22, 0x23, 0x24, 255] {
             assert!(matches!(
                 decode(&wire(&[opcode], 0)),
                 Err(Error::UnknownOpcode { .. })

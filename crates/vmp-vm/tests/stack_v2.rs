@@ -3,6 +3,138 @@
 use vmp_vm::bytecode::{Register, Width};
 use vmp_vm::stack_v2::{Instruction, Machine, Output, StackError};
 
+#[test]
+fn shl_count_classes_padding_and_atomic_bounds() {
+    for width in [Width::Byte, Width::Word, Width::Dword, Width::Qword] {
+        let bits = width as u32 * 8;
+        let storage = (width as usize).max(2);
+        for (count, value, result, changed, flags) in [
+            (0, 0x81, 0x81u64, 0, 0),
+            (1, 1, 2, 0x8c5, 0),
+            (2, 1, 4, 0xc5, 0),
+            (
+                bits,
+                1,
+                if bits < 32 { 0 } else { 1 },
+                if bits < 32 { 0xc4 } else { 0 },
+                0x44,
+            ),
+            (
+                255,
+                1,
+                if bits >= 32 { 1 << (bits - 1) } else { 0 },
+                if bits < 32 { 0xc4 } else { 0xc5 },
+                if bits >= 32 { 0x84 } else { 0x44 },
+            ),
+        ] {
+            for initial in [0, u64::MAX] {
+                let mut m = Machine::new(storage + 10);
+                push(&mut m, Width::Word, 0xabcd);
+                push(&mut m, Width::Word, 0xa500 | u64::from(count));
+                push(&mut m, width, value);
+                m.shl(width, initial).expect("shift");
+                let raw = m.stack_bytes().collect::<Vec<_>>();
+                let expected = (initial & !changed) | (flags & changed);
+                assert_eq!(&raw[..8], expected.to_le_bytes(), "{width:?} count={count}");
+                assert_eq!(&raw[8..8 + storage], &result.to_le_bytes()[..storage]);
+                assert_eq!(&raw[8 + storage..], [0xcd, 0xab]);
+            }
+        }
+        let mut m = Machine::new(storage + 9);
+        push(&mut m, Width::Word, 0xabcd);
+        push(&mut m, Width::Word, 0);
+        push(&mut m, width, 1);
+        let before = m.stack_bytes().collect::<Vec<_>>();
+        assert_eq!(
+            m.shl(width, 0),
+            Err(StackError::Budget {
+                required: storage + 10,
+                limit: storage + 9
+            })
+        );
+        assert_eq!(m.stack_bytes().collect::<Vec<_>>(), before);
+        let mut short = Machine::new(32);
+        push(&mut short, width, 1);
+        let before = short.stack_bytes().collect::<Vec<_>>();
+        assert_eq!(
+            short.shl(width, 0),
+            Err(StackError::Underflow {
+                needed: storage + 2,
+                available: storage
+            })
+        );
+        assert_eq!(short.stack_bytes().collect::<Vec<_>>(), before);
+    }
+    let mut m = Machine::new(10);
+    push(&mut m, Width::Dword, 0xa501_fe81);
+    m.shl(Width::Byte, 0).expect("ignore both padding bytes");
+    assert_eq!(
+        m.stack_bytes().collect::<Vec<_>>(),
+        [1, 8, 0, 0, 0, 0, 0, 0, 2, 0]
+    );
+}
+
+#[test]
+fn add_masks_padding_and_pins_arithmetic_goldens() {
+    let mut m = Machine::new(12);
+    push(&mut m, Width::Word, 0xabcd);
+    push(&mut m, Width::Dword, 0xfe7f_ff01);
+    m.add(Width::Byte, 0).expect("exact budget");
+    assert_eq!(bytes(&m), [0x90, 8, 0, 0, 0, 0, 0, 0, 0x80, 0, 0xcd, 0xab]);
+    for width in [Width::Byte, Width::Word, Width::Dword, Width::Qword] {
+        let mask = u64::MAX >> (64 - width as u32 * 8);
+        let sign = (mask >> 1) + 1;
+        for (lhs, rhs, result, flags) in [
+            (0, 0, 0, 0x44),
+            (15, 1, 16, 0x10),
+            (1, 2, 3, 4),
+            (
+                sign - 1,
+                1,
+                sign,
+                if width == Width::Byte { 0x890 } else { 0x894 },
+            ),
+            (sign, sign, 0, 0x845),
+            (mask, 1, 0, 0x55),
+        ] {
+            let mut m =
+                Machine::new((8 + (width as usize).max(2)).max(2 * (width as usize).max(2)));
+            push(&mut m, width, lhs);
+            push(&mut m, width, rhs);
+            m.add(width, u64::MAX).expect("add");
+            assert_eq!(
+                m.step(Instruction::PopFlags),
+                Ok(Output::FlagsWord((!0x8d5u64) | flags))
+            );
+            m.step(Instruction::PopReg {
+                width,
+                register: Register::Rax,
+            })
+            .expect("result");
+            assert_eq!(m.register(Register::Rax), result);
+        }
+        let storage = (width as usize).max(2);
+        for available in 0..2 * storage {
+            if available % 2 != 0 {
+                continue;
+            }
+            let mut m = Machine::new(32);
+            for _ in 0..available / 2 {
+                push(&mut m, Width::Word, 0xabcd);
+            }
+            let before = bytes(&m);
+            assert_eq!(
+                m.add(width, 0),
+                Err(StackError::Underflow {
+                    needed: 2 * storage,
+                    available
+                })
+            );
+            assert_eq!(bytes(&m), before);
+        }
+    }
+}
+
 fn push(machine: &mut Machine, width: Width, value: u64) {
     assert_eq!(
         machine.step(Instruction::PushImm { width, value }),

@@ -2,6 +2,105 @@ use vmp_vm::bytecode::{self, Condition, Register, Width};
 use vmp_vm::bytecode_v2::{decode, Instruction as I, Program};
 use vmp_vm::host_v2::{ExecutionError as E, Machine, Termination};
 use vmp_vm::stack_v2::{Instruction as S, StackError};
+#[test]
+fn shl_flags_are_separate_and_count_is_a_word() {
+    for width in [Width::Byte, Width::Word, Width::Dword, Width::Qword] {
+        for count in [0, 1, 2, 32, 64, 255] {
+            for apply in [false, true] {
+                let mut m = Machine::new(16);
+                m.set_flags_bits(u64::MAX);
+                let p = program(vec![
+                    push(Width::Word, count),
+                    push(width, 1),
+                    I::Shl { width },
+                ]);
+                assert!(matches!(m.execute(&p, 3), Err(E::Fallthrough { .. })));
+                assert_eq!(m.flags_bits(), u64::MAX);
+                let raw = m.stack_bytes().collect::<Vec<_>>();
+                let flags = u64::from_le_bytes(raw[..8].try_into().expect("flags"));
+                let end = program(vec![
+                    I::Stack(if apply {
+                        S::PopFlags
+                    } else {
+                        S::Drop {
+                            width: Width::Qword,
+                        }
+                    }),
+                    I::Stack(S::Drop { width }),
+                    I::Ret,
+                ]);
+                assert_eq!(m.execute(&end, 6), Ok(Termination::Ret));
+                assert_eq!(m.flags_bits(), if apply { flags } else { u64::MAX });
+            }
+        }
+    }
+}
+
+#[test]
+fn add_flags_are_physical_until_applied_or_discarded() {
+    for width in [Width::Byte, Width::Word, Width::Dword, Width::Qword] {
+        for initial in [0, u64::MAX, 0xdead_beef_0005_0202] {
+            for apply in [false, true] {
+                let mut m = Machine::new(16);
+                m.set_flags_bits(initial);
+                let mask = u64::MAX >> (64 - width as u32 * 8);
+                let p = program(vec![push(width, mask), push(width, 1), I::Add { width }]);
+                assert!(matches!(m.execute(&p, 3), Err(E::Fallthrough { .. })));
+                assert_eq!(m.flags_bits(), initial);
+                let flags = (initial & !0x8d5) | 0x55;
+                let bytes = m.stack_bytes().collect::<Vec<_>>();
+                assert_eq!(&bytes[..8], &flags.to_le_bytes());
+                assert_eq!(&bytes[8..], vec![0; (width as usize).max(2)]);
+                let end = program(vec![
+                    I::Stack(if apply {
+                        S::PopFlags
+                    } else {
+                        S::Drop {
+                            width: Width::Qword,
+                        }
+                    }),
+                    I::Stack(S::PopReg {
+                        width,
+                        register: Register::Rax,
+                    }),
+                    I::Ret,
+                ]);
+                assert_eq!(m.execute(&end, 6), Ok(Termination::Ret));
+                assert_eq!(m.flags_bits(), if apply { flags } else { initial });
+                assert_eq!(m.register(Register::Rax), 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn add_failure_preserves_data_state_and_counts_dispatch() {
+    let mut m = Machine::new(11);
+    m.set_flags_bits(u64::MAX);
+    m.set_register(Register::Rax, 42);
+    let p = program(vec![
+        push(Width::Word, 0xabcd),
+        push(Width::Word, 1),
+        push(Width::Word, 2),
+        I::Add { width: Width::Word },
+    ]);
+    assert_eq!(
+        m.execute(&p, 4),
+        Err(E::Stack(StackError::Budget {
+            required: 12,
+            limit: 11
+        }))
+    );
+    assert_eq!(
+        m.stack_bytes().collect::<Vec<_>>(),
+        [2, 0, 1, 0, 0xcd, 0xab]
+    );
+    assert_eq!(m.flags_bits(), u64::MAX);
+    assert_eq!(m.register(Register::Rax), 42);
+    assert_eq!(m.pc(), 12);
+    assert_eq!(m.steps(), 4);
+}
+
 fn program(instructions: Vec<I>) -> Program {
     Program::new(0, instructions).expect("valid")
 }

@@ -9,6 +9,8 @@ pub const V2_HEADER_SIZE: usize = 16;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Instruction {
     Stack(Stack),
+    Add { width: Width },
+    Shl { width: Width },
     Ret,
     Jmp { target: u32 },
     Jcc { condition: Condition, target: u32 },
@@ -20,7 +22,7 @@ impl Instruction {
             Self::Ret | Self::Stack(Stack::PopFlags) => 1,
             Self::Stack(Stack::PushImm { width, .. }) => 2 + width.byte_len(),
             Self::Stack(Stack::PushReg { .. } | Stack::PopReg { .. }) => 3,
-            Self::Stack(Stack::Drop { .. }) => 2,
+            Self::Stack(Stack::Drop { .. }) | Self::Add { .. } | Self::Shl { .. } => 2,
             Self::Jmp { .. } => 5,
             Self::Jcc { .. } => 6,
         }
@@ -88,7 +90,10 @@ impl Program {
                         });
                     }
                 }
-                Instruction::Ret | Instruction::Stack(_) => {}
+                Instruction::Ret
+                | Instruction::Stack(_)
+                | Instruction::Add { .. }
+                | Instruction::Shl { .. } => {}
             }
         }
         Ok(Self {
@@ -158,6 +163,8 @@ pub fn encode(program: &Program) -> Result<Vec<u8>, Error> {
     for instruction in &program.instructions {
         match *instruction {
             Instruction::Ret => out.push(1),
+            Instruction::Add { width } => out.extend_from_slice(&[0x20, width as u8]),
+            Instruction::Shl { width } => out.extend_from_slice(&[0x25, width as u8]),
             Instruction::Stack(stack) => match stack {
                 Stack::PushImm { width, value } => {
                     out.extend_from_slice(&[0x10, width as u8]);
@@ -252,6 +259,12 @@ pub fn decode(input: &[u8]) -> Result<Program, Error> {
                 width: reader.width()?,
             }),
             0x14 => Instruction::Stack(Stack::PopFlags),
+            0x20 => Instruction::Add {
+                width: reader.width()?,
+            },
+            0x25 => Instruction::Shl {
+                width: reader.width()?,
+            },
             0x30 => Instruction::Jmp {
                 target: reader.u32()?,
             },

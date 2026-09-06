@@ -103,7 +103,7 @@ fn invalid_fields_are_typed() {
         decode(&wire(&[0x31, 16, 0, 0, 0, 0], 0)),
         Err(Error::InvalidCondition { .. })
     ));
-    for opcode in [0, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 255] {
+    for opcode in [0, 0x21, 0x22, 0x23, 0x24, 255] {
         assert!(matches!(
             decode(&wire(&[opcode], 0)),
             Err(Error::UnknownOpcode { .. })
