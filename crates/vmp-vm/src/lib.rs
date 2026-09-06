@@ -3,3 +3,4 @@
 pub mod bytecode;
 pub mod host;
 pub mod lowering;
+pub mod stack_v2;
