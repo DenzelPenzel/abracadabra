@@ -87,6 +87,8 @@ impl Machine {
                 .ok_or(ExecutionError::InvalidPc { pc: self.pc })?;
             self.steps += 1;
             match *instruction {
+                Instruction::Add { width } => self.stack.add(width, self.flags_bits)?,
+                Instruction::Shl { width } => self.stack.shl(width, self.flags_bits)?,
                 Instruction::Stack(instruction) => match self.stack.step(instruction)? {
                     Output::None => {}
                     Output::FlagsWord(bits) => self.flags_bits = bits,
