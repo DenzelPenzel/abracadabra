@@ -23,7 +23,7 @@ pub enum Width {
 }
 
 impl Width {
-    fn from_byte(value: u8, code_offset: u32) -> Result<Self, DecodeError> {
+    pub(crate) fn from_byte(value: u8, code_offset: u32) -> Result<Self, DecodeError> {
         match value {
             1 => Ok(Self::Byte),
             2 => Ok(Self::Word),
@@ -88,7 +88,7 @@ impl Register {
         }
     }
 
-    fn from_id(value: u8, code_offset: u32) -> Result<Self, DecodeError> {
+    pub(crate) fn from_id(value: u8, code_offset: u32) -> Result<Self, DecodeError> {
         match value {
             0 => Ok(Self::Rax),
             1 => Ok(Self::Rcx),
@@ -133,7 +133,7 @@ pub enum Condition {
 }
 
 impl Condition {
-    fn from_byte(value: u8, code_offset: u32) -> Result<Self, DecodeError> {
+    pub(crate) fn from_byte(value: u8, code_offset: u32) -> Result<Self, DecodeError> {
         match value {
             0 => Ok(Self::O),
             1 => Ok(Self::No),

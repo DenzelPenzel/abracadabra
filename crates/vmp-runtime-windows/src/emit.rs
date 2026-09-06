@@ -30,6 +30,8 @@ const WIDTH_QWORD: i32 = 8;
 const REG_RAX: i32 = 0;
 const REG_RCX: i32 = 1;
 const REG_RDX: i32 = 2;
+const AC: i32 = 1 << 18;
+const ARITHMETIC_FLAGS: i32 = (1 << 0) | (1 << 2) | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 11);
 
 // Offsets from the immutable saved-context base in R15. The dispatcher pushes
 // all fifteen modeled GPRs and then RFLAGS, so the saved frame is 128 bytes and
@@ -658,6 +660,10 @@ fn emit_dispatcher(
     // R15 is the immutable saved-context base.
     asm.mov(r15, rsp)?;
     asm.set_label(prologue_end)?;
+    // Normalize live AC only after the unwind frame is established
+    asm.push(qword_ptr(r15 + SAVED_RFLAGS))?;
+    asm.and(qword_ptr(rsp), !AC)?;
+    asm.popfq()?;
     asm.mov(rsi, qword_ptr(r15 + ENTRY_CODE_BASE))?;
     asm.mov(r13, qword_ptr(r15 + ENTRY_PC))?;
     asm.mov(r12, qword_ptr(r15 + ENTRY_CODE_END))?;
@@ -757,7 +763,9 @@ fn emit_dispatcher(
     asm.add(qword_ptr(r14), rax)?;
     asm.pushfq()?;
     asm.pop(rax)?;
-    asm.mov(qword_ptr(r15 + SAVED_RFLAGS), rax)?;
+    asm.and(rax, ARITHMETIC_FLAGS)?;
+    asm.and(qword_ptr(r15 + SAVED_RFLAGS), !ARITHMETIC_FLAGS)?;
+    asm.or(qword_ptr(r15 + SAVED_RFLAGS), rax)?;
     asm.add(r14, 8)?;
     asm.jmp(fetch)?;
 
@@ -862,6 +870,65 @@ mod tests {
         assert_eq!(low.test_adapter_range(), high.test_adapter_range());
         assert_eq!(low.dispatcher_range(), high.dispatcher_range());
         assert_eq!(low.handlers_range(), high.handlers_range());
+    }
+
+    #[test]
+    fn body_normalizes_only_live_ac_after_frozen_prologue() {
+        let blob = emit_interpreter().expect("assemble");
+        let function = &blob.unwind_plan.functions[1];
+        let start = function.range.start() as usize;
+        let end = start + function.prologue_size as usize;
+        assert_eq!(
+            &blob.bytes()[start..end],
+            &[
+                0x50, 0x51, 0x52, 0x53, 0x55, 0x56, 0x57, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41,
+                0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x9c, 0x49, 0x89, 0xe7
+            ]
+        );
+        let body: Vec<_> = Decoder::new(64, &blob.bytes()[end..], DecoderOptions::NONE)
+            .into_iter()
+            .take(3)
+            .collect();
+        assert_eq!(body[0].mnemonic(), Mnemonic::Push);
+        assert_eq!(body[0].memory_base(), Register::R15);
+        assert_eq!(body[0].memory_displacement64(), 0);
+        assert_eq!(body[1].mnemonic(), Mnemonic::And);
+        assert_eq!(body[1].memory_base(), Register::RSP);
+        assert_eq!(body[1].immediate32(), !(1u32 << 18));
+        assert_eq!(body[2].mnemonic(), Mnemonic::Popfq);
+        let remaining: Vec<_> = Decoder::new(64, &blob.bytes()[end..], DecoderOptions::NONE)
+            .into_iter()
+            .collect();
+        let restores: Vec<_> = remaining
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| i.mnemonic() == Mnemonic::Popfq)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(restores, [2, remaining.len() - 19]);
+    }
+
+    #[test]
+    fn add_merges_only_arithmetic_flags_into_guest_snapshot() {
+        let blob = emit_interpreter().expect("assemble");
+        let instructions: Vec<_> = Decoder::new(64, blob.bytes(), DecoderOptions::NONE)
+            .into_iter()
+            .collect();
+        let add = instructions
+            .iter()
+            .position(|i| {
+                i.mnemonic() == Mnemonic::Add
+                    && i.memory_base() == Register::R14
+                    && i.op1_register() == Register::RAX
+            })
+            .expect("ADD handler");
+        assert_eq!(instructions[add + 3].mnemonic(), Mnemonic::And);
+        assert_eq!(instructions[add + 3].immediate32(), 0x8d5);
+        assert_eq!(instructions[add + 4].mnemonic(), Mnemonic::And);
+        assert_eq!(instructions[add + 4].memory_base(), Register::R15);
+        assert_eq!(instructions[add + 4].immediate32(), !0x8d5u32);
+        assert_eq!(instructions[add + 5].mnemonic(), Mnemonic::Or);
+        assert_eq!(instructions[add + 5].memory_base(), Register::R15);
     }
 
     #[test]

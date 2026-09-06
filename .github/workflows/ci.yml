@@ -58,6 +58,19 @@ jobs:
         run: rustup target add i686-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
 
+      - name: Registered VM runtime unwind gate
+        timeout-minutes: 10
+        run: |
+          $env:CARGO_TERM_COLOR = "never"
+          cargo test -p vmp-runtime-windows --lib unwind::windows_tests -- --nocapture 2>&1 | Tee-Object -Variable debugUnwind
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p vmp-runtime-windows --lib --release unwind::windows_tests -- --nocapture 2>&1 | Tee-Object -Variable releaseUnwind
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($output in @($debugUnwind, $releaseUnwind)) {
+            $summaries = @($output | Where-Object { $_ -match '^test result: ok[.] 7 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' })
+            if ($summaries.Count -ne 1) { throw "unwind gate did not execute exactly seven passing tests" }
+          }
+
       # Real PE32 and PE32+ fixtures, produced here by the MSVC linker. Pointing
       # `VMP_CORPUS_DIR` at them makes the property sweeps a hard gate on fresh
       # toolchain output as well as on the committed corpus; the pinned suites
@@ -136,6 +149,19 @@ jobs:
           $matchingSummaries = @($oracleOutput | Where-Object { $_ -match $summaryPattern })
           if ($matchingSummaries.Count -ne 1) {
             throw "native VM differential oracle did not execute exactly eleven passing tests"
+          }
+
+      - name: Native v2 raw-flags condition gate
+        timeout-minutes: 10
+        run: |
+          $env:CARGO_TERM_COLOR = "never"
+          cargo test -p vmp-vm --test native_v2_conditions -- --nocapture 2>&1 | Tee-Object -Variable debugConditions
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p vmp-vm --test native_v2_conditions --release -- --nocapture 2>&1 | Tee-Object -Variable releaseConditions
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($output in @($debugConditions, $releaseConditions)) {
+            $summaries = @($output | Where-Object { $_ -match '^test result: ok[.] 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;' })
+            if ($summaries.Count -ne 1) { throw "v2 conditions gate did not execute exactly one passing test" }
           }
 
       # The loader gate proper: imagehlp recomputes the checksum, the kernel maps
