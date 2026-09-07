@@ -57,6 +57,7 @@ jobs:
             output=$(CARGO_TERM_COLOR=never cargo test -p vmp-vm --test native_gate_cpu "${args[@]}" 2>&1)
             printf '%s\n' "$output"
             printf '%s\n' "$output" | grep -E '^test result: ok[.] 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in [0-9]+([.][0-9]+)?s$'
+          done
 
   windows-gate:
     name: windows loader and corpus gate
