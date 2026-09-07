@@ -1,7 +1,7 @@
 //! Production stack transport against source-derived C++ byte-layout pins
 
-use vmp_vm::bytecode::{Register, Width};
-use vmp_vm::stack_v2::{Instruction, Machine, Output, StackError};
+use vmp_vm::operand::{Register, Width};
+use vmp_vm::stack::{Instruction, Machine, Output, StackError};
 
 #[test]
 fn shl_count_classes_padding_and_atomic_bounds() {

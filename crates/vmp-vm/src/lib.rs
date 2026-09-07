@@ -1,8 +1,6 @@
-//! VM bytecode, lowering and host reference execution.
+//! Logical commands, raw-stack primitives and coupled generated native VM instances
 
-pub mod bytecode;
-pub mod bytecode_v2;
-pub mod host;
-pub mod host_v2;
-pub mod lowering;
-pub mod stack_v2;
+pub mod instance;
+pub mod logical;
+pub mod operand;
+pub mod stack;

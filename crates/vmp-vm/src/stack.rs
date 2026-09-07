@@ -2,7 +2,7 @@
 //!
 //! Flags are transported as raw words, not applied to architectural flags or definedness
 
-use crate::bytecode::{Register, Width};
+use crate::operand::{Register, Width};
 use thiserror::Error;
 
 /// Logical stack operations independent of their wire encoding

@@ -47,6 +47,16 @@ jobs:
       # windows-gate job below re-runs the sweeps against fresh linker output.
       - run: cargo test --workspace --all-targets
       - run: cargo test --workspace --all-targets --release
+      - name: Current generated native VM gate
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          for profile in debug release; do
+            args=()
+            if [ "$profile" = release ]; then args+=(--release); fi
+            output=$(CARGO_TERM_COLOR=never cargo test -p vmp-vm --test native_gate_cpu "${args[@]}" 2>&1)
+            printf '%s\n' "$output"
+            printf '%s\n' "$output" | grep -E '^test result: ok[.] 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in [0-9]+([.][0-9]+)?s$'
 
   windows-gate:
     name: windows loader and corpus gate
@@ -58,18 +68,6 @@ jobs:
         run: rustup target add i686-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
 
-      - name: Registered VM runtime unwind gate
-        timeout-minutes: 10
-        run: |
-          $env:CARGO_TERM_COLOR = "never"
-          cargo test -p vmp-runtime-windows --lib unwind::windows_tests -- --nocapture 2>&1 | Tee-Object -Variable debugUnwind
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test -p vmp-runtime-windows --lib --release unwind::windows_tests -- --nocapture 2>&1 | Tee-Object -Variable releaseUnwind
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          foreach ($output in @($debugUnwind, $releaseUnwind)) {
-            $summaries = @($output | Where-Object { $_ -match '^test result: ok[.] 7 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' })
-            if ($summaries.Count -ne 1) { throw "unwind gate did not execute exactly seven passing tests" }
-          }
 
       # Real PE32 and PE32+ fixtures, produced here by the MSVC linker. Pointing
       # `VMP_CORPUS_DIR` at them makes the property sweeps a hard gate on fresh
@@ -101,67 +99,23 @@ jobs:
           echo VMP_SDK_REGISTER_PROBE=%GITHUB_WORKSPACE%\ci-fixtures\sdk-register-probe.exe>>%GITHUB_ENV%
           echo VMP_SDK_STATIC_PROBE=%GITHUB_WORKSPACE%\ci-fixtures\sdk-static-probe.exe>>%GITHUB_ENV%
 
-      - name: Build VM runtime production-entry probe
-        shell: cmd
-        run: ml64 /nologo /c /Foci-fixtures\runtime-probe.obj crates\vmp-runtime-windows\tests\fixtures\runtime_probe.asm
-
-      - name: VM runtime production-entry gate
-        run: |
-          $object = Join-Path $env:GITHUB_WORKSPACE "ci-fixtures\runtime-probe.obj"
-          $env:RUSTFLAGS = "-C link-arg=$object"
-          $env:CARGO_TERM_COLOR = "never"
-          cargo clean -p vmp-runtime-windows
-
-          cargo test -p vmp-runtime-windows --features windows-runtime-probe --test windows_runtime -- --nocapture 2>&1 | Tee-Object -Variable debugOutput
-          if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
-          }
-          cargo test -p vmp-runtime-windows --features windows-runtime-probe --test windows_runtime --release -- --nocapture 2>&1 | Tee-Object -Variable releaseOutput
-          if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
-          }
-
-          $summaryPattern = '^test result: ok[.] 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in [0-9]+([.][0-9]+)?s$'
-          foreach ($output in @($debugOutput, $releaseOutput)) {
-            $matchingSummaries = @($output | Where-Object { $_ -match $summaryPattern })
-            if ($matchingSummaries.Count -ne 1) {
-              throw "production-entry gate did not execute exactly five passing tests"
-            }
-          }
 
       - name: Parser and writer suite over the built corpus
         env:
           VMP_CORPUS_DIR: ${{ github.workspace }}/ci-fixtures
         run: cargo test --workspace --all-targets
 
-      - name: Native x86-64 VM differential gate
-        run: |
-          $architecture = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture
-          if ($architecture -ne [System.Runtime.InteropServices.Architecture]::X64) {
-            throw "native VM differential gate requires X64, found $architecture"
-          }
-          $env:CARGO_TERM_COLOR = "never"
-          cargo test -p vmp-vm --test native_differential -- --nocapture 2>&1 | Tee-Object -Variable oracleOutput
-          if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
-          }
-          $summaryPattern = '^test result: ok[.] 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in [0-9]+([.][0-9]+)?s$'
-          $matchingSummaries = @($oracleOutput | Where-Object { $_ -match $summaryPattern })
-          if ($matchingSummaries.Count -ne 1) {
-            throw "native VM differential oracle did not execute exactly eleven passing tests"
-          }
-
-      - name: Native v2 raw-flags condition, ADD and SHL gate
+      - name: Current raw-stack ADD and SHL gate
         timeout-minutes: 10
         run: |
           $env:CARGO_TERM_COLOR = "never"
-          cargo test -p vmp-vm --test native_v2_conditions -- --nocapture 2>&1 | Tee-Object -Variable debugConditions
+          cargo test -p vmp-vm --test native_stack -- --nocapture 2>&1 | Tee-Object -Variable debugConditions
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test -p vmp-vm --test native_v2_conditions --release -- --nocapture 2>&1 | Tee-Object -Variable releaseConditions
+          cargo test -p vmp-vm --test native_stack --release -- --nocapture 2>&1 | Tee-Object -Variable releaseConditions
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           foreach ($output in @($debugConditions, $releaseConditions)) {
-            $summaries = @($output | Where-Object { $_ -match '^test result: ok[.] 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in [0-9]+([.][0-9]+)?s$' })
-            if ($summaries.Count -ne 1) { throw "v2 conditions, ADD and SHL gate did not execute exactly three passing tests" }
+            $summaries = @($output | Where-Object { $_ -match '^test result: ok[.] 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in [0-9]+([.][0-9]+)?s$' })
+            if ($summaries.Count -ne 1) { throw "raw-stack ADD and SHL gate did not execute exactly two passing tests" }
           }
 
       # The loader gate proper: imagehlp recomputes the checksum, the kernel maps

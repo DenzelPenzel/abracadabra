@@ -9,7 +9,6 @@ thiserror.workspace = true
 vmp-ir = { version = "0.1.0", path = "../vmp-ir" }
 vmp-mutation = { version = "0.1.0", path = "../vmp-mutation" }
 vmp-pe = { version = "0.1.0", path = "../vmp-pe" }
-vmp-runtime-windows = { version = "0.1.0", path = "../vmp-runtime-windows" }
 vmp-types = { version = "0.1.0", path = "../vmp-types" }
 vmp-x86 = { version = "0.1.0", path = "../vmp-x86" }
 
