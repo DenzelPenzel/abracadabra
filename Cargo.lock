@@ -332,7 +332,6 @@ dependencies = [
  "vmp-ir",
  "vmp-mutation",
  "vmp-pe",
- "vmp-runtime-windows",
  "vmp-types",
  "vmp-x86",
 ]
@@ -372,18 +371,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "vmp-runtime-windows"
-version = "0.1.0"
-dependencies = [
- "iced-x86",
- "thiserror",
- "vmp-pe",
- "vmp-types",
- "vmp-vm",
- "windows-sys",
-]
-
-[[package]]
 name = "vmp-symbols"
 version = "0.1.0"
 dependencies = [
@@ -408,9 +395,7 @@ dependencies = [
  "iced-x86",
  "thiserror",
  "vmp-ir",
- "vmp-pe",
  "vmp-types",
- "vmp-x86",
 ]
 
 [[package]]

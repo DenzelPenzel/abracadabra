@@ -3,15 +3,16 @@ name = "vmp-vm"
 version = "0.1.0"
 edition = "2021"
 
+
 [dependencies]
 iced-x86.workspace = true
 thiserror.workspace = true
 vmp-ir = { version = "0.1.0", path = "../vmp-ir" }
 vmp-types = { version = "0.1.0", path = "../vmp-types" }
-vmp-x86 = { version = "0.1.0", path = "../vmp-x86" }
 
-[dev-dependencies]
-vmp-pe = { version = "0.1.0", path = "../vmp-pe" }
+[[example]]
+name = "body_instance"
+path = "tests/proofs/emit_instance.rs"
 
 [lints]
 workspace = true
