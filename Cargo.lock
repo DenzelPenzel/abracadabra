@@ -333,6 +333,7 @@ dependencies = [
  "vmp-mutation",
  "vmp-pe",
  "vmp-types",
+ "vmp-vm",
  "vmp-x86",
 ]
 

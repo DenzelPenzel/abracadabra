@@ -26,6 +26,7 @@ use vmp_x86::{decode_function, epilogues, relocate, Epilogue, Image, Relocated};
 
 pub mod sdk;
 mod stub;
+pub mod vm;
 
 use stub::{Stub, STUB_LEN};
 

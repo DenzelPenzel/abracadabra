@@ -239,6 +239,7 @@ pub struct NativeInstance {
     body: BodyInstance,
     entry: usize,
     exit: usize,
+    gate_addresses: [usize; 4],
 }
 
 impl NativeInstance {
@@ -310,23 +311,34 @@ impl NativeInstance {
             body.image
                 .extend_from_slice(&[0x48, 0x89, 0x44, 0x24, offset]);
         }
-        for (prefix, offset) in [
+        let mut gate_addresses = [0; 4];
+        for (index, (prefix, offset)) in [
             ([0x48, 0xbe], body.stream.start),
             ([0x49, 0xba], body.table),
             ([0x49, 0xbb], body.stream.end),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             body.image.extend_from_slice(&prefix);
+            gate_addresses[index] = body.image.len();
             body.image
                 .extend_from_slice(&(base.0 + offset as u64).to_le_bytes());
         }
         if let Some(key) = body.initial_key() {
             body.image.extend_from_slice(&[0x48, 0xbf]); // mov rdi, initial key
+            gate_addresses[3] = body.image.len();
             body.image.extend_from_slice(&key.to_le_bytes());
         }
         jump_dispatch(&mut body.image);
         // Retarget the owned dispatch completion JE, leaving raw-body layout unchanged
         body.image[9..13].copy_from_slice(&(exit as i32 - 13).to_le_bytes());
-        Ok(Self { body, entry, exit })
+        Ok(Self {
+            body,
+            entry,
+            exit,
+            gate_addresses,
+        })
     }
 
     pub fn image(&self) -> &[u8] {
@@ -337,6 +349,23 @@ impl NativeInstance {
     }
     pub fn exit_offset(&self) -> usize {
         self.exit
+    }
+
+    /// Sorted image-relative offsets of absolute little-endian 64-bit address fields
+    ///
+    /// Includes all table slots and gate pointers, including the encrypted initial key
+    /// Consumers must check conversion to their own address coordinates before publication
+    /// These fixups support whole-image rebasing with a delta divisible by 256 for the
+    /// captured byte cryptor; arbitrary placement changes require regenerating the stream
+    pub fn absolute_address_offsets(&self) -> impl Iterator<Item = usize> + '_ {
+        let count = if self.body.initial_key().is_some() {
+            4
+        } else {
+            3
+        };
+        (self.body.table..self.body.table + 256 * 8)
+            .step_by(8)
+            .chain(self.gate_addresses[..count].iter().copied())
     }
     /// Below gate-entry RSP: 128 saved bytes, 256 scratch bytes, one PUSHF qword
     pub fn max_native_stack_bytes(&self) -> usize {

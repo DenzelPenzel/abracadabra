@@ -104,13 +104,14 @@ Dependencies point outward-to-inward; low-level crates never know about the CLI 
 config format.
 
 ```text
-vmp-cli ──> vmp-compiler ─┬─> vmp-emit ──> vmp-runtime-windows
+vmp-cli ──> vmp-compiler ─┬─> vmp-emit
   (plus vmp-pe/vmp-x86/   ├─> vmp-mutation
    vmp-ir directly, for   ├─> vmp-symbols ──> vmp-pdb, vmp-demangle
    inspect and disasm)    ├─> vmp-x86 ──> vmp-ir
                           └─> vmp-pe
 
-vmp-vm ──> vmp-ir, vmp-x86   implemented, deliberately not yet reachable from vmp-compiler
+vmp-vm                       operands and raw-stack model; not reachable from vmp-compiler
+vmp-runtime-windows          fixed-runtime proof island; no normal vmp-emit dependency
 every crate ──> vmp-types    typed addresses, architecture, protection mode
 ```
 
@@ -127,13 +128,12 @@ The boundaries that are easy to get wrong:
   liveness, a value/flag model, epilogue analysis, relocation round-tripping, SDK-marker
   scanning. The persistent function/block/edge model that `vmp-mutation` and `vmp-vm`
   consume lives in `vmp-ir`.
-- **`vmp-vm` lowers; `vmp-runtime-windows` interprets.** Per ADR-0002 the MVP is *variant
-  A*: one fixed interpreter and one opcode set for every file. Opcode handlers are **not**
-  generated in `vmp-vm` — it only lowers native IR into fixed-format bytecode v1
-  (ADR-0003). Variant B (per-file polymorphic handler generation, shuffled opcodes,
-  encrypted stream — what the C++ actually does) comes after end-to-end Virtualization and
-  will move codegen here. That variant A is knowably weaker protection is a recorded MVP
-  limitation, not a defect.
+- **`vmp-vm` must generate a complete per-artifact instance.** Logical commands are
+  unversioned compiler IR, not a stable wire protocol. Native handlers, context layout,
+  mapping, dispatch, cryptors, stream and links must remain coupled as in the C++.
+  `vmp-runtime-windows` currently holds a fixed-runtime proof experiment with ABI/unwind
+  fixtures; it is not the future embedded processor. ADR-0002 replaces the old fixed-MVP
+  decision. Preserve independent CPU and ABI/unwind proof assets during migration.
 - **`vmp-compiler` owns orchestration; `vmp-cli` is an adapter.** `protect_mutation`
   owns explicit/symbol/SDK/exception selection, dedup, emission and typed domain errors.
   The CLI does bounded IO, atomic publication and rendering — no library logic in commands.
