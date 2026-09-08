@@ -130,6 +130,8 @@ enum Execution {
     Native,
     Plain,
     Encrypted,
+    RebasedPlain,
+    RebasedEncrypted,
 }
 
 #[allow(unsafe_code)]
@@ -155,16 +157,37 @@ fn execute_program(
         .collect();
     let mapping = Mapping::new();
     let base = mapping.0 as u64;
-    let gate = match execution {
-        Execution::Native | Execution::Plain => {
-            NativeInstance::generate(&bodies, VirtualAddress(base), variant)
+    let preferred = if matches!(
+        execution,
+        Execution::RebasedPlain | Execution::RebasedEncrypted
+    ) {
+        if variant & 1 == 0 {
+            base.checked_sub(0x10000).expect("lower preferred base")
+        } else {
+            base.checked_add(0x10000).expect("upper preferred base")
         }
-        Execution::Encrypted => {
-            NativeInstance::generate_encrypted(&bodies, VirtualAddress(base), variant)
+    } else {
+        base
+    };
+    let gate = match execution {
+        Execution::Native | Execution::Plain | Execution::RebasedPlain => {
+            NativeInstance::generate(&bodies, VirtualAddress(preferred), variant)
+        }
+        Execution::Encrypted | Execution::RebasedEncrypted => {
+            NativeInstance::generate_encrypted(&bodies, VirtualAddress(preferred), variant)
         }
     }
     .expect("gate");
     let mut image = gate.image().to_vec();
+    if preferred != base {
+        for offset in gate.absolute_address_offsets() {
+            let old =
+                u64::from_le_bytes(image[offset..offset + 8].try_into().expect("fixup qword"));
+            let new = u64::try_from(i128::from(old) + i128::from(base) - i128::from(preferred))
+                .expect("rebased address");
+            image[offset..offset + 8].copy_from_slice(&new.to_le_bytes());
+        }
+    }
     match mutation {
         Mutation::None => {}
         Mutation::Pop => {
@@ -302,6 +325,14 @@ fn compare_native(variant: u8, program: &[u8], initial: &[u64; 15], flags: u64) 
     for output in [actual, expected] {
         assert_eq!(output[16], output[17], "outer RSP");
         assert_eq!(output[18], 0x5a5a5a5a5a5a5a5a, "stack boundary");
+    }
+    for execution in [Execution::RebasedPlain, Execution::RebasedEncrypted] {
+        let relocated =
+            execute_program(variant, program, initial, flags, Mutation::None, execution);
+        assert_eq!(&relocated[..15], &expected[..15], "rebased GPRs");
+        assert_eq!(relocated[15] & 0xed5, expected[15] & 0xed5, "rebased flags");
+        assert_eq!(relocated[16], relocated[17], "rebased RSP");
+        assert_eq!(relocated[18], 0x5a5a5a5a5a5a5a5a, "rebased stack boundary");
     }
     actual
 }

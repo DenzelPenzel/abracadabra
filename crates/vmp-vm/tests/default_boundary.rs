@@ -18,7 +18,7 @@ fn only_current_implementation_is_available() {
 }
 
 #[test]
-fn cli_does_not_expose_unintegrated_virtualization() {
+fn emitter_dependency_reaches_only_current_vm() {
     let output = cargo()
         .args([
             "tree", "-p", "vmp-cli", "--edges", "normal", "--prefix", "none",
@@ -29,7 +29,7 @@ fn cli_does_not_expose_unintegrated_virtualization() {
     assert!(output.status.success(), "{output:?}");
     let tree = String::from_utf8(output.stdout).expect("Cargo prints UTF-8");
     assert!(!tree.contains("vmp-runtime-windows"), "{tree}");
-    assert!(!tree.contains("vmp-vm "), "{tree}");
+    assert!(tree.contains("vmp-vm "), "{tree}");
 }
 
 struct Consumer(PathBuf);

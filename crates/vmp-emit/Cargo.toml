@@ -10,7 +10,12 @@ vmp-ir = { version = "0.1.0", path = "../vmp-ir" }
 vmp-mutation = { version = "0.1.0", path = "../vmp-mutation" }
 vmp-pe = { version = "0.1.0", path = "../vmp-pe" }
 vmp-types = { version = "0.1.0", path = "../vmp-types" }
+vmp-vm = { version = "0.1.0", path = "../vmp-vm" }
 vmp-x86 = { version = "0.1.0", path = "../vmp-x86" }
 
 [lints]
 workspace = true
+
+[[example]]
+name = "emit_vm_pe"
+path = "tests/proofs/emit_vm_pe.rs"
