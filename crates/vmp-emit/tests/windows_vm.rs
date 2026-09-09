@@ -4,7 +4,7 @@
 #[path = "support/windows_vm.rs"]
 mod os;
 
-use iced_x86::{Decoder, DecoderOptions};
+use iced_x86::{Code, Decoder, DecoderOptions};
 use vmp_emit::vm::append_vm_instance;
 use vmp_ir::Instruction;
 use vmp_pe::{directory, ExportTarget, Fixup, FixupKind, PeFile};
@@ -53,20 +53,24 @@ fn omit_fixup(bytes: &[u8], target: Rva) -> Vec<u8> {
         block += size;
     }
     assert_eq!(removed, 1);
-    let checksum = PeFile::parse(&result)
+    refresh_checksum(&mut result);
+    result
+}
+
+fn refresh_checksum(result: &mut [u8]) {
+    let checksum = PeFile::parse(result)
         .expect("mutated PE")
-        .compute_checksum(&result)
+        .compute_checksum(result)
         .expect("checksum");
     let nt = u32::from_le_bytes(result[0x3c..0x40].try_into().expect("PE offset")) as usize;
     result[nt + 88..nt + 92].copy_from_slice(&checksum.to_le_bytes());
-    result
 }
 
 #[test]
 fn windows_loader_rebases_and_executes_serialized_vm() {
     let path =
         std::env::var_os("VMP_VM_DLL_PROBE").expect("build the CI VM DLL and set VMP_VM_DLL_PROBE");
-    let input = std::fs::read(path).expect("read DLL");
+    let input = std::fs::read(&path).expect("read DLL");
     let before = PeFile::parse(&input).expect("fixture PE");
     assert_eq!(before.optional.entry_point, Rva(0));
     assert!(before.tls.is_none());
@@ -116,6 +120,10 @@ fn windows_loader_rebases_and_executes_serialized_vm() {
     let dir = std::env::temp_dir().join(format!("vmp-windows-vm-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("scratch directory");
     let _reservation = os::Reservation::at(before.optional.image_base.0);
+    let reference = os::Module::load(
+        std::path::Path::new(&path),
+        before.optional.size_of_image as usize,
+    );
     for variant in [0, 1, 15, 255] {
         let artifact = append_vm_instance(input.clone(), &bodies, variant).expect("embed VM");
         let entry = artifact.placement().entry_rva();
@@ -126,7 +134,29 @@ fn windows_loader_rebases_and_executes_serialized_vm() {
             .chain(artifact.placement().relocations().fixups())
             .copied()
             .collect();
-        let bytes = artifact.into_bytes();
+        let mut bytes = artifact.into_bytes();
+        let offset = PeFile::parse(&bytes)
+            .expect("embedded PE")
+            .rva_to_offset(original)
+            .expect("embedded original bytes")
+            .get() as usize;
+        assert_eq!(&bytes[offset..offset + 7], code);
+        // Only this pinned leaf fixture is redirected; arbitrary functions need selection and unwind
+        let displacement = i32::try_from(i64::from(entry.get()) - i64::from(original.get()) - 5)
+            .expect("gate within rel32 reach");
+        bytes[offset..offset + 6].fill(0x90);
+        bytes[offset] = 0xe9;
+        bytes[offset + 1..offset + 5].copy_from_slice(&displacement.to_le_bytes());
+        refresh_checksum(&mut bytes);
+        let jump = Decoder::with_ip(
+            64,
+            &bytes[offset..offset + 6],
+            u64::from(original.get()),
+            DecoderOptions::NONE,
+        )
+        .decode();
+        assert_eq!(jump.code(), Code::Jmp_rel32_64);
+        assert_eq!(jump.near_branch_target(), u64::from(entry.get()));
         let pe = PeFile::parse(&bytes).expect("serialized PE");
         let serialized_fixups = pe
             .base_relocations
@@ -186,14 +216,22 @@ fn windows_loader_rebases_and_executes_serialized_vm() {
                 );
             } else {
                 assert!(mismatches.is_empty());
+                assert_eq!(
+                    loaded.qword(original),
+                    u64::from_le_bytes(
+                        bytes[offset..offset + 8]
+                            .try_into()
+                            .expect("loaded entry bytes")
+                    )
+                );
                 for (lhs, rhs, result, flags) in [
                     (0, 0, 0, 0x246),
                     (1, 2, 3, 0x206),
                     (u64::MAX, 1, 0, 0x257),
                     (i64::MAX as u64, 1, 1 << 63, 0xa96),
                 ] {
-                    let native = loaded.snapshot(original, lhs, rhs);
-                    let vm = loaded.snapshot(entry, lhs, rhs);
+                    let native = reference.snapshot(original, lhs, rhs);
+                    let vm = loaded.snapshot(original, lhs, rhs);
                     assert_eq!(vm[..16], native[..16], "GPRs and flags after RET");
                     assert_eq!(vm[0], result);
                     assert_eq!(vm[15], flags);
