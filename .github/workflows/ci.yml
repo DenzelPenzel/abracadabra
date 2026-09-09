@@ -108,6 +108,14 @@ jobs:
           Copy-Item target/i686-pc-windows-msvc/release/pe-loader-probe.exe ci-fixtures/probe-i386.exe
           Get-ChildItem ci-fixtures
 
+      - name: Build VM loader DLL
+        shell: cmd
+        run: |
+          ml64 /nologo /c /Foci-fixtures\vm-loader-probe.obj crates\vmp-emit\tests\fixtures\vm_loader_probe.asm || exit /b 1
+          link /nologo /dll /noentry /machine:x64 /dynamicbase /fixed:no /base:0x180000000 /export:VmOriginal /export:RelocationAnchor,DATA /out:ci-fixtures\vm-loader-probe.dll ci-fixtures\vm-loader-probe.obj || exit /b 1
+          dumpbin /headers ci-fixtures\vm-loader-probe.dll || exit /b 1
+          echo VMP_VM_DLL_PROBE=%GITHUB_WORKSPACE%\ci-fixtures\vm-loader-probe.dll>>%GITHUB_ENV%
+
       - name: Build SDK execution probes
         shell: cmd
         run: |
@@ -130,6 +138,19 @@ jobs:
         env:
           VMP_CORPUS_DIR: ${{ github.workspace }}/ci-fixtures
         run: cargo test --workspace --all-targets
+
+      - name: Serialized VM Windows loader execution gate
+        timeout-minutes: 10
+        run: |
+          $env:CARGO_TERM_COLOR = "never"
+          foreach ($profile in @("debug", "release")) {
+            $profileArgs = @()
+            if ($profile -eq "release") { $profileArgs += "--release" }
+            cargo test -p vmp-emit --test windows_vm @profileArgs -- --nocapture 2>&1 | Tee-Object -Variable output
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $summaries = @($output | Where-Object { $_ -match '^test result: ok[.] 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in [0-9]+([.][0-9]+)?s$' })
+            if ($summaries.Count -ne 1) { throw "Windows VM loader gate did not execute exactly one passing test" }
+          }
 
       - name: Current raw-stack ADD and SHL gate
         timeout-minutes: 10
