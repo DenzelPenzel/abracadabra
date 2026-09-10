@@ -11,6 +11,7 @@ static unsigned char *fault_pc, *handler_pc;
 static unsigned char handler_byte;
 static DWORD64 expected_rip, observed_frame, observed_native_rsp;
 static unsigned fault_seen, handler_seen;
+static DWORD frame_bias;
 
 static void require(int condition, const char *message)
 {
@@ -32,7 +33,7 @@ static LONG CALLBACK observe(EXCEPTION_POINTERS *exception)
         exception->ExceptionRecord->ExceptionAddress == fault_pc) {
         NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
         require(fault_seen == 0, "fault must be delivered once");
-        observed_frame = context->Rsp;
+        observed_frame = context->Rsp + frame_bias;
         require(observed_frame >= (DWORD64)tib->StackLimit &&
                 observed_frame + 256 < (DWORD64)tib->StackBase, "native thread stack frame");
         require(*(DWORD64 *)(observed_frame + 192) == expected_rip, "live shadow RIP");
@@ -101,7 +102,9 @@ int main(int argc, char **argv)
     void *image, *observer;
     FILE *file = NULL;
     PRUNTIME_FUNCTION table;
-    require(argc == 14, "arguments");
+    require(argc == 14 || argc == 15, "arguments");
+    frame_bias = argc == 15 ? (DWORD)strtoul(argv[14], NULL, 10) : 0;
+    require(frame_bias == 0 || frame_bias == 8, "frame bias");
     base = _strtoui64(argv[2], NULL, 10);
     size = (SIZE_T)_strtoui64(argv[3], NULL, 10);
     entry = _strtoui64(argv[4], NULL, 10);

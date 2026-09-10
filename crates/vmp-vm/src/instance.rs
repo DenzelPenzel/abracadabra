@@ -46,6 +46,7 @@ pub struct BodyInstance {
     stream: Range<usize>,
     table: usize,
     handlers: [usize; 3],
+    flags_pop: Range<usize>,
     opcodes: [u8; 3],
     variant: u8,
     initial_key: Option<u64>,
@@ -117,7 +118,10 @@ impl BodyInstance {
         let add = image.len();
         image.extend_from_slice(&[0x48, 0x8b, 0x45, 0]);
         image.extend_from_slice(&[0x48, 0x03, 0x45, 8]); // add rax, [rbp + 8]
-        image.extend_from_slice(&[0x48, 0x89, 0x45, 8, 0x9c, 0x8f, 0x45, 0]);
+        image.extend_from_slice(&[0x48, 0x89, 0x45, 8, 0x9c]);
+        let flags_pop_start = image.len();
+        image.extend_from_slice(&[0x8f, 0x45, 0]);
+        let flags_pop = flags_pop_start..image.len();
         jump_dispatch(&mut image);
         while image.len() % 8 != 0 {
             image.push(0xcc);
@@ -189,6 +193,7 @@ impl BodyInstance {
             stream: start..end,
             table,
             handlers,
+            flags_pop,
             opcodes,
             variant,
             initial_key,

@@ -12,7 +12,7 @@ from snapshot import REGS, STACK, STACK_SIZE, SP, STOP, UNWIND
 BASE, PLACEMENT = 0x140000000, 0x2000
 
 
-def check(image, entry, fault):
+def check(image, entry, fault, bias):
     for lhs, rhs in ((1, 2), (0, 0), (0xffffffffffffffff, 1)):
         for stop in (STOP, fault):
             uc = Uc(UC_ARCH_X86, UC_MODE_64)
@@ -34,7 +34,7 @@ def check(image, entry, fault):
                 assert uc.reg_read(REGS['rax']) == (lhs + rhs) & 0xffffffffffffffff
                 assert uc.reg_read(REGS['rsp']) == SP + 8
             else:
-                frame = uc.reg_read(REGS['rsp'])
+                frame = uc.reg_read(REGS['rsp']) + bias
                 assert struct.unpack('<6Q', uc.mem_read(frame + 192, 48)) == (
                     BASE + 0x1000, SP, 0x1122000000000606, 0x1122000000000404,
                     0x1122000000000505, 0x1122000000000101)
@@ -47,9 +47,11 @@ def main():
     out = Path('target/rust-leaf-unwind')
     out.mkdir(parents=True, exist_ok=True)
     results = []
-    for row in instances:
+    for row, site in ((row, site) for row in instances for site in ('add', 'flags-pop')):
         code = bytes(row['image'])
-        assert bytes(row['codes']) == UNWIND
+        shifted_codes = bytearray(UNWIND)
+        shifted_codes[6] = 27
+        assert list(map(bytes, row['codes'])) == [UNWIND, bytes(shifted_codes), UNWIND]
         image = bytearray(65536)
         image[0x1000:0x1007] = bytes.fromhex('4889c84801d0c3')
         image[PLACEMENT:PLACEMENT + len(code)] = code
@@ -57,18 +59,29 @@ def main():
         image[0x8100:0x8110] = UNWIND
         struct.pack_into('<II', image, 0x8110, PLACEMENT + row['handler'][0], 0)
         image[0x8120:0x8124] = bytes.fromhex('01000000')
+        image[0x8140:0x8150] = bytes(row['codes'][1])
+        struct.pack_into('<II', image, 0x8150, PLACEMENT + row['shifted_handler'], 0)
         ranges = [(0x1000, 0x1007, 0x8120),
-                  (PLACEMENT + row['processor'][0], PLACEMENT + row['processor'][1], 0x8100),
                   (PLACEMENT + row['empty'], PLACEMENT + row['empty'] + 1, 0x8120),
                   (PLACEMENT + row['handler'][0], PLACEMENT + row['handler'][1], 0x8120)]
+        ranges.extend((PLACEMENT + start, PLACEMENT + end, 0x8140 if index == 1 else 0x8100)
+                      for index, (start, end) in enumerate(row['processor']))
         for index, record in enumerate(sorted(ranges)):
             struct.pack_into('<III', image, 0x8000 + index * 12, *record)
         signature = bytes.fromhex('48034508')
         assert code.count(signature) == 1
         fault = BASE + PLACEMENT + code.index(signature)
         entry = BASE + PLACEMENT + row['entry']
-        check(bytes(image), entry, fault)
-        path = out / f"{row['variant']}.image"
+        # The flags transfer also belongs to the advertised processor range
+        flags_transfer = bytes.fromhex('9c8f4500')
+        assert code.count(flags_transfer) == 1
+        flags_pop = code.index(flags_transfer) + 1
+        assert row['processor'][1] == [flags_pop, flags_pop + 3]
+        bias = 8 if site == 'flags-pop' else 0
+        if bias:
+            fault = BASE + PLACEMENT + flags_pop
+        check(bytes(image), entry, fault, bias)
+        path = out / f"{row['variant']}-{site}.image"
         path.write_bytes(image)
         if len(sys.argv) == 1:
             continue
@@ -78,7 +91,8 @@ def main():
             for mode in ('normal', 'fault', 'no-handler'):
                 args = [executable, str(path.resolve())] + [str(n) for n in (
                     BASE, len(image), entry, 0x8000, len(ranges), fault,
-                    BASE + PLACEMENT + row['handler'][0], BASE + 0x1000, 0x8100, lhs, rhs)] + [mode]
+                    BASE + PLACEMENT + row['handler'][0], BASE + 0x1000,
+                    0x8140 if bias else 0x8100, lhs, rhs)] + [mode, str(bias)]
                 result = subprocess.run(args, capture_output=True, text=True, timeout=30)
                 print(row['variant'], lhs, rhs, mode, result.returncode, result.stdout, result.stderr, flush=True)
                 if mode == 'no-handler':
@@ -89,14 +103,14 @@ def main():
                     assert result.returncode == 0 and expected in result.stdout
                     if mode == 'fault':
                         assert 'FAULT:' in result.stdout and 'HANDLER:' in result.stdout
-                results.append({'variant': row['variant'], 'lhs': lhs, 'rhs': rhs, 'mode': mode,
+                results.append({'variant': row['variant'], 'site': site, 'lhs': lhs, 'rhs': rhs, 'mode': mode,
                                 'exit': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr})
     if len(sys.argv) > 1:
-        assert len(results) == 36
+        assert len(results) == 72
         (out / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
-        print('PASS: 12 Rust native returns; 12 exception dispatches; 12 removed-handler negatives')
+        print('PASS: 24 Rust native returns; 24 exception dispatches; 24 removed-handler negatives')
     else:
-        print('PASS: 4 Rust leaf layouts; 12 normal executions and 12 live shadow checkpoints')
+        print('PASS: 4 Rust leaf layouts; 24 normal executions and 24 live shadow checkpoints')
 
 
 if __name__ == '__main__':

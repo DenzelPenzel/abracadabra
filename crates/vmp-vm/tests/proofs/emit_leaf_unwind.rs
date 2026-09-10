@@ -22,9 +22,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let instance =
             NativeInstance::generate_leaf_unwind(&bodies, VirtualAddress(0x140002000), variant)?;
         let u = instance.unwind().expect("leaf metadata");
-        println!("{{\"variant\":{},\"image\":{:?},\"entry\":{},\"processor\":[{},{}],\"handler\":[{},{}],\"empty\":{},\"codes\":{:?}}}",
-            variant, instance.image(), instance.entry_offset(), u.processor.start, u.processor.end,
-            u.handler.start, u.handler.end, u.empty_ret, u.codes);
+        println!("{{\"variant\":{},\"image\":{:?},\"entry\":{},\"processor\":{:?},\"handler\":[{},{}],\"shifted_handler\":{},\"empty\":{},\"codes\":{:?}}}",
+            variant, instance.image(), instance.entry_offset(), u.processor.each_ref().map(|r| [r.start, r.end]),
+            u.handler.start, u.handler.end, u.shifted_handler, u.empty_ret, u.codes);
     }
     Ok(())
 }

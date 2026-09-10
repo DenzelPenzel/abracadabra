@@ -5,14 +5,16 @@ use super::{relative, BodyInstance};
 
 /// Image-relative body and callback ranges, excluding gate entry and exit
 ///
-/// `codes` is the processor UNWIND_INFO prefix; placement appends the handler RVA
+/// `codes` holds the UNWIND_INFO prefixes for the three disjoint processor ranges
+/// Placement appends `shifted_handler` for the middle range and `handler.start` otherwise
 /// The handler and empty-RET ranges use an empty version-1 UNWIND_INFO
 #[derive(Debug)]
 pub struct LeafUnwind {
-    pub processor: Range<usize>,
+    pub processor: [Range<usize>; 3],
     pub handler: Range<usize>,
+    pub shifted_handler: usize,
     pub empty_ret: usize,
-    pub codes: [u8; 16],
+    pub codes: [[u8; 16]; 3],
 }
 
 pub(super) fn shadows(body: &mut BodyInstance, native_rip: u64) -> usize {
@@ -66,10 +68,22 @@ pub(super) fn handler(body: &mut BodyInstance) -> LeafUnwind {
     image.extend_from_slice(&[0x48, 0x8b, 0]);
     image.extend_from_slice(&[0x48, 0x89, 0x81, 0xf8, 0, 0, 0]);
     image.extend_from_slice(&[0xb8, 1, 0, 0, 0, 0xc3]);
+    let shifted_handler = image.len();
+    // Normalize the establisher frame while the flags value occupies one native stack slot
+    image.extend_from_slice(&[0x48, 0x83, 0xc2, 8, 0xe9]);
+    relative(image, start as i32);
+    let codes = [9, 0, 6, 0, 5, 1, 26, 0, 4, 0x50, 3, 0x60, 2, 0x70, 1, 0x30];
+    let mut shifted_codes = codes;
+    shifted_codes[6] = 27;
     LeafUnwind {
-        processor: 0..body.table,
+        processor: [
+            0..body.flags_pop.start,
+            body.flags_pop.clone(),
+            body.flags_pop.end..body.table,
+        ],
         handler: start..image.len(),
+        shifted_handler,
         empty_ret,
-        codes: [9, 0, 6, 0, 5, 1, 26, 0, 4, 0x50, 3, 0x60, 2, 0x70, 1, 0x30],
+        codes: [codes, shifted_codes, codes],
     }
 }
