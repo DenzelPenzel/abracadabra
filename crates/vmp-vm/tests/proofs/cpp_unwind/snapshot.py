@@ -1,4 +1,7 @@
 """Bounded C++ artifact replay; snapshots are not native Windows execution."""
+if not __debug__:
+    raise RuntimeError('optimized Python is unsupported: proof assertions are required')
+
 from pathlib import Path
 import hashlib
 import json
@@ -66,6 +69,15 @@ def replay(data, lhs, rhs, count=100000):
                  count=count, timeout=10000000)
     assert len(instructions) == count or uc.reg_read(REGS['rip']) == STOP
     return uc, events
+
+
+def verified_image(pe, uc):
+    size = pe.OPTIONAL_HEADER.SizeOfImage
+    expected = pe.get_memory_mapped_image()
+    assert len(expected) <= size
+    image = bytes(uc.mem_read(pe.OPTIONAL_HEADER.ImageBase, size))
+    assert image == expected.ljust(size, b'\x00'), 'live image changed during replay'
+    return image
 
 
 def snapshots():

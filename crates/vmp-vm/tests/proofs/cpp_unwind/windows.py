@@ -11,7 +11,7 @@ from pathlib import Path
 import struct
 
 import pefile
-from snapshot import STACK, STACK_SIZE, REGS, UNWIND, snapshots
+from snapshot import STACK, STACK_SIZE, REGS, UNWIND, snapshots, verified_image
 
 
 def main():
@@ -55,7 +55,7 @@ def main():
             mapped = True
             stack = alloc(STACK, STACK_SIZE, 0x3000, 4)
             assert stack == STACK, ('exact snapshot stack mapping required', c.get_last_error())
-            image = pe.get_memory_mapped_image()
+            image = verified_image(pe, uc)
             c.memmove(base, image, len(image))
             stack_bytes = bytes(uc.mem_read(STACK, STACK_SIZE))
             c.memmove(STACK, stack_bytes, len(stack_bytes))
