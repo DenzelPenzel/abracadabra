@@ -26,7 +26,7 @@ fn leaf_handler_uses_cpp_shadow_layout_and_reports_native_rip_fixup() {
         assert!(unwind.handler.start > instance.entry_offset());
         assert_eq!(
             unwind.codes[0],
-            [0x09, 0, 6, 0, 5, 1, 26, 0, 4, 0x50, 3, 0x60, 2, 0x70, 1, 0x30]
+            [0x09, 0, 6, 0, 0, 1, 26, 0, 0, 0x50, 0, 0x60, 0, 0x70, 0, 0x30]
         );
         assert_eq!(unwind.codes[2], unwind.codes[0]);
         let mut shifted = unwind.codes[0];

@@ -72,7 +72,8 @@ pub(super) fn handler(body: &mut BodyInstance) -> LeafUnwind {
     // Normalize the establisher frame while the flags value occupies one native stack slot
     image.extend_from_slice(&[0x48, 0x83, 0xc2, 8, 0xe9]);
     relative(image, start as i32);
-    let codes = [9, 0, 6, 0, 5, 1, 26, 0, 4, 0x50, 3, 0x60, 2, 0x70, 1, 0x30];
+    // Every range starts in a fully established body frame, including its first instruction
+    let codes = [9, 0, 6, 0, 0, 1, 26, 0, 0, 0x50, 0, 0x60, 0, 0x70, 0, 0x30];
     let mut shifted_codes = codes;
     shifted_codes[6] = 27;
     LeafUnwind {

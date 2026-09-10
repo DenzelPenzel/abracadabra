@@ -47,16 +47,19 @@ def main():
     out = Path('target/rust-leaf-unwind')
     out.mkdir(parents=True, exist_ok=True)
     results = []
-    for row, site in ((row, site) for row in instances for site in ('add', 'flags-pop')):
+    for row, site in ((row, site) for row in instances for site in ('add', 'flags-pop', 'after-pop')):
         code = bytes(row['image'])
-        shifted_codes = bytearray(UNWIND)
+        body_codes = bytearray(UNWIND)
+        for offset in (4, 8, 10, 12, 14):
+            body_codes[offset] = 0
+        shifted_codes = bytearray(body_codes)
         shifted_codes[6] = 27
-        assert list(map(bytes, row['codes'])) == [UNWIND, bytes(shifted_codes), UNWIND]
+        assert list(map(bytes, row['codes'])) == [bytes(body_codes), bytes(shifted_codes), bytes(body_codes)]
         image = bytearray(65536)
         image[0x1000:0x1007] = bytes.fromhex('4889c84801d0c3')
         image[PLACEMENT:PLACEMENT + len(code)] = code
-        # Test-only serialization independently pins the C++ metadata contract
-        image[0x8100:0x8110] = UNWIND
+        # Body-only ranges have no partially executed prologue at their beginning
+        image[0x8100:0x8110] = body_codes
         struct.pack_into('<II', image, 0x8110, PLACEMENT + row['handler'][0], 0)
         image[0x8120:0x8124] = bytes.fromhex('01000000')
         image[0x8140:0x8150] = bytes(row['codes'][1])
@@ -80,6 +83,8 @@ def main():
         bias = 8 if site == 'flags-pop' else 0
         if bias:
             fault = BASE + PLACEMENT + flags_pop
+        elif site == 'after-pop':
+            fault = BASE + PLACEMENT + flags_pop + 3
         check(bytes(image), entry, fault, bias)
         path = out / f"{row['variant']}-{site}.image"
         path.write_bytes(image)
@@ -106,11 +111,11 @@ def main():
                 results.append({'variant': row['variant'], 'site': site, 'lhs': lhs, 'rhs': rhs, 'mode': mode,
                                 'exit': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr})
     if len(sys.argv) > 1:
-        assert len(results) == 72
+        assert len(results) == 108
         (out / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
-        print('PASS: 24 Rust native returns; 24 exception dispatches; 24 removed-handler negatives')
+        print('PASS: 36 Rust native returns; 36 exception dispatches; 36 removed-handler negatives')
     else:
-        print('PASS: 4 Rust leaf layouts; 24 normal executions and 24 live shadow checkpoints')
+        print('PASS: 4 Rust leaf layouts; 36 normal executions and 36 live shadow checkpoints')
 
 
 if __name__ == '__main__':
