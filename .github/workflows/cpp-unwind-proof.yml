@@ -1,0 +1,39 @@
+name: C++ Windows unwind proof
+
+on:
+  push:
+    branches: [test/cpp-windows-unwind-proof]
+  pull_request:
+    paths:
+      - crates/vmp-vm/tests/proofs/cpp_unwind/**
+      - .github/workflows/cpp-unwind-proof.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-unwind:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: x64
+      - name: Install pinned proof dependencies
+        run: python -m pip install unicorn==2.1.4 pefile==2024.8.26
+      - name: Execute Windows metadata and callback proof
+        run: |
+          python crates/vmp-vm/tests/proofs/cpp_unwind/windows.py 2>&1 | Tee-Object -Variable output
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $passed = @($output | Where-Object { $_ -eq 'PASS: 30 Windows metadata/handler walks; 30 removed-table lookup negatives' })
+          if ($passed.Count -ne 1) { throw "Windows unwind proof did not execute exactly 30 cases" }
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: cpp-windows-unwind-results
+          path: cpp-windows-unwind-results.json
+          if-no-files-found: warn
+          retention-days: 7
