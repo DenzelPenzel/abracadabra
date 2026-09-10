@@ -82,7 +82,8 @@ def main():
                     assert result.returncode == 0 and 'PASS: native exception dispatch' in result.stdout
                     assert 'FAULT:' in result.stdout and 'HANDLER:' in result.stdout
                 else:
-                    assert result.returncode != 0 and 'FAULT:' in result.stdout
+                    assert result.returncode == 3221225501 and 'FAULT:' in result.stdout
+                    assert not result.stderr, 'negative must be an unhandled illegal instruction, not a harness error'
                     assert 'HANDLER:' not in result.stdout and 'PASS:' not in result.stdout
                 reports.append({'variant': row['variant'], 'lhs': lhs, 'rhs': rhs, 'mode': mode,
                                 'exit': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr})
