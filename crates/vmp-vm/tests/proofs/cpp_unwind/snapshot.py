@@ -40,7 +40,7 @@ def artifacts():
     return result, original.OPTIONAL_HEADER.ImageBase + entry.BeginAddress
 
 
-def replay(data, lhs, rhs, count=100000):
+def replay(data, lhs, rhs, count=100000, trace=None):
     pe = pefile.PE(data=data)
     base = pe.OPTIONAL_HEADER.ImageBase
     uc = Uc(UC_ARCH_X86, UC_MODE_64)
@@ -58,6 +58,8 @@ def replay(data, lhs, rhs, count=100000):
     instructions, events = [], []
     def code(machine, pc, size, _):
         instructions.append((pc, size))
+        if trace is not None:
+            trace.append((pc, size))
     def write(machine, access, address, size, value, _):
         rsp = machine.reg_read(REGS['rsp'])
         if size == 8 and address - rsp in (192, 200, 208, 216, 224, 232):

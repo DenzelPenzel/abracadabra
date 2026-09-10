@@ -18,6 +18,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -32,10 +33,19 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $passed = @($output | Where-Object { $_ -eq 'PASS: 30 Windows metadata/handler walks; 30 removed-table lookup negatives' })
           if ($passed.Count -ne 1) { throw "Windows unwind proof did not execute exactly 30 cases" }
+      - name: Build native exception probe
+        shell: cmd
+        run: cl /nologo /W4 /WX /Od crates\vmp-vm\tests\proofs\cpp_unwind\native_dispatch.c /Fe:native-dispatch.exe /Fo:native-dispatch.obj /link /dynamicbase /base:0x180000000
+      - name: Execute native exception dispatch
+        run: |
+          python crates/vmp-vm/tests/proofs/cpp_unwind/native_dispatch.py native-dispatch.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
         with:
           name: cpp-windows-unwind-results
-          path: cpp-windows-unwind-results.json
+          path: |
+            cpp-windows-unwind-results.json
+            target/cpp-native-dispatch/*.json
           if-no-files-found: warn
           retention-days: 7
