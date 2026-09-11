@@ -19,3 +19,7 @@ workspace = true
 [[example]]
 name = "emit_vm_pe"
 path = "tests/proofs/emit_vm_pe.rs"
+
+[[example]]
+name = "emit_leaf_pe"
+path = "tests/proofs/emit_leaf_pe.rs"

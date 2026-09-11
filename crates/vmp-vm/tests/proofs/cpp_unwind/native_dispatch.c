@@ -98,12 +98,15 @@ int main(int argc, char **argv)
     SIZE_T size;
     DWORD pdata, count, unwind_rva, old;
     uint64_t lhs, rhs;
-    int normal, negative;
+    int normal, negative, loader;
+    void *reservation = NULL;
     void *image, *observer;
     FILE *file = NULL;
     PRUNTIME_FUNCTION table;
-    require(argc == 14 || argc == 15, "arguments");
-    frame_bias = argc == 15 ? (DWORD)strtoul(argv[14], NULL, 10) : 0;
+    require(argc == 14 || argc == 15 || argc == 16, "arguments");
+    loader = argc == 16;
+    require(!loader || strcmp(argv[15], "pe") == 0, "loader mode");
+    frame_bias = argc >= 15 ? (DWORD)strtoul(argv[14], NULL, 10) : 0;
     require(frame_bias == 0 || frame_bias == 8, "frame bias");
     base = _strtoui64(argv[2], NULL, 10);
     size = (SIZE_T)_strtoui64(argv[3], NULL, 10);
@@ -123,11 +126,29 @@ int main(int argc, char **argv)
             unwind_rva < size && entry >= base && entry - base < size &&
             (DWORD64)fault_pc >= base && (DWORD64)fault_pc - base + 2 <= size &&
             (DWORD64)handler_pc >= base && (DWORD64)handler_pc - base < size, "image ranges");
+    if (loader) {
+        DWORD64 loaded_base = 0, delta;
+        PRUNTIME_FUNCTION found;
+        reservation = VirtualAlloc((void *)base, size, MEM_RESERVE, PAGE_NOACCESS);
+        image = (void *)LoadLibraryA(argv[1]);
+        require(image != NULL && (DWORD64)image != base, "loader must rebase the DLL");
+        delta = (DWORD64)image - base;
+        base = (DWORD64)image;
+        entry += delta;
+        fault_pc = (unsigned char *)((DWORD64)fault_pc + delta);
+        handler_pc = (unsigned char *)((DWORD64)handler_pc + delta);
+        expected_rip += delta;
+        found = RtlLookupFunctionEntry((DWORD64)fault_pc, &loaded_base, NULL);
+        require(found != NULL && loaded_base == base && found->UnwindData == unwind_rva,
+                "loader registered persisted exception directory");
+        require(VirtualProtect(image, size, PAGE_READWRITE, &old) != 0, "loaded image writable");
+    } else {
     image = VirtualAlloc((void *)base, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     require(image == (void *)base, "exact image allocation");
     require(fopen_s(&file, argv[1], "rb") == 0 && file != NULL, "image open");
     require(fread(image, 1, size, file) == size && fgetc(file) == EOF, "image length");
     require(fclose(file) == 0, "image close");
+    }
     if (!normal) {
         fault_pc[0] = 0x0f;
         fault_pc[1] = 0x0b;
@@ -141,14 +162,21 @@ int main(int argc, char **argv)
     require(VirtualProtect(image, size, PAGE_EXECUTE_READ, &old) != 0, "image executable");
     require(FlushInstructionCache(GetCurrentProcess(), image, size) != 0, "image cache");
     table = (PRUNTIME_FUNCTION)(base + pdata);
-    require(RtlAddFunctionTable(table, count, base) != 0, "register table");
+    if (!loader)
+        require(RtlAddFunctionTable(table, count, base) != 0, "register table");
     owner_thread = GetCurrentThreadId();
     observer = AddVectoredExceptionHandler(1, observe);
     require(observer != NULL, "install observer");
     invoke(entry, lhs, rhs, normal);
     require(RemoveVectoredExceptionHandler(observer) != 0, "remove observer");
-    require(RtlDeleteFunctionTable(table) != 0, "delete table");
-    require(VirtualFree(image, 0, MEM_RELEASE) != 0, "release image");
+    if (loader) {
+        require(FreeLibrary((HMODULE)image) != 0, "unload image");
+        if (reservation != NULL)
+            require(VirtualFree(reservation, 0, MEM_RELEASE) != 0, "release reservation");
+    } else {
+        require(RtlDeleteFunctionTable(table) != 0, "delete table");
+        require(VirtualFree(image, 0, MEM_RELEASE) != 0, "release image");
+    }
     puts(normal ? "PASS: native normal return" : "PASS: native exception dispatch");
     return 0;
 }

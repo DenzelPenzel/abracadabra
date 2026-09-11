@@ -1,7 +1,7 @@
 //! Places a captured encrypted scalar instance and translates its absolute fields to PE RVAs
 
 use thiserror::Error;
-use vmp_pe::{BaseRelocations, Fixup, FixupKind, NewSection, PeError, PeImage};
+use vmp_pe::{BaseRelocations, Fixup, FixupKind, NewSection, PeError, PeImage, RuntimeFunction};
 use vmp_types::{Architecture, ImageBase, Rva};
 use vmp_vm::{
     instance::{InstanceError, NativeInstance},
@@ -24,6 +24,10 @@ pub enum VmPlacementError {
 
 #[derive(Debug, Error)]
 pub enum VmEmbeddingError {
+    #[error(
+        "leaf source must match executable PE bytes, end in RET and have no existing runtime entry"
+    )]
+    LeafSource,
     #[error("VM section embedding requires an x64 PE")]
     Architecture,
     #[error(transparent)]
@@ -62,26 +66,91 @@ pub fn append_vm_instance(
     bodies: &[LogicalInstruction<'_>],
     variant: u8,
 ) -> Result<VmPeArtifact, VmEmbeddingError> {
+    append_instance(data, bodies, variant, false)
+}
+
+/// Appends an encrypted scalar leaf with persisted body exception metadata
+///
+/// The native leaf must remain at its original VA; entry/exit gates are not unwindable
+/// This does not redirect the original entry or enable CLI virtualization
+pub fn append_leaf_vm_instance(
+    data: Vec<u8>,
+    bodies: &[LogicalInstruction<'_>],
+    variant: u8,
+) -> Result<VmPeArtifact, VmEmbeddingError> {
+    append_instance(data, bodies, variant, true)
+}
+
+fn append_instance(
+    data: Vec<u8>,
+    bodies: &[LogicalInstruction<'_>],
+    variant: u8,
+    leaf: bool,
+) -> Result<VmPeArtifact, VmEmbeddingError> {
     let mut image = PeImage::from_bytes(data)?;
     match image.pe().architecture {
         Architecture::X64 => {}
         Architecture::X86 => return Err(VmEmbeddingError::Architecture),
     }
+    if leaf {
+        for body in bodies {
+            let source = body.source();
+            let source_rva = source.rva().ok_or(VmEmbeddingError::LeafSource)?;
+            if source_rva
+                .to_va(image.pe().optional.image_base)
+                .map(|a| a.0)
+                != Some(source.raw().ip())
+                || image
+                    .pe()
+                    .mapped_range(image.bytes(), source_rva, source.raw().len() as u32)?
+                    != source.bytes()
+                || !image.pe().sections.iter().any(|s| {
+                    s.characteristics & 0x2000_0000 != 0
+                        && source_rva.get() >= s.virtual_address.get()
+                        && u64::from(source_rva.get()) + source.raw().len() as u64
+                            <= u64::from(s.virtual_address.get()) + u64::from(s.virtual_size)
+                })
+            {
+                return Err(VmEmbeddingError::LeafSource);
+            }
+            if image.pe().exception_table.as_ref().is_some_and(|table| {
+                table.entries().iter().any(|entry| {
+                    u64::from(source_rva.get()) < u64::from(entry.function.end.get())
+                        && u64::from(source_rva.get()) + source.raw().len() as u64
+                            > u64::from(entry.function.begin.get())
+                })
+            }) {
+                return Err(VmEmbeddingError::LeafSource);
+            }
+        }
+        let last = bodies.last().ok_or(VmEmbeddingError::LeafSource)?.source();
+        let ret = last
+            .rva()
+            .and_then(|r| r.checked_add(last.raw().len() as u32))
+            .ok_or(VmEmbeddingError::LeafSource)?;
+        if image.pe().mapped_range(image.bytes(), ret, 1)? != [0xc3] {
+            return Err(VmEmbeddingError::LeafSource);
+        }
+    }
     let rva = image.next_section_rva()?;
-    let placement = VmPlacement::generate(bodies, image.pe().optional.image_base, rva, variant)?;
+    let placement = VmPlacement::build(bodies, image.pe().optional.image_base, rva, variant, leaf)?;
     image.add_section(NewSection {
         name: ".vmpvm",
         data: placement.image(),
         characteristics: 0x6000_0020,
     })?;
     image.extend_base_relocations(".vmprel", placement.relocations().fixups())?;
+    if leaf {
+        image.extend_exception_references(".vmpexc", &placement.functions)?;
+    }
     Ok(VmPeArtifact { image, placement })
 }
 
 /// Coupled bytes, entry RVA and base relocations for one placed scalar VM
 #[derive(Debug)]
 pub struct VmPlacement {
-    instance: NativeInstance,
+    image: Vec<u8>,
+    functions: Vec<RuntimeFunction>,
     rva: Rva,
     entry: Rva,
     relocations: BaseRelocations,
@@ -99,13 +168,27 @@ impl VmPlacement {
         rva: Rva,
         variant: u8,
     ) -> Result<Self, VmPlacementError> {
+        Self::build(bodies, image_base, rva, variant, false)
+    }
+
+    fn build(
+        bodies: &[LogicalInstruction<'_>],
+        image_base: ImageBase,
+        rva: Rva,
+        variant: u8,
+        leaf: bool,
+    ) -> Result<Self, VmPlacementError> {
         if image_base.0 & 0xffff != 0 {
             return Err(VmPlacementError::ImageBaseAlignment);
         }
         let address = rva
             .to_va(image_base)
             .ok_or(VmPlacementError::AddressOverflow)?;
-        let instance = NativeInstance::generate_encrypted(bodies, address, variant)?;
+        let instance = if leaf {
+            NativeInstance::generate_leaf_unwind(bodies, address, variant)?
+        } else {
+            NativeInstance::generate_encrypted(bodies, address, variant)?
+        };
         let at = |offset: usize| {
             let offset = u32::try_from(offset).map_err(|_| VmPlacementError::RvaOverflow)?;
             rva.checked_add(offset).ok_or(VmPlacementError::RvaOverflow)
@@ -120,8 +203,46 @@ impl VmPlacement {
                 kind: FixupKind::Dir64,
             })?;
         }
+        let mut image = instance.image().to_vec();
+        let mut functions = Vec::new();
+        if let Some(unwind) = instance.unwind() {
+            while image.len() % 4 != 0 {
+                image.push(0);
+            }
+            for (index, range) in unwind.processor.iter().enumerate() {
+                let unwind_info = at(image.len())?;
+                image.extend_from_slice(&unwind.codes[index]);
+                let handler = if index == 1 {
+                    unwind.shifted_handler
+                } else {
+                    unwind.handler.start
+                };
+                image.extend_from_slice(&at(handler)?.get().to_le_bytes());
+                image.extend_from_slice(&0u32.to_le_bytes());
+                functions.push(RuntimeFunction {
+                    begin: at(range.start)?,
+                    end: at(range.end)?,
+                    unwind_info,
+                });
+            }
+            let unwind_info = at(image.len())?;
+            // Keep the empty code-array address within the mapped section
+            image.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
+            for range in [
+                unwind.empty_ret..unwind.empty_ret + 1,
+                unwind.handler.clone(),
+            ] {
+                functions.push(RuntimeFunction {
+                    begin: at(range.start)?,
+                    end: at(range.end)?,
+                    unwind_info,
+                });
+            }
+        }
+        at(image.len())?;
         Ok(Self {
-            instance,
+            image,
+            functions,
             rva,
             entry,
             relocations,
@@ -129,7 +250,7 @@ impl VmPlacement {
     }
 
     pub fn image(&self) -> &[u8] {
-        self.instance.image()
+        &self.image
     }
 
     pub fn rva(&self) -> Rva {

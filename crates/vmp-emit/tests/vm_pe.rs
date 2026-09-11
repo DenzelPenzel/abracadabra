@@ -8,6 +8,44 @@ use vmp_vm::logical::lower_instruction;
 const X64: &[u8] = include_bytes!("../../vmp-pe/test-corpus/win64-app-msvc-amd64");
 const X86: &[u8] = include_bytes!("../../vmp-pe/test-corpus/win32-app-test1-i386");
 
+#[test]
+fn serialized_leaf_unwind_preserves_original_entries() {
+    let mut image = vmp_pe::PeImage::from_bytes(X64.to_vec()).expect("fixture");
+    let rva = image.next_section_rva().expect("native leaf");
+    let code = [0x48, 0x01, 0xd0, 0xc3];
+    image
+        .add_section(vmp_pe::NewSection {
+            name: ".leaf",
+            data: &code,
+            characteristics: 0x6000_0020,
+        })
+        .expect("leaf");
+    let raw = Decoder::with_ip(
+        64,
+        &code[..3],
+        rva.to_va(image.pe().optional.image_base).expect("VA").0,
+        DecoderOptions::NONE,
+    )
+    .decode();
+    let native = Instruction::decoded(rva, raw, &code[..3]);
+    let bodies = [lower_instruction(Architecture::X64, &native).expect("ADD")];
+    let before = image
+        .pe()
+        .exception_table
+        .clone()
+        .expect("original entries");
+    let artifact =
+        vmp_emit::vm::append_leaf_vm_instance(image.into_bytes(), &bodies, 37).expect("embed leaf");
+    let parsed = PeFile::parse(artifact.bytes()).expect("persisted PE");
+    let after = parsed.exception_table.as_ref().expect("merged entries");
+    assert_eq!(&after.entries()[..before.len()], before.entries());
+    assert_eq!(after.len(), before.len() + 5);
+    let added = &after.entries()[before.len()..];
+    assert!(added[..3].iter().all(|e| e.unwind.handler.is_some()));
+    assert_eq!(added[1].unwind.codes[2], 27);
+    assert_eq!(artifact.placement().relocations().len(), 261);
+}
+
 fn native() -> Instruction {
     let bytes = [0x48, 0x01, 0xd0];
     let raw = Decoder::with_ip(64, &bytes, 0x1000, DecoderOptions::NONE).decode();
@@ -69,6 +107,7 @@ fn serialized_vm_preserves_original_image_and_merges_fixups() {
 fn unsupported_images_return_no_partial_artifact() {
     let native = native();
     let bodies = [lower_instruction(Architecture::X64, &native).expect("ADD")];
+    assert!(vmp_emit::vm::append_leaf_vm_instance(X64.to_vec(), &bodies, 0).is_err());
     assert!(matches!(
         append_vm_instance(X86.to_vec(), &bodies, 0),
         Err(VmEmbeddingError::Architecture)
