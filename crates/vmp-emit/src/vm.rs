@@ -242,6 +242,15 @@ impl VmPlacement {
                 end: at(unwind.entry.end)?,
                 unwind_info,
             });
+            for (range, codes) in &unwind.exit {
+                let unwind_info = at(image.len())?;
+                image.extend_from_slice(codes);
+                functions.push(RuntimeFunction {
+                    begin: at(range.start)?,
+                    end: at(range.end)?,
+                    unwind_info,
+                });
+            }
             let unwind_info = at(image.len())?;
             // Keep the empty code-array address within the mapped section
             image.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);

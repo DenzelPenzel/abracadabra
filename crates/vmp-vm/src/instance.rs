@@ -242,8 +242,8 @@ impl BodyInstance {
 /// Captures RFLAGS and all GPRs except RSP before using work registers, and restores
 /// them from the modified context before RET. Only arithmetic flags are promised for ADD
 /// The caller supplies a writable native stack, benign control flags and the original
-/// return address. The leaf-unwind constructor additionally covers body exceptions;
-/// no gate-boundary unwind, SIMD/control-state or PE integration is claimed
+/// return address. The leaf-unwind constructor additionally describes entry, body and exit
+/// SIMD/control-state preservation and PE serialization are outside this generator
 #[derive(Debug)]
 pub struct NativeInstance {
     body: BodyInstance,
@@ -281,7 +281,7 @@ impl NativeInstance {
     /// The source instructions must be the complete contiguous body of a native leaf
     /// with no prologue, stack changes or nonvolatile writes; its RET is not a body
     /// The caller must retain its native address/range for subsequent Windows unwind
-    /// Entry/exit gate instruction boundaries are not covered by this metadata
+    /// Gate metadata tracks partial saves and restores without invoking the body handler
     pub fn generate_leaf_unwind(
         bodies: &[LogicalInstruction<'_>],
         base: VirtualAddress,
@@ -354,10 +354,25 @@ impl NativeInstance {
             body.image.extend_from_slice(&[0x48, 0x89, 0x45, offset]);
         }
         body.image.extend_from_slice(&[0x48, 0x89, 0xec]); // mov rsp, rbp
-        for id in order {
-            saved_register(&mut body.image, id, false);
+        let mut exit_unwind = Vec::new();
+        if native_rip.is_some() {
+            exit_unwind.push((exit..body.image.len(), unwind::exit_codes(&order, true)));
         }
+        for (index, id) in order.into_iter().enumerate() {
+            let start = body.image.len();
+            saved_register(&mut body.image, id, false);
+            if native_rip.is_some() {
+                exit_unwind.push((
+                    start..body.image.len(),
+                    unwind::exit_codes(&order[index..], false),
+                ));
+            }
+        }
+        let ret = body.image.len();
         body.image.push(0xc3);
+        if native_rip.is_some() {
+            exit_unwind.push((ret..body.image.len(), unwind::exit_codes(&[], false)));
+        }
 
         let entry = body.image.len();
         let mut push_offsets = [0; 16];
@@ -402,7 +417,8 @@ impl NativeInstance {
         body.image.extend_from_slice(&[0xff, 0xe0]);
         // Retarget the owned dispatch completion JE, leaving raw-body layout unchanged
         body.image[9..13].copy_from_slice(&(exit as i32 - 13).to_le_bytes());
-        let unwind = native_rip.map(|_| unwind::handler(&mut body, entry, entry_codes));
+        let unwind =
+            native_rip.map(|_| unwind::handler(&mut body, entry, entry_codes, exit_unwind));
         Ok(Self {
             body,
             entry,

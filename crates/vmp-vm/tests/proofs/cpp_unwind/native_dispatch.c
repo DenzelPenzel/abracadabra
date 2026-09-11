@@ -14,6 +14,7 @@ static unsigned fault_seen, handler_seen;
 static DWORD frame_bias;
 static int entry_fault;
 static int exit_fault;
+static int gate_exit;
 static unsigned char fault_bytes[2];
 static int gate_fault;
 
@@ -33,7 +34,7 @@ static LONG CALLBACK observe(EXCEPTION_POINTERS *exception)
     if (GetCurrentThreadId() != owner_thread)
         return EXCEPTION_CONTINUE_SEARCH;
     context = exception->ContextRecord;
-    if (exception->ExceptionRecord->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION &&
+    if (exception->ExceptionRecord->ExceptionCode == (gate_exit ? EXCEPTION_PRIV_INSTRUCTION : EXCEPTION_ILLEGAL_INSTRUCTION) &&
         exception->ExceptionRecord->ExceptionAddress == fault_pc) {
         NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
         require(fault_seen == 0, "fault must be delivered once");
@@ -50,8 +51,8 @@ static LONG CALLBACK observe(EXCEPTION_POINTERS *exception)
         printf("FAULT: pc=%p frame=%llx native_rsp=%llx\n", fault_pc,
                (unsigned long long)observed_frame, (unsigned long long)observed_native_rsp);
         fflush(stdout);
-        if (exit_fault) {
-            /* Unwind must inspect the original POPF and following instruction */
+        if (exit_fault || gate_exit) {
+            /* Unwind must inspect the original exit instructions */
             require(VirtualProtect(fault_pc, 2, PAGE_READWRITE, &old) != 0, "exit writable");
             memcpy(fault_pc, fault_bytes, 2);
             require(VirtualProtect(fault_pc, 2, old, &old) != 0, "exit executable");
@@ -104,7 +105,7 @@ static LONG CALLBACK observe(EXCEPTION_POINTERS *exception)
 
 static int catch_fault(EXCEPTION_POINTERS *exception)
 {
-    require(exception->ExceptionRecord->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION &&
+    require(exception->ExceptionRecord->ExceptionCode == (gate_exit ? EXCEPTION_PRIV_INSTRUCTION : EXCEPTION_ILLEGAL_INSTRUCTION) &&
             exception->ExceptionRecord->ExceptionAddress == fault_pc, "outer catcher sees original fault");
     require(fault_seen == 1 && handler_seen == (gate_fault ? 0u : 1u),
             "expected handler path before outer catcher");
@@ -157,7 +158,8 @@ int main(int argc, char **argv)
     negative = strcmp(argv[13], "no-handler") == 0;
     entry_fault = strcmp(argv[13], "entry-fault") == 0;
     exit_fault = strcmp(argv[13], "exit-fault") == 0;
-    gate_fault = strcmp(argv[13], "gate-fault") == 0;
+    gate_exit = strcmp(argv[13], "gate-exit") == 0;
+    gate_fault = strcmp(argv[13], "gate-fault") == 0 || gate_exit;
     require(normal || negative || entry_fault || exit_fault || gate_fault || strcmp(argv[13], "fault") == 0, "mode");
     require(size && pdata < size && (SIZE_T)count * 12 <= size - pdata &&
             unwind_rva < size && entry >= base && entry - base < size &&
@@ -187,12 +189,14 @@ int main(int argc, char **argv)
     require(fclose(file) == 0, "image close");
     }
     if (!normal) {
-        if (exit_fault) {
-            require(fault_pc[0] == 0x9d, "exit fault replaces POPF");
+        if (exit_fault || gate_exit) {
+            require(!exit_fault || fault_pc[0] == 0x9d, "exit fault replaces POPF");
             memcpy(fault_bytes, fault_pc, 2);
         }
-        fault_pc[0] = 0x0f;
-        fault_pc[1] = 0x0b;
+        /* HLT occupies one byte, so a RET fault cannot corrupt the adjacent entry */
+        fault_pc[0] = gate_exit ? 0xf4 : 0x0f;
+        if (!gate_exit)
+            fault_pc[1] = 0x0b;
         handler_byte = *handler_pc;
         *handler_pc = 0xcc;
         if (negative) {

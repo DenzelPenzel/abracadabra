@@ -47,7 +47,7 @@ fn serialized_leaf_unwind_preserves_original_entries() {
     let parsed = PeFile::parse(artifact.bytes()).expect("persisted PE");
     let after = parsed.exception_table.as_ref().expect("merged entries");
     assert_eq!(&after.entries()[..before.len()], before.entries());
-    assert_eq!(after.len(), before.len() + 6);
+    assert_eq!(after.len(), before.len() + 24);
     let added = &after.entries()[before.len()..];
     assert!(added[..3].iter().all(|e| e.unwind.handler.is_some()));
     assert_eq!(added[1].unwind.codes[2], 27);

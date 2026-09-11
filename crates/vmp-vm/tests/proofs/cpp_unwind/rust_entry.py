@@ -15,7 +15,7 @@ ORDER = ('rax', 'rcx', 'rdx', 'rbx', 'rsp', 'rbp', 'rsi', 'rdi',
 NONVOL = ('rbx', 'rbp', 'rsi', 'rdi', 'r12', 'r13', 'r14', 'r15')
 
 
-def states(row, image):
+def states(row, image, bounds=None):
     uc = Uc(UC_ARCH_X86, UC_MODE_64)
     uc.mem_map(BASE, len(image))
     uc.mem_write(BASE, bytes(image))
@@ -31,18 +31,19 @@ def states(row, image):
     uc.mem_write(SP, struct.pack('<Q', STOP))
     rows = []
     start, end = BASE + PLACEMENT + row['entry'], BASE + PLACEMENT + row['empty']
+    capture_start, capture_end = bounds if bounds else (start, end)
     def capture(machine, pc, size, _):
-        if start <= pc < end:
+        if capture_start <= pc < capture_end:
             rows.append(([machine.reg_read(REGS[name]) for name in ORDER],
                          bytes(machine.mem_read(SP - 4096, 4104))))
     uc.hook_add(UC_HOOK_CODE, capture)
     uc.emu_start(start, STOP, count=100000)
     assert uc.reg_read(REGS['rip']) == STOP
-    assert rows and rows[0][0][-1] == start
+    assert rows and rows[0][0][-1] == capture_start
     return rows, expected
 
 
-def windows(image, snapshots, expected):
+def windows(image, snapshots, expected, records=None):
     kernel, nt = c.WinDLL('kernel32'), c.WinDLL('ntdll')
     ptr, u64, u32 = c.c_void_p, c.c_uint64, c.c_uint32
     alloc = kernel.VirtualAlloc
@@ -61,18 +62,25 @@ def windows(image, snapshots, expected):
         c.memmove(BASE, bytes(image), len(image))
         for regs, memory in snapshots:
             pc = regs[-1]
+            table_offset, code_offset = 0x8000, 0x8100
+            if records is not None:
+                owners = [(table, code) for begin, end, table, code in records if begin <= pc < end]
+                assert len(owners) == 1
+                table_offset, code_offset = owners[0]
             for negative in (False, True):
+                if negative and records is not None and pc != snapshots[0][0][-1]:
+                    continue
                 if negative and regs[4] == SP:
                     continue
                 c.memmove(SP - 4096, memory, len(memory))
-                prefix = bytes(image[0x8100:0x8104]) if not negative else bytes([1, 0, 0, 0])
-                c.memmove(BASE + 0x8100, prefix, 4)
+                prefix = bytes(image[code_offset:code_offset + 4]) if not negative else bytes([1, 0, 0, 0])
+                c.memmove(BASE + code_offset, prefix, 4)
                 storage = c.create_string_buffer(1248)
                 context = (c.addressof(storage) + 15) & ~15
                 for index, value in enumerate(regs):
                     c.c_uint64.from_address(context + 0x78 + index * 8).value = value
                 handler_data, frame = ptr(), u64()
-                handler = unwind(1, BASE, pc, BASE + 0x8000, context,
+                handler = unwind(1, BASE, pc, BASE + table_offset, context,
                                  c.byref(handler_data), c.byref(frame), None)
                 actual = {name: c.c_uint64.from_address(context + 0x78 + index * 8).value
                           for index, name in enumerate(ORDER)}
@@ -80,6 +88,7 @@ def windows(image, snapshots, expected):
                            and all(actual[name] == expected[name] for name in NONVOL))
                 assert not handler and correct != negative, (hex(pc), negative, actual)
                 results.append(dict(pc=pc, negative=negative, correct=correct))
+                c.memmove(BASE + code_offset, bytes(image[code_offset:code_offset + 4]), 4)
     finally:
         if stack:
             assert free(stack, 0, 0x8000)

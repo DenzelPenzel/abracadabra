@@ -24,13 +24,14 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     results = []
     entry_results = []
+    exit_results = []
     for variant in (0, 1, 127, 255):
         path = (out / f'{variant}.dll').resolve()
         row = json.loads(subprocess.check_output(['cargo', 'run', '-q', '-p', 'vmp-emit', '--example',
                         'emit_leaf_pe', '--', str(source), str(path), str(variant)], text=True))
         pe = pefile.PE(str(path))
         entries = records(pe)
-        assert entries[:len(old)] == old and len(entries) == len(old) + 6
+        assert entries[:len(old)] == old and len(entries) == len(old) + 24
         for section in original.sections:
             assert pe.get_data(section.VirtualAddress, section.SizeOfRawData) == section.get_data()
         assert pe.OPTIONAL_HEADER.CheckSum == pe.generate_checksum()
@@ -45,6 +46,24 @@ def main():
         directory = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]
         gate = next(record for record in generated if record[0] == row['entry'])
         prefix = pe.get_data(gate[2], 4)
+        exits = [record for record in generated if generated[2][1] < record[0] < gate[0]]
+        assert len(exits) == 18 and exits[-1][1] == gate[0]
+        for site, (fault, _, unwind) in enumerate(exits):
+            for mode in ('normal', 'gate-exit'):
+                args = [str(catcher), str(path)] + list(map(str, [base, pe.OPTIONAL_HEADER.SizeOfImage,
+                    base + row['entry'], directory.VirtualAddress, len(entries), base + fault,
+                    base + handler, base + native, unwind, 1, 2])) + [mode, '0', 'pe']
+                r = subprocess.run(args, capture_output=True, text=True, timeout=30)
+                report = dict(variant=variant, site=site, mode=mode, exit=r.returncode,
+                              stdout=r.stdout, stderr=r.stderr)
+                exit_results.append(report)
+                (out / 'exit-results.json').write_text(json.dumps(exit_results, indent=2) + '\n')
+                print(json.dumps(report), flush=True)
+                assert r.returncode == 0 and not r.stderr and 'HANDLER:' not in r.stdout
+                expected = 'PASS: native normal return' if mode == 'normal' else 'PASS: native exception dispatch'
+                assert expected in r.stdout
+                if mode != 'normal':
+                    assert 'FAULT:' in r.stdout
         assert prefix[0] == 1 and prefix[2:] == bytes([18, 0])
         first_size = 2 if pe.get_data(gate[0], 1) == b'\x41' else 1
         for site, fault in [('first', gate[0]), ('saved-one', gate[0] + first_size),
@@ -82,6 +101,7 @@ def main():
                                         exit=r.returncode, stdout=r.stdout, stderr=r.stderr))
     assert len(results) == 108
     assert len(entry_results) == 32
+    assert len(exit_results) == 144
     (out / 'entry-results.json').write_text(json.dumps(entry_results, indent=2) + '\n')
     print('PASS: 16 PE entry returns; 16 PE entry exception dispatches without body handler')
     (out / 'results.json').write_text(json.dumps(results, indent=2) + '\n')

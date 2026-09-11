@@ -14,6 +14,50 @@ fn leaf_handler_uses_cpp_shadow_layout_and_reports_native_rip_fixup() {
             NativeInstance::generate_leaf_unwind(&bodies, VirtualAddress(0x140002000), variant)
                 .expect("leaf unwind");
         let unwind = instance.unwind().expect("body metadata");
+        assert_eq!(unwind.exit.len(), 18);
+        assert_eq!(unwind.exit[0].0.start, instance.exit_offset());
+        assert_eq!(
+            unwind.exit.last().expect("RET range").0.end,
+            instance.entry_offset()
+        );
+        for pair in unwind.exit.windows(2) {
+            assert_eq!(pair[0].0.end, pair[1].0.start);
+        }
+        let mut remaining = Vec::new();
+        let mut decoder = Decoder::new(
+            64,
+            &instance.image()[unwind.exit[1].0.start..instance.entry_offset()],
+            DecoderOptions::NONE,
+        );
+        for _ in 0..16 {
+            let instruction = decoder.decode();
+            let id = match instruction.op0_register() {
+                iced_x86::Register::RBX => 0x30,
+                iced_x86::Register::RBP => 0x50,
+                iced_x86::Register::RSI => 0x60,
+                iced_x86::Register::RDI => 0x70,
+                iced_x86::Register::R12 => 0xc0,
+                iced_x86::Register::R13 => 0xd0,
+                iced_x86::Register::R14 => 0xe0,
+                iced_x86::Register::R15 => 0xf0,
+                _ => 2,
+            };
+            remaining.push(id);
+        }
+        for (index, (_, codes)) in unwind.exit.iter().enumerate() {
+            let skip = index.saturating_sub(1);
+            let mut expected = vec![1, 0, (16 - skip + if index == 0 { 2 } else { 0 }) as u8, 0];
+            if index == 0 {
+                expected.extend_from_slice(&[0, 1, 32, 0]);
+            }
+            for &op in &remaining[skip..] {
+                expected.extend_from_slice(&[0, op]);
+            }
+            while expected.len() < 8 || !expected.len().is_multiple_of(4) {
+                expected.push(0);
+            }
+            assert_eq!(codes, &expected);
+        }
         assert_eq!(unwind.entry.start, instance.entry_offset());
         assert_eq!(unwind.entry.end, unwind.empty_ret);
         assert_eq!(

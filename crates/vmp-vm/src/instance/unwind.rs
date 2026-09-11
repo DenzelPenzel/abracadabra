@@ -3,13 +3,14 @@ use std::ops::Range;
 
 use super::{relative, BodyInstance};
 
-/// Image-relative entry, body and callback ranges, excluding gate exit
+/// Image-relative gate, body and callback ranges
 ///
 /// `codes` holds the UNWIND_INFO prefixes for the three disjoint processor ranges
 /// Placement appends `shifted_handler` for the middle range and `handler.start` otherwise
 /// The handler and empty-RET ranges use an empty version-1 UNWIND_INFO
 #[derive(Debug)]
 pub struct LeafUnwind {
+    pub exit: Vec<(Range<usize>, Vec<u8>)>,
     pub entry: Range<usize>,
     pub entry_codes: [u8; 40],
     pub processor: [Range<usize>; 3],
@@ -61,7 +62,12 @@ pub(super) fn entry_codes(order: [u8; 16], offsets: [u8; 16], end: u8) -> [u8; 4
     codes
 }
 
-pub(super) fn handler(body: &mut BodyInstance, entry: usize, entry_codes: [u8; 40]) -> LeafUnwind {
+pub(super) fn handler(
+    body: &mut BodyInstance,
+    entry: usize,
+    entry_codes: [u8; 40],
+    exit: Vec<(Range<usize>, Vec<u8>)>,
+) -> LeafUnwind {
     let empty_ret = body.image.len();
     body.image.push(0xc3);
     let start = body.image.len();
@@ -94,6 +100,7 @@ pub(super) fn handler(body: &mut BodyInstance, entry: usize, entry_codes: [u8; 4
     let mut shifted_codes = codes;
     shifted_codes[6] = 27;
     LeafUnwind {
+        exit,
         entry: entry..empty_ret,
         entry_codes,
         processor: [
@@ -106,4 +113,25 @@ pub(super) fn handler(body: &mut BodyInstance, entry: usize, entry_codes: [u8; 4
         empty_ret,
         codes: [codes, shifted_codes, codes],
     }
+}
+
+pub(super) fn exit_codes(order: &[u8], scratch: bool) -> Vec<u8> {
+    // Only slots still below the caller return address participate in this unwind
+    let mut codes = vec![1, 0, (order.len() + if scratch { 2 } else { 0 }) as u8, 0];
+    if scratch {
+        codes.extend_from_slice(&[0, 1, 32, 0]);
+    }
+    for &id in order {
+        codes.extend_from_slice(&[
+            0,
+            match id {
+                3 | 5 | 6 | 7 | 12..=15 => id << 4,
+                _ => 2,
+            },
+        ]);
+    }
+    while codes.len() < 8 || !codes.len().is_multiple_of(4) {
+        codes.push(0);
+    }
+    codes
 }

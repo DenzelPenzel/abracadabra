@@ -22,9 +22,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let instance =
             NativeInstance::generate_leaf_unwind(&bodies, VirtualAddress(0x140002000), variant)?;
         let u = instance.unwind().expect("leaf metadata");
-        println!("{{\"variant\":{},\"image\":{:?},\"entry\":{},\"processor\":{:?},\"handler\":[{},{}],\"shifted_handler\":{},\"empty\":{},\"codes\":{:?},\"entry_codes\":{:?}}}",
+        println!("{{\"variant\":{},\"image\":{:?},\"entry\":{},\"processor\":{:?},\"handler\":[{},{}],\"shifted_handler\":{},\"empty\":{},\"codes\":{:?},\"entry_codes\":{:?},\"exit_ranges\":{:?},\"exit_codes\":{:?}}}",
             variant, instance.image(), instance.entry_offset(), u.processor.each_ref().map(|r| [r.start, r.end]),
-            u.handler.start, u.handler.end, u.shifted_handler, u.empty_ret, u.codes, u.entry_codes);
+            u.handler.start, u.handler.end, u.shifted_handler, u.empty_ret, u.codes, u.entry_codes,
+            u.exit.iter().map(|(r, _)| [r.start, r.end]).collect::<Vec<_>>(),
+            u.exit.iter().map(|(_, c)| c).collect::<Vec<_>>());
     }
     Ok(())
 }

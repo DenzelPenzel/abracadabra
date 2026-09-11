@@ -52,6 +52,8 @@ jobs:
         run: python crates/vmp-vm/tests/proofs/cpp_unwind/exit_dispatch.py native-dispatch.exe
       - name: Verify Rust entry unwind at every instruction boundary
         run: python crates/vmp-vm/tests/proofs/cpp_unwind/rust_entry.py
+      - name: Verify Rust exit unwind at every instruction boundary
+        run: python crates/vmp-vm/tests/proofs/cpp_unwind/rust_exit.py
       - name: Execute native exception dispatch
         run: |
           python crates/vmp-vm/tests/proofs/cpp_unwind/native_dispatch.py native-dispatch.exe
@@ -79,6 +81,7 @@ jobs:
             target/cpp-exit-dispatch/*.json
             target/rust-leaf-unwind/*.json
             target/rust-entry-unwind/*.json
+            target/rust-exit-unwind/*.json
             target/leaf-pe-unwind/*.json
           if-no-files-found: warn
           retention-days: 7
