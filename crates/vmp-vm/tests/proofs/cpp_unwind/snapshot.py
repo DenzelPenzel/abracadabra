@@ -82,6 +82,18 @@ def verified_image(pe, uc):
     return image
 
 
+def entry_snapshots():
+    files, _ = artifacts()
+    for variant in ('classic', 'advanced'):
+        data = files[f'unwind_{variant}_add_protected.exe']
+        for checkpoint in (3, 4):
+            uc, events = replay(data, 1, 2, checkpoint)
+            assert not events
+            assert uc.reg_read(REGS['rsp']) == SP - (16 if checkpoint == 3 else 24)
+            assert bytes(uc.mem_read(uc.reg_read(REGS['rsp']) + 192, 48)) == bytes(48)
+            yield variant, 1, 2, checkpoint, data, uc
+
+
 def snapshots():
     files, entry = artifacts()
     expected = [(192, entry), (200, SP), (208, 0x1122000000000606),

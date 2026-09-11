@@ -9,12 +9,15 @@ import json
 import os
 from pathlib import Path
 import struct
+import sys
 
 import pefile
-from snapshot import STACK, STACK_SIZE, REGS, UNWIND, snapshots, verified_image
+from snapshot import STACK, STACK_SIZE, REGS, UNWIND, snapshots, entry_snapshots, verified_image
 
 
 def main():
+    early_entry = sys.argv[1:] == ['--entry-boundaries']
+    assert not sys.argv[1:] or early_entry, 'unsupported arguments'
     assert os.name == 'nt' and c.sizeof(c.c_void_p) == 8, 'requires native Windows x64'
     kernel = c.WinDLL('kernel32', use_last_error=True)
     ntdll = c.WinDLL('ntdll')
@@ -36,7 +39,7 @@ def main():
     readq = lambda address: c.c_uint64.from_address(address).value
     writeq = lambda address, value: setattr(c.c_uint64.from_address(address), 'value', value)
     rows = []
-    for variant, lhs, rhs, checkpoint, data, uc in snapshots():
+    for variant, lhs, rhs, checkpoint, data, uc in (entry_snapshots() if early_entry else snapshots()):
         pe = pefile.PE(data=data)
         base, size = pe.OPTIONAL_HEADER.ImageBase, pe.OPTIONAL_HEADER.SizeOfImage
         pc, frame = uc.reg_read(REGS['rip']), uc.reg_read(REGS['rsp'])
@@ -88,6 +91,15 @@ def main():
             assert cursor == frame + 248
             for offset, slot in ((0xa0, 208), (0xa8, 216), (0xb0, 224), (0x90, 232)):
                 assert readq(context + offset) == readq(frame + slot)
+            if early_entry:
+                # Do not call a handler whose live native-RSP shadow is uninitialised
+                assert native_rip == 0 and native_rsp == 0
+                assert readq(context + 0x90) == 0 and readq(context + 0xa0) == 0
+                rows.append({'variant': variant, 'checkpoint': checkpoint,
+                             'pc': pc, 'frame': frame, 'handler': handler,
+                             'native_rip': native_rip, 'native_rsp': native_rsp,
+                             'os_rbx': readq(context + 0x90), 'os_rbp': readq(context + 0xa0)})
+                continue
             # The dispatcher structure points at the OS-mutated context unchanged
             dispatch = c.create_string_buffer(80)
             writeq(c.addressof(dispatch) + 0x28, context)
@@ -127,6 +139,13 @@ def main():
                 assert free(stack, 0, 0x8000)
             if mapped:
                 assert free(base, 0, 0x8000)
+    if early_entry:
+        assert len(rows) == 4
+        Path('cpp-windows-entry-boundaries.json').write_text(json.dumps({
+            'scope': 'Original C++ early-entry metadata gap; NOT successful exception dispatch',
+            'cases': rows}, indent=2) + '\n')
+        print('PASS: 4 original C++ early-entry metadata gaps reproduced', flush=True)
+        return
     assert len(rows) == 30
     Path('cpp-windows-unwind-results.json').write_text(json.dumps({
         'scope': 'Windows metadata unwind and native callback over emulator snapshots; NOT exception dispatch',

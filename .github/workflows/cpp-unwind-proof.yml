@@ -39,6 +39,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $passed = @($output | Where-Object { $_ -eq 'PASS: 30 Windows metadata/handler walks; 30 removed-table lookup negatives' })
           if ($passed.Count -ne 1) { throw "Windows unwind proof did not execute exactly 30 cases" }
+      - name: Pin original C++ early-entry metadata gap
+        run: python crates/vmp-vm/tests/proofs/cpp_unwind/windows.py --entry-boundaries
       - name: Build native exception probe
         shell: cmd
         run: cl /nologo /W4 /WX /Od crates\vmp-vm\tests\proofs\cpp_unwind\native_dispatch.c /Fe:native-dispatch.exe /Fo:native-dispatch.obj /link /dynamicbase /base:0x180000000
@@ -62,6 +64,7 @@ jobs:
           name: cpp-windows-unwind-results
           path: |
             cpp-windows-unwind-results.json
+            cpp-windows-entry-boundaries.json
             target/cpp-native-dispatch/*.json
             target/rust-leaf-unwind/*.json
             target/leaf-pe-unwind/*.json
