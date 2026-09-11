@@ -13,6 +13,8 @@ static DWORD64 expected_rip, observed_frame, observed_native_rsp;
 static unsigned fault_seen, handler_seen;
 static DWORD frame_bias;
 static int entry_fault;
+static int exit_fault;
+static unsigned char fault_bytes[2];
 static int gate_fault;
 
 static void require(int condition, const char *message)
@@ -38,16 +40,23 @@ static LONG CALLBACK observe(EXCEPTION_POINTERS *exception)
         observed_frame = context->Rsp + frame_bias;
         require(observed_frame >= (DWORD64)tib->StackLimit &&
                 observed_frame + 256 < (DWORD64)tib->StackBase, "native thread stack frame");
-        if (!entry_fault && !gate_fault)
+        if (!entry_fault && !exit_fault && !gate_fault)
             require(*(DWORD64 *)(observed_frame + 192) == expected_rip, "live shadow RIP");
         observed_native_rsp = gate_fault ? 0 : *(DWORD64 *)(observed_frame + 200);
-        if (!entry_fault && !gate_fault)
+        if (!entry_fault && !exit_fault && !gate_fault)
             require(observed_native_rsp > observed_frame + 248 &&
                 observed_native_rsp < (DWORD64)tib->StackBase, "live native RSP");
         fault_seen++;
         printf("FAULT: pc=%p frame=%llx native_rsp=%llx\n", fault_pc,
                (unsigned long long)observed_frame, (unsigned long long)observed_native_rsp);
         fflush(stdout);
+        if (exit_fault) {
+            /* Unwind must inspect the original POPF and following instruction */
+            require(VirtualProtect(fault_pc, 2, PAGE_READWRITE, &old) != 0, "exit writable");
+            memcpy(fault_pc, fault_bytes, 2);
+            require(VirtualProtect(fault_pc, 2, old, &old) != 0, "exit executable");
+            require(FlushInstructionCache(GetCurrentProcess(), fault_pc, 2) != 0, "exit cache");
+        }
         /* Do not handle the fault: Windows must perform normal SEH search */
         return EXCEPTION_CONTINUE_SEARCH;
     }
@@ -70,7 +79,7 @@ static LONG CALLBACK observe(EXCEPTION_POINTERS *exception)
         context->Rip = (DWORD64)handler_pc;
         return EXCEPTION_CONTINUE_EXECUTION;
     }
-    if (entry_fault && fault_seen && handler_seen &&
+    if ((entry_fault || exit_fault) && fault_seen && handler_seen &&
         exception->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
         DWORD64 handler_base = 0, fault_base = 0;
         PRUNTIME_FUNCTION handler_range = RtlLookupFunctionEntry((DWORD64)handler_pc, &handler_base, NULL);
@@ -147,8 +156,9 @@ int main(int argc, char **argv)
     normal = strcmp(argv[13], "normal") == 0;
     negative = strcmp(argv[13], "no-handler") == 0;
     entry_fault = strcmp(argv[13], "entry-fault") == 0;
+    exit_fault = strcmp(argv[13], "exit-fault") == 0;
     gate_fault = strcmp(argv[13], "gate-fault") == 0;
-    require(normal || negative || entry_fault || gate_fault || strcmp(argv[13], "fault") == 0, "mode");
+    require(normal || negative || entry_fault || exit_fault || gate_fault || strcmp(argv[13], "fault") == 0, "mode");
     require(size && pdata < size && (SIZE_T)count * 12 <= size - pdata &&
             unwind_rva < size && entry >= base && entry - base < size &&
             (DWORD64)fault_pc >= base && (DWORD64)fault_pc - base + 2 <= size &&
@@ -177,6 +187,10 @@ int main(int argc, char **argv)
     require(fclose(file) == 0, "image close");
     }
     if (!normal) {
+        if (exit_fault) {
+            require(fault_pc[0] == 0x9d, "exit fault replaces POPF");
+            memcpy(fault_bytes, fault_pc, 2);
+        }
         fault_pc[0] = 0x0f;
         fault_pc[1] = 0x0b;
         handler_byte = *handler_pc;

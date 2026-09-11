@@ -48,6 +48,8 @@ jobs:
         run: cl /nologo /W4 /WX /Od crates\vmp-vm\tests\proofs\cpp_unwind\native_dispatch.c /Fe:native-dispatch.exe /Fo:native-dispatch.obj /link /dynamicbase /base:0x180000000
       - name: Probe native C++ early-entry exceptions
         run: python crates/vmp-vm/tests/proofs/cpp_unwind/entry_dispatch.py native-dispatch.exe
+      - name: Observe native C++ exit exceptions
+        run: python crates/vmp-vm/tests/proofs/cpp_unwind/exit_dispatch.py native-dispatch.exe
       - name: Verify Rust entry unwind at every instruction boundary
         run: python crates/vmp-vm/tests/proofs/cpp_unwind/rust_entry.py
       - name: Execute native exception dispatch
@@ -74,6 +76,7 @@ jobs:
             cpp-windows-exit-boundaries.json
             target/cpp-native-dispatch/*.json
             target/cpp-entry-dispatch/*.json
+            target/cpp-exit-dispatch/*.json
             target/rust-leaf-unwind/*.json
             target/rust-entry-unwind/*.json
             target/leaf-pe-unwind/*.json
