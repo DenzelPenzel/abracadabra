@@ -94,6 +94,25 @@ def entry_snapshots():
             yield variant, 1, 2, checkpoint, data, uc
 
 
+def exit_snapshots():
+    files, _ = artifacts()
+    for variant in ('classic', 'advanced'):
+        data = files[f'unwind_{variant}_add_protected.exe']
+        pe = pefile.PE(data=data)
+        base = pe.OPTIONAL_HEADER.ImageBase
+        trace = []
+        final, _ = replay(data, 1, 2, trace=trace)
+        assert final.reg_read(REGS['rip']) == STOP and final.reg_read(REGS['rax']) == 3
+        popf = max(i for i, (pc, size) in enumerate(trace)
+                   if size == 1 and pe.get_data(pc - base, 1) == b'\x9d')
+        for site, index in (('popf', popf), ('ret', len(trace) - 1)):
+            uc, _ = replay(data, 1, 2, count=index)
+            assert uc.reg_read(REGS['rip']) == trace[index][0]
+            assert uc.reg_read(REGS['rsp']) == SP - (8 if site == 'popf' else 0)
+            assert pe.get_data(trace[index][0] - base, 1) == (b'\x9d' if site == 'popf' else b'\xc3')
+            yield variant, 1, 2, site, data, uc
+
+
 def snapshots():
     files, entry = artifacts()
     expected = [(192, entry), (200, SP), (208, 0x1122000000000606),

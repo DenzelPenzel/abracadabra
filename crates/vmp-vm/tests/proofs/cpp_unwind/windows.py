@@ -12,12 +12,13 @@ import struct
 import sys
 
 import pefile
-from snapshot import STACK, STACK_SIZE, REGS, UNWIND, snapshots, entry_snapshots, verified_image
+from snapshot import STACK, STACK_SIZE, SP, STOP, REGS, UNWIND, snapshots, entry_snapshots, exit_snapshots, verified_image
 
 
 def main():
     early_entry = sys.argv[1:] == ['--entry-boundaries']
-    assert not sys.argv[1:] or early_entry, 'unsupported arguments'
+    exit_boundary = sys.argv[1:] == ['--exit-boundaries']
+    assert not sys.argv[1:] or early_entry or exit_boundary, 'unsupported arguments'
     assert os.name == 'nt' and c.sizeof(c.c_void_p) == 8, 'requires native Windows x64'
     kernel = c.WinDLL('kernel32', use_last_error=True)
     ntdll = c.WinDLL('ntdll')
@@ -39,7 +40,8 @@ def main():
     readq = lambda address: c.c_uint64.from_address(address).value
     writeq = lambda address, value: setattr(c.c_uint64.from_address(address), 'value', value)
     rows = []
-    for variant, lhs, rhs, checkpoint, data, uc in (entry_snapshots() if early_entry else snapshots()):
+    source = entry_snapshots() if early_entry else exit_snapshots() if exit_boundary else snapshots()
+    for variant, lhs, rhs, checkpoint, data, uc in source:
         pe = pefile.PE(data=data)
         base, size = pe.OPTIONAL_HEADER.ImageBase, pe.OPTIONAL_HEADER.SizeOfImage
         pc, frame = uc.reg_read(REGS['rip']), uc.reg_read(REGS['rsp'])
@@ -87,6 +89,17 @@ def main():
             print(json.dumps({'variant': variant, 'checkpoint': checkpoint, 'pc': hex(pc),
                               'frame': hex(frame), 'establisher': hex(establisher.value),
                               'cursor': hex(cursor), 'handler': hex(handler or 0)}), flush=True)
+            if exit_boundary:
+                nonvolatile = ('rbx', 'rbp', 'rsi', 'rdi', 'r12', 'r13', 'r14', 'r15')
+                restored = {name: readq(context + 0x78 + order.index(name) * 8) for name in nonvolatile}
+                correct = (cursor == SP + 8 and readq(context + 0xf8) == STOP and
+                           all(restored[name] == uc.reg_read(REGS[name]) for name in nonvolatile))
+                rows.append(dict(variant=variant, site=checkpoint, pc=pc, handler=handler,
+                                 frame=frame, cursor=cursor, rip=readq(context + 0xf8),
+                                 correct=correct, restored=restored))
+                if checkpoint == 'ret':
+                    assert correct and not handler, 'native RET must unwind to caller'
+                continue
             assert handler == expected_handler and establisher.value == frame
             assert cursor == frame + 248
             for offset, slot in ((0xa0, 208), (0xa8, 216), (0xb0, 224), (0x90, 232)):
@@ -139,6 +152,13 @@ def main():
                 assert free(stack, 0, 0x8000)
             if mapped:
                 assert free(base, 0, 0x8000)
+    if exit_boundary:
+        assert len(rows) == 4
+        Path('cpp-windows-exit-boundaries.json').write_text(json.dumps({
+            'scope': 'Original C++ exit virtual unwind, not native exception delivery',
+            'cases': rows}, indent=2) + '\n')
+        print('PASS: 4 original C++ exit observations; correct:', sum(row['correct'] for row in rows))
+        return
     if early_entry:
         assert len(rows) == 4
         Path('cpp-windows-entry-boundaries.json').write_text(json.dumps({
