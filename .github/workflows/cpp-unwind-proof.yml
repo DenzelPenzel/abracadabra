@@ -44,6 +44,8 @@ jobs:
       - name: Build native exception probe
         shell: cmd
         run: cl /nologo /W4 /WX /Od crates\vmp-vm\tests\proofs\cpp_unwind\native_dispatch.c /Fe:native-dispatch.exe /Fo:native-dispatch.obj /link /dynamicbase /base:0x180000000
+      - name: Probe native C++ early-entry exceptions
+        run: python crates/vmp-vm/tests/proofs/cpp_unwind/entry_dispatch.py native-dispatch.exe
       - name: Execute native exception dispatch
         run: |
           python crates/vmp-vm/tests/proofs/cpp_unwind/native_dispatch.py native-dispatch.exe
@@ -66,6 +68,7 @@ jobs:
             cpp-windows-unwind-results.json
             cpp-windows-entry-boundaries.json
             target/cpp-native-dispatch/*.json
+            target/cpp-entry-dispatch/*.json
             target/rust-leaf-unwind/*.json
             target/leaf-pe-unwind/*.json
           if-no-files-found: warn

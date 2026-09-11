@@ -12,6 +12,7 @@ static unsigned char handler_byte;
 static DWORD64 expected_rip, observed_frame, observed_native_rsp;
 static unsigned fault_seen, handler_seen;
 static DWORD frame_bias;
+static int entry_fault;
 
 static void require(int condition, const char *message)
 {
@@ -36,9 +37,11 @@ static LONG CALLBACK observe(EXCEPTION_POINTERS *exception)
         observed_frame = context->Rsp + frame_bias;
         require(observed_frame >= (DWORD64)tib->StackLimit &&
                 observed_frame + 256 < (DWORD64)tib->StackBase, "native thread stack frame");
-        require(*(DWORD64 *)(observed_frame + 192) == expected_rip, "live shadow RIP");
+        if (!entry_fault)
+            require(*(DWORD64 *)(observed_frame + 192) == expected_rip, "live shadow RIP");
         observed_native_rsp = *(DWORD64 *)(observed_frame + 200);
-        require(observed_native_rsp > observed_frame + 248 &&
+        if (!entry_fault)
+            require(observed_native_rsp > observed_frame + 248 &&
                 observed_native_rsp < (DWORD64)tib->StackBase, "live native RSP");
         fault_seen++;
         printf("FAULT: pc=%p frame=%llx native_rsp=%llx\n", fault_pc,
@@ -65,6 +68,16 @@ static LONG CALLBACK observe(EXCEPTION_POINTERS *exception)
         require(FlushInstructionCache(GetCurrentProcess(), handler_pc, 1) != 0, "handler cache");
         context->Rip = (DWORD64)handler_pc;
         return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (entry_fault && fault_seen && handler_seen &&
+        exception->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+        printf("HANDLER_AV: pc=%p operation=%llu address=%llx\n",
+               exception->ExceptionRecord->ExceptionAddress,
+               (unsigned long long)exception->ExceptionRecord->ExceptionInformation[0],
+               (unsigned long long)exception->ExceptionRecord->ExceptionInformation[1]);
+        fflush(stdout);
+        /* Stop the isolated diagnostic child before recursive exception dispatch */
+        ExitProcess(21);
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -121,7 +134,8 @@ int main(int argc, char **argv)
     rhs = _strtoui64(argv[12], NULL, 10);
     normal = strcmp(argv[13], "normal") == 0;
     negative = strcmp(argv[13], "no-handler") == 0;
-    require(normal || negative || strcmp(argv[13], "fault") == 0, "mode");
+    entry_fault = strcmp(argv[13], "entry-fault") == 0;
+    require(normal || negative || entry_fault || strcmp(argv[13], "fault") == 0, "mode");
     require(size && pdata < size && (SIZE_T)count * 12 <= size - pdata &&
             unwind_rva < size && entry >= base && entry - base < size &&
             (DWORD64)fault_pc >= base && (DWORD64)fault_pc - base + 2 <= size &&
