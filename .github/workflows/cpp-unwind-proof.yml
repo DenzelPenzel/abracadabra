@@ -45,7 +45,7 @@ jobs:
       - name: Build persisted PE fixture
         shell: cmd
         run: |
-          ml64 /nologo /c /Fo:leaf-loader.obj crates\vmp-emit\tests\proofs\leaf_loader.asm
+          ml64 /nologo /c /Foleaf-loader.obj crates\vmp-emit\tests\proofs\leaf_loader.asm
           if errorlevel 1 exit /b 1
           link /nologo /dll /noentry /dynamicbase /base:0x140000000 /export:VmOriginal /out:leaf-loader.dll leaf-loader.obj
       - name: Execute persisted PE unwind
