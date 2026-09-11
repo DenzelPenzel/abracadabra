@@ -48,7 +48,7 @@ def main():
         assert prefix[0] == 1 and prefix[2:] == bytes([18, 0])
         first_size = 2 if pe.get_data(gate[0], 1) == b'\x41' else 1
         for site, fault in [('first', gate[0]), ('saved-one', gate[0] + first_size),
-                            ('allocated', gate[0] + prefix[1]), ('dispatch', gate[1] - 5)]:
+                            ('allocated', gate[0] + prefix[1]), ('dispatch', gate[1] - 2)]:
             for mode in ('normal', 'gate-fault'):
                 args = [str(catcher), str(path)] + list(map(str, [base, pe.OPTIONAL_HEADER.SizeOfImage,
                     base + row['entry'], directory.VirtualAddress, len(entries), base + fault,

@@ -396,7 +396,10 @@ impl NativeInstance {
             gate_addresses[3] = body.image.len();
             body.image.extend_from_slice(&key.to_le_bytes());
         }
-        jump_dispatch(&mut body.image);
+        // A register-direct jump is not a Windows tail epilogue; the entry frame is still live
+        body.image.extend_from_slice(&[0x48, 0x8d, 0x05]);
+        relative(&mut body.image, 4);
+        body.image.extend_from_slice(&[0xff, 0xe0]);
         // Retarget the owned dispatch completion JE, leaving raw-body layout unchanged
         body.image[9..13].copy_from_slice(&(exit as i32 - 13).to_le_bytes());
         let unwind = native_rip.map(|_| unwind::handler(&mut body, entry, entry_codes));

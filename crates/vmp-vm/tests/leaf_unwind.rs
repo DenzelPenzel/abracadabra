@@ -17,6 +17,10 @@ fn leaf_handler_uses_cpp_shadow_layout_and_reports_native_rip_fixup() {
         assert_eq!(unwind.entry.start, instance.entry_offset());
         assert_eq!(unwind.entry.end, unwind.empty_ret);
         assert_eq!(
+            &instance.image()[unwind.entry.end - 2..unwind.entry.end],
+            &[0xff, 0xe0]
+        );
+        assert_eq!(
             unwind.entry_codes[0], 1,
             "entry must not use the body handler"
         );
