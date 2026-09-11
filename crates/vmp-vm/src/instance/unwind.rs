@@ -1,15 +1,17 @@
-//! Native-state shadows and body-only exception reconstruction for scalar leaves
+//! Native-state shadows, entry unwind and body exception reconstruction for scalar leaves
 use std::ops::Range;
 
 use super::{relative, BodyInstance};
 
-/// Image-relative body and callback ranges, excluding gate entry and exit
+/// Image-relative entry, body and callback ranges, excluding gate exit
 ///
 /// `codes` holds the UNWIND_INFO prefixes for the three disjoint processor ranges
 /// Placement appends `shifted_handler` for the middle range and `handler.start` otherwise
 /// The handler and empty-RET ranges use an empty version-1 UNWIND_INFO
 #[derive(Debug)]
 pub struct LeafUnwind {
+    pub entry: Range<usize>,
+    pub entry_codes: [u8; 40],
     pub processor: [Range<usize>; 3],
     pub handler: Range<usize>,
     pub shifted_handler: usize,
@@ -44,7 +46,22 @@ fn store(image: &mut Vec<u8>, offset: u32) {
     image.extend_from_slice(&offset.to_le_bytes());
 }
 
-pub(super) fn handler(body: &mut BodyInstance) -> LeafUnwind {
+pub(super) fn entry_codes(order: [u8; 16], offsets: [u8; 16], end: u8) -> [u8; 40] {
+    let mut codes = [0; 40];
+    // The entry unwinds saved registers directly, before native shadows are ready
+    codes[..8].copy_from_slice(&[1, end, 18, 0, end, 1, 32, 0]);
+    for (index, id) in order.into_iter().enumerate() {
+        codes[8 + index * 2] = offsets[15 - index];
+        codes[9 + index * 2] = match id {
+            3 | 5 | 6 | 7 | 12..=15 => id << 4,
+            // Volatile registers and flags occupy stack slots but need no restoration
+            _ => 2,
+        };
+    }
+    codes
+}
+
+pub(super) fn handler(body: &mut BodyInstance, entry: usize, entry_codes: [u8; 40]) -> LeafUnwind {
     let empty_ret = body.image.len();
     body.image.push(0xc3);
     let start = body.image.len();
@@ -77,6 +94,8 @@ pub(super) fn handler(body: &mut BodyInstance) -> LeafUnwind {
     let mut shifted_codes = codes;
     shifted_codes[6] = 27;
     LeafUnwind {
+        entry: entry..empty_ret,
+        entry_codes,
         processor: [
             0..body.flags_pop.start,
             body.flags_pop.clone(),

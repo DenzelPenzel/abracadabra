@@ -13,6 +13,7 @@ static DWORD64 expected_rip, observed_frame, observed_native_rsp;
 static unsigned fault_seen, handler_seen;
 static DWORD frame_bias;
 static int entry_fault;
+static int gate_fault;
 
 static void require(int condition, const char *message)
 {
@@ -37,10 +38,10 @@ static LONG CALLBACK observe(EXCEPTION_POINTERS *exception)
         observed_frame = context->Rsp + frame_bias;
         require(observed_frame >= (DWORD64)tib->StackLimit &&
                 observed_frame + 256 < (DWORD64)tib->StackBase, "native thread stack frame");
-        if (!entry_fault)
+        if (!entry_fault && !gate_fault)
             require(*(DWORD64 *)(observed_frame + 192) == expected_rip, "live shadow RIP");
-        observed_native_rsp = *(DWORD64 *)(observed_frame + 200);
-        if (!entry_fault)
+        observed_native_rsp = gate_fault ? 0 : *(DWORD64 *)(observed_frame + 200);
+        if (!entry_fault && !gate_fault)
             require(observed_native_rsp > observed_frame + 248 &&
                 observed_native_rsp < (DWORD64)tib->StackBase, "live native RSP");
         fault_seen++;
@@ -71,6 +72,16 @@ static LONG CALLBACK observe(EXCEPTION_POINTERS *exception)
     }
     if (entry_fault && fault_seen && handler_seen &&
         exception->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+        DWORD64 handler_base = 0, fault_base = 0;
+        PRUNTIME_FUNCTION handler_range = RtlLookupFunctionEntry((DWORD64)handler_pc, &handler_base, NULL);
+        PRUNTIME_FUNCTION fault_range = RtlLookupFunctionEntry(context->Rip, &fault_base, NULL);
+        require(handler_range != NULL && fault_range != NULL && handler_base == fault_base &&
+                handler_range->BeginAddress == fault_range->BeginAddress &&
+                handler_range->EndAddress == fault_range->EndAddress, "AV belongs to original handler");
+        require(exception->ExceptionRecord->NumberParameters >= 2 &&
+                exception->ExceptionRecord->ExceptionInformation[0] == 1 &&
+                exception->ExceptionRecord->ExceptionInformation[1] == observed_native_rsp - 8,
+                "handler writes through native-RSP shadow");
         printf("HANDLER_AV: pc=%p operation=%llu address=%llx\n",
                exception->ExceptionRecord->ExceptionAddress,
                (unsigned long long)exception->ExceptionRecord->ExceptionInformation[0],
@@ -86,7 +97,8 @@ static int catch_fault(EXCEPTION_POINTERS *exception)
 {
     require(exception->ExceptionRecord->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION &&
             exception->ExceptionRecord->ExceptionAddress == fault_pc, "outer catcher sees original fault");
-    require(fault_seen == 1 && handler_seen == 1, "generated handler reached before outer catcher");
+    require(fault_seen == 1 && handler_seen == (gate_fault ? 0u : 1u),
+            "expected handler path before outer catcher");
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
@@ -135,7 +147,8 @@ int main(int argc, char **argv)
     normal = strcmp(argv[13], "normal") == 0;
     negative = strcmp(argv[13], "no-handler") == 0;
     entry_fault = strcmp(argv[13], "entry-fault") == 0;
-    require(normal || negative || entry_fault || strcmp(argv[13], "fault") == 0, "mode");
+    gate_fault = strcmp(argv[13], "gate-fault") == 0;
+    require(normal || negative || entry_fault || gate_fault || strcmp(argv[13], "fault") == 0, "mode");
     require(size && pdata < size && (SIZE_T)count * 12 <= size - pdata &&
             unwind_rva < size && entry >= base && entry - base < size &&
             (DWORD64)fault_pc >= base && (DWORD64)fault_pc - base + 2 <= size &&

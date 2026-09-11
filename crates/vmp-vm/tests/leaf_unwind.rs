@@ -14,6 +14,43 @@ fn leaf_handler_uses_cpp_shadow_layout_and_reports_native_rip_fixup() {
             NativeInstance::generate_leaf_unwind(&bodies, VirtualAddress(0x140002000), variant)
                 .expect("leaf unwind");
         let unwind = instance.unwind().expect("body metadata");
+        assert_eq!(unwind.entry.start, instance.entry_offset());
+        assert_eq!(unwind.entry.end, unwind.empty_ret);
+        assert_eq!(
+            unwind.entry_codes[0], 1,
+            "entry must not use the body handler"
+        );
+        let mut decoder = Decoder::with_ip(
+            64,
+            &instance.image()[unwind.entry.clone()],
+            0,
+            DecoderOptions::NONE,
+        );
+        let mut slots = Vec::new();
+        for _ in 0..16 {
+            let instruction = decoder.decode();
+            let op = match instruction.op0_register() {
+                iced_x86::Register::RBX => 0x30,
+                iced_x86::Register::RBP => 0x50,
+                iced_x86::Register::RSI => 0x60,
+                iced_x86::Register::RDI => 0x70,
+                iced_x86::Register::R12 => 0xc0,
+                iced_x86::Register::R13 => 0xd0,
+                iced_x86::Register::R14 => 0xe0,
+                iced_x86::Register::R15 => 0xf0,
+                _ => 2,
+            };
+            slots.push([instruction.next_ip() as u8, op]);
+        }
+        assert_eq!(decoder.decode().mnemonic(), iced_x86::Mnemonic::Mov);
+        let allocation = decoder.decode();
+        assert_eq!(allocation.mnemonic(), iced_x86::Mnemonic::Sub);
+        let end = allocation.next_ip() as u8;
+        let mut expected = vec![1, end, 18, 0, end, 1, 32, 0];
+        for slot in slots.into_iter().rev() {
+            expected.extend_from_slice(&slot);
+        }
+        assert_eq!(unwind.entry_codes.as_slice(), expected.as_slice());
         assert_eq!(unwind.processor[0].start, 0);
         assert!(unwind.processor[2].end < instance.exit_offset());
         assert_eq!(unwind.processor[0].end, unwind.processor[1].start);

@@ -360,13 +360,17 @@ impl NativeInstance {
         body.image.push(0xc3);
 
         let entry = body.image.len();
-        for id in order.into_iter().rev() {
+        let mut push_offsets = [0; 16];
+        for (index, id) in order.into_iter().rev().enumerate() {
             saved_register(&mut body.image, id, true);
+            push_offsets[index] = (body.image.len() - entry) as u8;
         }
         body.image.extend_from_slice(&[0x48, 0x89, 0xe5]); // mov rbp, rsp
         body.image
             .extend_from_slice(&[0x48, 0x81, 0xec, 0, 1, 0, 0]); // sub rsp, 256
-                                                                 // The body addresses context at RSP; its descending VM stack starts at RBP
+        let entry_codes =
+            unwind::entry_codes(order, push_offsets, (body.image.len() - entry) as u8);
+        // The body addresses context at RSP; its descending VM stack starts at RBP
         for offset in (0..128u8).step_by(8) {
             body.image.extend_from_slice(&[0x48, 0x8b, 0x45, offset]);
             body.image
@@ -395,7 +399,7 @@ impl NativeInstance {
         jump_dispatch(&mut body.image);
         // Retarget the owned dispatch completion JE, leaving raw-body layout unchanged
         body.image[9..13].copy_from_slice(&(exit as i32 - 13).to_le_bytes());
-        let unwind = native_rip.map(|_| unwind::handler(&mut body));
+        let unwind = native_rip.map(|_| unwind::handler(&mut body, entry, entry_codes));
         Ok(Self {
             body,
             entry,

@@ -236,6 +236,13 @@ impl VmPlacement {
                 });
             }
             let unwind_info = at(image.len())?;
+            image.extend_from_slice(&unwind.entry_codes);
+            functions.push(RuntimeFunction {
+                begin: at(unwind.entry.start)?,
+                end: at(unwind.entry.end)?,
+                unwind_info,
+            });
+            let unwind_info = at(image.len())?;
             // Keep the empty code-array address within the mapped section
             image.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
             for range in [
