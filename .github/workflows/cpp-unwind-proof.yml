@@ -5,7 +5,13 @@ on:
     branches: [test/cpp-windows-unwind-proof]
   pull_request:
     paths:
-      - crates/vmp-vm/tests/proofs/cpp_unwind/**
+      - crates/vmp-vm/**
+      - crates/vmp-emit/**
+      - crates/vmp-pe/**
+      - crates/vmp-ir/**
+      - crates/vmp-types/**
+      - Cargo.toml
+      - Cargo.lock
       - .github/workflows/cpp-unwind-proof.yml
   workflow_dispatch:
 

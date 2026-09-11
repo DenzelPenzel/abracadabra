@@ -96,14 +96,24 @@ fn append_instance(
         for body in bodies {
             let source = body.source();
             let source_rva = source.rva().ok_or(VmEmbeddingError::LeafSource)?;
+            let encoding =
+                image
+                    .pe()
+                    .mapped_range(image.bytes(), source_rva, source.raw().len() as u32)?;
+            let decoded = iced_x86::Decoder::with_ip(
+                64,
+                encoding,
+                source.raw().ip(),
+                iced_x86::DecoderOptions::NONE,
+            )
+            .decode();
             if source_rva
                 .to_va(image.pe().optional.image_base)
                 .map(|a| a.0)
                 != Some(source.raw().ip())
-                || image
-                    .pe()
-                    .mapped_range(image.bytes(), source_rva, source.raw().len() as u32)?
-                    != source.bytes()
+                || encoding != source.bytes()
+                || decoded.is_invalid()
+                || decoded != *source.raw()
                 || !image.pe().sections.iter().any(|s| {
                     s.characteristics & 0x2000_0000 != 0
                         && source_rva.get() >= s.virtual_address.get()

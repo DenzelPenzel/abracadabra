@@ -28,6 +28,14 @@ fn serialized_leaf_unwind_preserves_original_entries() {
     )
     .decode();
     let native = Instruction::decoded(rva, raw, &code[..3]);
+    let mismatched_raw =
+        Decoder::with_ip(64, &[0x48, 0x01, 0xc8], raw.ip(), DecoderOptions::NONE).decode();
+    let mismatched = Instruction::decoded(rva, mismatched_raw, &code[..3]);
+    let mismatched_bodies = [lower_instruction(Architecture::X64, &mismatched).expect("ADD")];
+    assert!(matches!(
+        vmp_emit::vm::append_leaf_vm_instance(image.bytes().to_vec(), &mismatched_bodies, 37),
+        Err(VmEmbeddingError::LeafSource)
+    ));
     let bodies = [lower_instruction(Architecture::X64, &native).expect("ADD")];
     let before = image
         .pe()
