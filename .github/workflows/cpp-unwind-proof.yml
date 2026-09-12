@@ -68,6 +68,8 @@ jobs:
           link /nologo /dll /noentry /dynamicbase /base:0x140000000 /export:VmOriginal /out:leaf-loader.dll leaf-loader.obj
       - name: Execute persisted PE unwind
         run: python crates/vmp-emit/tests/proofs/leaf_pe.py leaf-loader.dll native-dispatch.exe
+      - name: Execute redirected original-RVA PE unwind
+        run: python crates/vmp-emit/tests/proofs/leaf_pe.py leaf-loader.dll native-dispatch.exe --redirect
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
         with:
@@ -83,5 +85,6 @@ jobs:
             target/rust-entry-unwind/*.json
             target/rust-exit-unwind/*.json
             target/leaf-pe-unwind/*.json
+            target/leaf-pe-redirect/*.json
           if-no-files-found: warn
           retention-days: 7

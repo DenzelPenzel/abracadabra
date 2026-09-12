@@ -1,6 +1,6 @@
 //! Emits a DLL with generated body unwind through the production PE writer
 use iced_x86::{Decoder, DecoderOptions};
-use vmp_emit::vm::append_leaf_vm_instance;
+use vmp_emit::vm::{append_leaf_vm_instance, redirect_leaf_vm_instance};
 use vmp_ir::Instruction;
 use vmp_pe::{ExportTarget, PeFile};
 use vmp_types::{Architecture, Rva};
@@ -8,7 +8,7 @@ use vmp_vm::logical::lower_instruction;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if args.len() != 3 {
+    if args.len() != 3 && !(args.len() == 4 && args[3] == "--redirect") {
         return Err("input DLL, output DLL, variant required".into());
     }
     let input = std::fs::read(&args[0])?;
@@ -44,7 +44,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .map(|i| lower_instruction(Architecture::X64, i))
         .collect::<Result<Vec<_>, _>>()?;
-    let artifact = append_leaf_vm_instance(input, &bodies, args[2].parse()?)?;
+    let artifact = if args.len() == 4 {
+        redirect_leaf_vm_instance(input, &bodies, args[2].parse()?)?
+    } else {
+        append_leaf_vm_instance(input, &bodies, args[2].parse()?)?
+    };
     println!(
         "{{\"entry\":{},\"instance\":{}}}",
         artifact.placement().entry_rva().get(),

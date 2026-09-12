@@ -66,19 +66,31 @@ pub fn append_vm_instance(
     bodies: &[LogicalInstruction<'_>],
     variant: u8,
 ) -> Result<VmPeArtifact, VmEmbeddingError> {
-    append_instance(data, bodies, variant, false)
+    append_instance(data, bodies, variant, false, false)
 }
 
-/// Appends an encrypted scalar leaf with persisted body exception metadata
+/// Appends an encrypted scalar leaf with persisted gate and body exception metadata
 ///
-/// The native leaf must remain at its original VA; entry/exit gates are not unwindable
+/// The native leaf must remain at its original VA for body exception reconstruction
 /// This does not redirect the original entry or enable CLI virtualization
 pub fn append_leaf_vm_instance(
     data: Vec<u8>,
     bodies: &[LogicalInstruction<'_>],
     variant: u8,
 ) -> Result<VmPeArtifact, VmEmbeddingError> {
-    append_instance(data, bodies, variant, true)
+    append_instance(data, bodies, variant, true, false)
+}
+
+/// Redirects a complete scalar leaf's original entry into its generated VM
+///
+/// The caller must establish that no control-flow entry targets the replaced interior
+/// The original RET and its leaf unwind address remain in place
+pub fn redirect_leaf_vm_instance(
+    data: Vec<u8>,
+    bodies: &[LogicalInstruction<'_>],
+    variant: u8,
+) -> Result<VmPeArtifact, VmEmbeddingError> {
+    append_instance(data, bodies, variant, true, true)
 }
 
 fn append_instance(
@@ -86,6 +98,7 @@ fn append_instance(
     bodies: &[LogicalInstruction<'_>],
     variant: u8,
     leaf: bool,
+    redirect: bool,
 ) -> Result<VmPeArtifact, VmEmbeddingError> {
     let mut image = PeImage::from_bytes(data)?;
     match image.pe().architecture {
@@ -144,6 +157,33 @@ fn append_instance(
     }
     let rva = image.next_section_rva()?;
     let placement = VmPlacement::build(bodies, image.pe().optional.image_base, rva, variant, leaf)?;
+    if redirect {
+        let first = bodies.first().ok_or(VmEmbeddingError::LeafSource)?.source();
+        let last = bodies.last().ok_or(VmEmbeddingError::LeafSource)?.source();
+        let start = first.rva().ok_or(VmEmbeddingError::LeafSource)?;
+        let end = last
+            .rva()
+            .and_then(|r| r.checked_add(last.raw().len() as u32))
+            .ok_or(VmEmbeddingError::LeafSource)?;
+        let span = end
+            .get()
+            .checked_sub(start.get())
+            .ok_or(VmEmbeddingError::LeafSource)?;
+        if span < crate::stub::STUB_LEN
+            || image.pe().base_relocations.as_ref().is_some_and(|relocs| {
+                relocs.fixups().iter().any(|fixup| {
+                    u64::from(fixup.rva.get()) < u64::from(end.get())
+                        && u64::from(fixup.rva.get()) + 8 > u64::from(start.get())
+                })
+            })
+        {
+            return Err(VmEmbeddingError::LeafSource);
+        }
+        let mut patched = image.bytes().to_vec();
+        crate::stub::Stub::spanning(start, placement.entry_rva(), span)
+            .write(image.pe(), &mut patched)?;
+        image = PeImage::from_bytes(patched)?;
+    }
     image.add_section(NewSection {
         name: ".vmpvm",
         data: placement.image(),
