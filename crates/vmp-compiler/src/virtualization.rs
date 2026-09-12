@@ -15,10 +15,20 @@ use vmp_x86::{decode_function_with, DecodeOptions, Image};
 const MAX_ROOTS: usize = 4096;
 const DECODE_BUDGET: usize = 4096;
 
+/// Exactly one explicit address or one resolved code-symbol occurrence
+pub enum Selection {
+    Rva(Rva),
+    Symbol {
+        symbol: crate::SymbolSelection,
+        map: Option<String>,
+        pdb: Option<Vec<u8>>,
+    },
+}
+
 /// One explicitly selected complete leaf and any additional known code entries.
 pub struct Request {
     pub image: Vec<u8>,
-    pub rva: Rva,
+    pub selection: Selection,
     pub external_entries: Vec<Rva>,
     pub seed: u64,
 }
@@ -36,6 +46,12 @@ pub struct Product {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("loading symbols failed: {0}")]
+    Symbols(#[from] vmp_symbols::SymbolError),
+    #[error("resolving the selected symbol failed: {0}")]
+    Resolve(#[from] vmp_symbols::ResolveError),
+    #[error("symbol `{name}` is ambiguous: {matches} code occurrences; select --symbol-index")]
+    AmbiguousSymbol { name: String, matches: usize },
     #[error("loading the PE failed: {0}")]
     Pe(#[from] vmp_pe::PeError),
     #[error("decoding a known code entry failed: {0}")]
@@ -64,10 +80,39 @@ pub fn protect_virtualization(request: Request) -> Result<Product, Error> {
     if pe.architecture != Architecture::X64 {
         return Err(Error::Leaf);
     }
+    let (rva, symbols) = match request.selection {
+        Selection::Rva(rva) => (rva, None),
+        Selection::Symbol { symbol, map, pdb } => {
+            let symbols =
+                vmp_symbols::load_symbols(&pe, &request.image, map.as_deref(), pdb.as_deref())?;
+            let selector = match symbol.occurrence {
+                Some(index) => vmp_symbols::Selector::Occurrence {
+                    name: symbol.name,
+                    index,
+                },
+                None => vmp_symbols::Selector::All(symbol.name),
+            };
+            let resolved = symbols.resolve_code(&selector)?;
+            let rva = match resolved.as_slice() {
+                [rva] => *rva,
+                _ => {
+                    let name = match selector {
+                        vmp_symbols::Selector::All(name)
+                        | vmp_symbols::Selector::Occurrence { name, .. } => name,
+                    };
+                    return Err(Error::AmbiguousSymbol {
+                        name,
+                        matches: resolved.len(),
+                    });
+                }
+            };
+            (rva, Some(symbols))
+        }
+    };
     let view = Image::new(&pe, &request.image);
     let function = decode_function_with(
         view,
-        request.rva,
+        rva,
         DecodeOptions {
             budget: DECODE_BUDGET,
         },
@@ -81,17 +126,15 @@ pub fn protect_virtualization(request: Request) -> Result<Product, Error> {
         return Err(Error::Leaf);
     }
     let end = ret.rva().ok_or(Error::Leaf)?;
-    let source_length = end
-        .get()
-        .checked_sub(request.rva.get())
-        .ok_or(Error::Leaf)?;
+    let source_length = end.get().checked_sub(rva.get()).ok_or(Error::Leaf)?;
     validate_entries(
         view,
         &request.image,
-        request.rva,
+        rva,
         end,
         &request.external_entries,
         body,
+        symbols.as_ref(),
     )?;
 
     // The native decoder uses RVA coordinates; generated shadows require VA coordinates
@@ -118,7 +161,7 @@ pub fn protect_virtualization(request: Request) -> Result<Product, Error> {
     let variant = request.seed.to_le_bytes()[0];
     let artifact = vmp_emit::vm::redirect_leaf_vm_instance(request.image, &bodies, variant)?;
     Ok(Product {
-        original: request.rva,
+        original: rva,
         entry: artifact.placement().entry_rva(),
         instance: artifact.placement().rva(),
         source_length,
@@ -135,10 +178,16 @@ fn validate_entries(
     end: Rva,
     declared: &[Rva],
     selected: &[Instruction],
+    symbols: Option<&vmp_symbols::SymbolIndex>,
 ) -> Result<(), Error> {
     let mut roots = Vec::new();
     let mut add = |target| add_root(image, &mut roots, entry, end, target);
     add(entry)?;
+    if let Some(symbols) = symbols {
+        for target in symbols.code_entries() {
+            add(target)?;
+        }
+    }
     if image.pe().entry_point().get() != 0 {
         add(image.pe().entry_point())?;
     }

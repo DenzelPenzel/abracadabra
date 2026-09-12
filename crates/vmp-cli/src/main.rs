@@ -81,7 +81,7 @@ enum Command {
         /// Path to write the protected PE to.
         #[arg(long)]
         output: PathBuf,
-        /// Protection mode; virtualization currently accepts one explicit scalar leaf RVA.
+        /// Protection mode; virtualization accepts one scalar leaf by RVA or symbol.
         #[arg(long, value_enum, default_value = "mutation")]
         mode: ProtectionMode,
         /// Additional known code entry for virtualization reference analysis; repeatable.
@@ -172,8 +172,20 @@ fn run(command: &Command) -> Result<()> {
                 )
             }
             ProtectionMode::Virtualization => {
-                anyhow::ensure!(rva.len() == 1 && symbol.is_none(), "virtualization requires exactly one --rva and does not yet support --symbol or automatic selection");
-                virtualize::run(input, output, rva[0], external_entry, *seed, *json)
+                use vmp_compiler::virtualization::Selection;
+                let selection = match (rva.as_slice(), symbol) {
+                    ([rva], None) => Selection::Rva(*rva),
+                    ([], Some(name)) => {
+                        let (map, pdb) = read_symbol_sidecars(input)?;
+                        Selection::Symbol {
+                            symbol: SymbolSelection { name: try_owned_cli(name)?, occurrence: *symbol_index },
+                            map,
+                            pdb,
+                        }
+                    }
+                    _ => return Err(anyhow!("virtualization requires exactly one --rva or --symbol, not both; automatic selection is unsupported")),
+                };
+                virtualize::run(input, output, selection, external_entry, *seed, *json)
             }
         },
     }
@@ -261,23 +273,7 @@ fn cmd_protect(
         .with_context(|| format!("failed to read input file {}", input.display()))?;
     let input_size = data.len() as u64;
     let (map, pdb) = if symbol.is_some() {
-        let map_path = input.with_extension("map");
-        if let Some(bytes) =
-            read_optional_bounded(&map_path, vmp_compiler::MAX_SIDECAR_INPUT_BYTES)?
-        {
-            let map = String::from_utf8(bytes).with_context(|| {
-                format!("MAP sidecar {} is not valid UTF-8", map_path.display())
-            })?;
-            (Some(map), None)
-        } else {
-            (
-                None,
-                read_optional_bounded(
-                    &input.with_extension("pdb"),
-                    vmp_compiler::MAX_SIDECAR_INPUT_BYTES,
-                )?,
-            )
-        }
+        read_symbol_sidecars(input)?
     } else {
         (None, None)
     };
@@ -325,6 +321,23 @@ fn cmd_protect(
     }
 
     Ok(())
+}
+
+fn read_symbol_sidecars(input: &Path) -> Result<(Option<String>, Option<Vec<u8>>)> {
+    let map_path = input.with_extension("map");
+    if let Some(bytes) = read_optional_bounded(&map_path, vmp_compiler::MAX_SIDECAR_INPUT_BYTES)? {
+        let map = String::from_utf8(bytes)
+            .with_context(|| format!("MAP sidecar {} is not valid UTF-8", map_path.display()))?;
+        Ok((Some(map), None))
+    } else {
+        Ok((
+            None,
+            read_optional_bounded(
+                &input.with_extension("pdb"),
+                vmp_compiler::MAX_SIDECAR_INPUT_BYTES,
+            )?,
+        ))
+    }
 }
 
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);

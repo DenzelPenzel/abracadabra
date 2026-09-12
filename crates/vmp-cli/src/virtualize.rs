@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
-use vmp_compiler::virtualization::{protect_virtualization, Request};
+use vmp_compiler::virtualization::{protect_virtualization, Request, Selection};
 use vmp_types::Rva;
 
 #[derive(Serialize)]
@@ -24,7 +24,7 @@ struct Report {
 pub fn run(
     input: &Path,
     output: &Path,
-    rva: Rva,
+    selection: Selection,
     external_entries: &[Rva],
     seed: Option<u64>,
     json: bool,
@@ -42,7 +42,7 @@ pub fn run(
     entries.extend_from_slice(external_entries);
     let product = protect_virtualization(Request {
         image,
-        rva,
+        selection,
         external_entries: entries,
         seed: seed.get(),
     })

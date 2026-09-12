@@ -1,4 +1,4 @@
-use vmp_compiler::virtualization::{protect_virtualization, Error, Request};
+use vmp_compiler::virtualization::{protect_virtualization, Error, Request, Selection};
 use vmp_pe::PeFile;
 use vmp_types::Rva;
 
@@ -47,10 +47,68 @@ fn image(target: u32) -> Vec<u8> {
     bytes
 }
 
+fn symbol_request(bytes: Vec<u8>, map: &str, occurrence: Option<usize>) -> Request {
+    let mut input = request(bytes);
+    input.selection = Selection::Symbol {
+        symbol: vmp_compiler::SymbolSelection {
+            name: "leaf".into(),
+            occurrence,
+        },
+        map: Some(map.into()),
+        pdb: None,
+    };
+    input
+}
+
+const LEAF_MAP: &str = "# Address Size File Name\n0x140001000 0x7 [  1] leaf\n";
+
+#[test]
+fn symbol_selection_produces_the_same_pe_as_rva_selection() {
+    let bytes = image(0x1000);
+    let explicit = protect_virtualization(request(bytes.clone())).expect("RVA");
+    let named = protect_virtualization(symbol_request(bytes, LEAF_MAP, None)).expect("symbol");
+    assert_eq!(named.original, Rva(0x1000));
+    assert_eq!(named.image, explicit.image);
+}
+
+#[test]
+fn ambiguous_symbols_require_an_in_range_occurrence() {
+    let map = format!("{LEAF_MAP}0x140001020 0x7 [  1] leaf\n");
+    let mut bytes = image(0x1000);
+    bytes[0x220..0x227].copy_from_slice(&[0x48, 0x89, 0xc8, 0x48, 0x01, 0xd0, 0xc3]);
+    assert!(matches!(
+        protect_virtualization(symbol_request(bytes.clone(), &map, None)),
+        Err(Error::AmbiguousSymbol { matches: 2, .. })
+    ));
+    let selected = protect_virtualization(symbol_request(bytes.clone(), &map, Some(1)))
+        .expect("second occurrence");
+    assert_eq!(selected.original, Rva(0x1020));
+    assert!(matches!(
+        protect_virtualization(symbol_request(bytes, &map, Some(2))),
+        Err(Error::Resolve(
+            vmp_symbols::ResolveError::OccurrenceOutOfRange { .. }
+        ))
+    ));
+}
+
+#[test]
+fn unselected_code_symbols_remain_known_entry_roots() {
+    let mut bytes = image(0x1000);
+    bytes[0x220..0x226].copy_from_slice(&[0xe8, 0xde, 0xff, 0xff, 0xff, 0xc3]);
+    let map = format!("{LEAF_MAP}0x140001020 0x6 [  1] caller\n");
+    assert!(matches!(
+        protect_virtualization(symbol_request(bytes, &map, None)),
+        Err(Error::InteriorEntry {
+            target: Rva(0x1003),
+            ..
+        })
+    ));
+}
+
 fn request(image: Vec<u8>) -> Request {
     Request {
         image,
-        rva: Rva(0x1000),
+        selection: Selection::Rva(Rva(0x1000)),
         external_entries: Vec::new(),
         seed: 37,
     }
@@ -115,7 +173,7 @@ fn refuses_an_instruction_overlapping_the_selected_mov_leaf() {
     let mut bytes = image(0x1000);
     bytes[0x210..0x218].copy_from_slice(&[0xb8, 0x48, 0x89, 0xc8, 0x48, 0x89, 0xc8, 0xc3]);
     let mut input = request(bytes);
-    input.rva = Rva(0x1011);
+    input.selection = Selection::Rva(Rva(0x1011));
     input.external_entries.push(Rva(0x1010));
     assert!(
         matches!(
@@ -131,7 +189,7 @@ fn accepts_aligned_fallthrough_to_the_selected_leaf() {
     let mut bytes = image(0x1000);
     bytes[0x210..0x218].copy_from_slice(&[0x90, 0x48, 0x89, 0xc8, 0x48, 0x89, 0xc8, 0xc3]);
     let mut input = request(bytes);
-    input.rva = Rva(0x1011);
+    input.selection = Selection::Rva(Rva(0x1011));
     input.external_entries.push(Rva(0x1010));
     assert!(protect_virtualization(input).is_ok());
 }
