@@ -378,6 +378,47 @@ impl PeImage {
         )
     }
 
+    /// Adds references to unwind blobs already present in this image
+    ///
+    /// Only the sorted function array is emitted; opaque handler data stays at its
+    /// original address. The caller owns the semantics of newly generated handlers
+    pub fn extend_exception_references(
+        &mut self,
+        name: &str,
+        additional: &[RuntimeFunction],
+    ) -> Result<(), PeError> {
+        if self.pe.architecture != vmp_types::Architecture::X64 {
+            return Err(PeError::UnsupportedRewriteLayout {
+                reason: "only x64 images have a RUNTIME_FUNCTION exception directory",
+            });
+        }
+        let mut table = self.pe.exception_table.clone().unwrap_or_default();
+        for function in additional {
+            let unwind = UnwindInfo::parse(&self.pe, &self.bytes, function.unwind_info)?;
+            table.insert(FunctionEntry {
+                function: *function,
+                unwind,
+            })?;
+        }
+        let data = table.to_bytes()?;
+        self.commit(
+            NewSection {
+                name,
+                data: &data,
+                characteristics: PAYLOAD_CHARACTERISTICS,
+            },
+            &[DirectoryPlacement {
+                directory: directory::EXCEPTION,
+                offset: 0,
+                size: PeError::u32_len(data.len(), "exception payload size")?,
+            }],
+            ExpectedModels {
+                exception: Some(table),
+                ..ExpectedModels::default()
+            },
+        )
+    }
+
     /// The current relocation table, if the image is one the loader relocates.
     fn relocatable_table(&self) -> Result<BaseRelocations, PeError> {
         if self.pe.coff.characteristics & IMAGE_FILE_RELOCS_STRIPPED != 0 {
@@ -1731,6 +1772,47 @@ mod tests {
             ),
             Err(PeError::UnsupportedRewriteLayout { .. })
         ));
+    }
+
+    #[test]
+    fn extends_exception_references_without_reemitting_handler_data() {
+        let mut owned = PeImage::from_bytes(image_with_exception_table()).expect("image");
+        let original = owned.pe().exception_table.clone().expect("original table");
+        let rva = owned.next_section_rva().expect("section RVA");
+        let blob = [9, 0, 0, 0, 0, 0x10, 0, 0, 0x12, 0x34, 0x56, 0x78];
+        owned
+            .add_section(NewSection {
+                name: ".testeh",
+                data: &blob,
+                characteristics: 0x4000_0040,
+            })
+            .expect("handler metadata");
+        let function = RuntimeFunction {
+            begin: Rva(0x1020),
+            end: Rva(0x1030),
+            unwind_info: rva,
+        };
+        owned
+            .extend_exception_references(".testpd", &[function])
+            .expect("merge");
+        let entries = owned
+            .pe()
+            .exception_table
+            .as_ref()
+            .expect("table")
+            .entries();
+        assert_eq!(&entries[..original.len()], original.entries());
+        assert_eq!(
+            entries.last().expect("added").unwind.handler,
+            Some(Rva(0x1000))
+        );
+        let offset = owned.pe().rva_to_offset(rva).expect("blob").get() as usize;
+        assert_eq!(&owned.bytes()[offset..offset + blob.len()], &blob);
+        let before = owned.bytes().to_vec();
+        assert!(owned
+            .extend_exception_references(".bad", &[function])
+            .is_err());
+        assert_eq!(owned.bytes(), before);
     }
 
     /// An image carrying relocations, TLS and unwind data at once.

@@ -8,13 +8,15 @@
 //! Context, both stack scratch regions and image must be disjoint; flags output guarantees
 //! only arithmetic bits. Native control flags must be benign (no TF); this is not POPF replay
 //! Encrypted bodies additionally require RDI = `initial_key` and use it as scratch
-//! `NativeInstance` adds scalar capture/restore; neither emits stack growth,
-//! relocation records or unwind metadata
+//! `NativeInstance` adds scalar capture/restore and optional leaf body exception metadata
+//! Neither emits stack growth or serialized PE directories
 
 use std::ops::Range;
 mod cryptor;
+mod unwind;
 use cryptor::{ByteCryptor, Cryptors};
 use thiserror::Error;
+pub use unwind::LeafUnwind;
 use vmp_types::VirtualAddress;
 
 use crate::{
@@ -33,6 +35,8 @@ pub enum InstanceError {
     UnsupportedCommand,
     #[error("unable to allocate bounded instance storage")]
     Allocation,
+    #[error("body-only unwind requires contiguous leaf instructions writing volatile registers")]
+    UnsupportedLeaf,
 }
 
 /// One placed body instance; all offsets are relative to the supplied image base
@@ -42,6 +46,7 @@ pub struct BodyInstance {
     stream: Range<usize>,
     table: usize,
     handlers: [usize; 3],
+    flags_pop: Range<usize>,
     opcodes: [u8; 3],
     variant: u8,
     initial_key: Option<u64>,
@@ -113,7 +118,10 @@ impl BodyInstance {
         let add = image.len();
         image.extend_from_slice(&[0x48, 0x8b, 0x45, 0]);
         image.extend_from_slice(&[0x48, 0x03, 0x45, 8]); // add rax, [rbp + 8]
-        image.extend_from_slice(&[0x48, 0x89, 0x45, 8, 0x9c, 0x8f, 0x45, 0]);
+        image.extend_from_slice(&[0x48, 0x89, 0x45, 8, 0x9c]);
+        let flags_pop_start = image.len();
+        image.extend_from_slice(&[0x8f, 0x45, 0]);
+        let flags_pop = flags_pop_start..image.len();
         jump_dispatch(&mut image);
         while image.len() % 8 != 0 {
             image.push(0xcc);
@@ -185,6 +193,7 @@ impl BodyInstance {
             stream: start..end,
             table,
             handlers,
+            flags_pop,
             opcodes,
             variant,
             initial_key,
@@ -233,13 +242,16 @@ impl BodyInstance {
 /// Captures RFLAGS and all GPRs except RSP before using work registers, and restores
 /// them from the modified context before RET. Only arithmetic flags are promised for ADD
 /// The caller supplies a writable native stack, benign control flags and the original
-/// return address. No exception/unwind, SIMD/control-state or PE integration is claimed
+/// return address. The leaf-unwind constructor additionally describes entry, body and exit
+/// SIMD/control-state preservation and PE serialization are outside this generator
 #[derive(Debug)]
 pub struct NativeInstance {
     body: BodyInstance,
     entry: usize,
     exit: usize,
     gate_addresses: [usize; 4],
+    shadow_address: Option<usize>,
+    unwind: Option<LeafUnwind>,
 }
 
 impl NativeInstance {
@@ -248,7 +260,7 @@ impl NativeInstance {
         base: VirtualAddress,
         variant: u8,
     ) -> Result<Self, InstanceError> {
-        Self::with_body(BodyInstance::generate(bodies, base, variant)?, base)
+        Self::with_body(BodyInstance::generate(bodies, base, variant)?, base, None)
     }
 
     /// Initializes the instance-owned rolling key after capturing all guest registers
@@ -260,10 +272,59 @@ impl NativeInstance {
         Self::with_body(
             BodyInstance::generate_encrypted(bodies, base, variant)?,
             base,
+            None,
         )
     }
 
-    fn with_body(mut body: BodyInstance, base: VirtualAddress) -> Result<Self, InstanceError> {
+    /// Generates an encrypted leaf with native shadows and a body-only exception handler
+    ///
+    /// The source instructions must be the complete contiguous body of a native leaf
+    /// with no prologue, stack changes or nonvolatile writes; its RET is not a body
+    /// The caller must retain its native address/range for subsequent Windows unwind
+    /// Gate metadata tracks partial saves and restores without invoking the body handler
+    pub fn generate_leaf_unwind(
+        bodies: &[LogicalInstruction<'_>],
+        base: VirtualAddress,
+        variant: u8,
+    ) -> Result<Self, InstanceError> {
+        use iced_x86::Register as R;
+        let first = bodies
+            .first()
+            .ok_or(InstanceError::BodyCount)?
+            .source()
+            .raw()
+            .ip();
+        let mut expected = first;
+        for body in bodies {
+            let raw = body.source().raw();
+            if raw.ip() != expected
+                || !matches!(
+                    raw.op0_register(),
+                    R::RAX | R::RCX | R::RDX | R::R8 | R::R9 | R::R10 | R::R11
+                )
+            {
+                return Err(InstanceError::UnsupportedLeaf);
+            }
+            expected = expected
+                .checked_add(raw.len() as u64)
+                .ok_or(InstanceError::AddressOverflow)?;
+        }
+        Self::with_body(
+            BodyInstance::generate_encrypted(bodies, base, variant)?,
+            base,
+            Some(first),
+        )
+    }
+
+    pub fn unwind(&self) -> Option<&LeafUnwind> {
+        self.unwind.as_ref()
+    }
+
+    fn with_body(
+        mut body: BodyInstance,
+        base: VirtualAddress,
+        native_rip: Option<u64>,
+    ) -> Result<Self, InstanceError> {
         // Native register IDs in ascending context-slot order; 16 denotes flags
         let mut order = [16u8; 16];
         for register in [
@@ -293,24 +354,44 @@ impl NativeInstance {
             body.image.extend_from_slice(&[0x48, 0x89, 0x45, offset]);
         }
         body.image.extend_from_slice(&[0x48, 0x89, 0xec]); // mov rsp, rbp
-        for id in order {
-            saved_register(&mut body.image, id, false);
+        let mut exit_unwind = Vec::new();
+        if native_rip.is_some() {
+            exit_unwind.push((exit..body.image.len(), unwind::exit_codes(&order, true)));
         }
+        for (index, id) in order.into_iter().enumerate() {
+            let start = body.image.len();
+            saved_register(&mut body.image, id, false);
+            if native_rip.is_some() {
+                exit_unwind.push((
+                    start..body.image.len(),
+                    unwind::exit_codes(&order[index..], false),
+                ));
+            }
+        }
+        let ret = body.image.len();
         body.image.push(0xc3);
+        if native_rip.is_some() {
+            exit_unwind.push((ret..body.image.len(), unwind::exit_codes(&[], false)));
+        }
 
         let entry = body.image.len();
-        for id in order.into_iter().rev() {
+        let mut push_offsets = [0; 16];
+        for (index, id) in order.into_iter().rev().enumerate() {
             saved_register(&mut body.image, id, true);
+            push_offsets[index] = (body.image.len() - entry) as u8;
         }
         body.image.extend_from_slice(&[0x48, 0x89, 0xe5]); // mov rbp, rsp
         body.image
             .extend_from_slice(&[0x48, 0x81, 0xec, 0, 1, 0, 0]); // sub rsp, 256
-                                                                 // The body addresses context at RSP; its descending VM stack starts at RBP
+        let entry_codes =
+            unwind::entry_codes(order, push_offsets, (body.image.len() - entry) as u8);
+        // The body addresses context at RSP; its descending VM stack starts at RBP
         for offset in (0..128u8).step_by(8) {
             body.image.extend_from_slice(&[0x48, 0x8b, 0x45, offset]);
             body.image
                 .extend_from_slice(&[0x48, 0x89, 0x44, 0x24, offset]);
         }
+        let shadow_address = native_rip.map(|rip| unwind::shadows(&mut body, rip));
         let mut gate_addresses = [0; 4];
         for (index, (prefix, offset)) in [
             ([0x48, 0xbe], body.stream.start),
@@ -330,14 +411,21 @@ impl NativeInstance {
             gate_addresses[3] = body.image.len();
             body.image.extend_from_slice(&key.to_le_bytes());
         }
-        jump_dispatch(&mut body.image);
+        // A register-direct jump is not a Windows tail epilogue; the entry frame is still live
+        body.image.extend_from_slice(&[0x48, 0x8d, 0x05]);
+        relative(&mut body.image, 4);
+        body.image.extend_from_slice(&[0xff, 0xe0]);
         // Retarget the owned dispatch completion JE, leaving raw-body layout unchanged
         body.image[9..13].copy_from_slice(&(exit as i32 - 13).to_le_bytes());
+        let unwind =
+            native_rip.map(|_| unwind::handler(&mut body, entry, entry_codes, exit_unwind));
         Ok(Self {
             body,
             entry,
             exit,
             gate_addresses,
+            shadow_address,
+            unwind,
         })
     }
 
@@ -365,6 +453,7 @@ impl NativeInstance {
         };
         (self.body.table..self.body.table + 256 * 8)
             .step_by(8)
+            .chain(self.shadow_address)
             .chain(self.gate_addresses[..count].iter().copied())
     }
     /// Below gate-entry RSP: 128 saved bytes, 256 scratch bytes, one PUSHF qword

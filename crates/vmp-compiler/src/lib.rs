@@ -5,6 +5,8 @@
 
 use std::collections::HashSet;
 
+pub mod virtualization;
+
 /// Mutation-only compatibility alias for the emitter outcome.
 ///
 /// Kept at the compiler boundary so frontends do not depend on `vmp-emit`;
