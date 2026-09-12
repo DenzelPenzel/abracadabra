@@ -15,22 +15,31 @@ def records(pe):
 
 
 def main():
-    redirected = sys.argv[-1:] == ['--redirect']
+    cli = sys.argv[-1:] == ['--cli']
+    redirected = cli or sys.argv[-1:] == ['--redirect']
     source, catcher = map(lambda s: Path(s).resolve(), sys.argv[1:-1] if redirected else sys.argv[1:])
     original = pefile.PE(str(source))
     old = records(original)
     assert old, 'fixture must contain an original runtime entry'
     native = next(s.address for s in original.DIRECTORY_ENTRY_EXPORT.symbols if s.name == b'VmOriginal')
-    out = Path('target/leaf-pe-redirect' if redirected else 'target/leaf-pe-unwind')
+    out = Path('target/leaf-pe-cli' if cli else 'target/leaf-pe-redirect' if redirected else 'target/leaf-pe-unwind')
     out.mkdir(parents=True, exist_ok=True)
     results = []
     entry_results = []
     exit_results = []
     for variant in (0, 1, 127, 255):
         path = (out / f'{variant}.dll').resolve()
-        row = json.loads(subprocess.check_output(['cargo', 'run', '-q', '-p', 'vmp-emit', '--example',
-                        'emit_leaf_pe', '--', str(source), str(path), str(variant)] +
-                        (['--redirect'] if redirected else []), text=True))
+        if cli:
+            report = json.loads(subprocess.check_output(['cargo', 'run', '-q', '-p', 'vmp-cli', '--',
+                'protect', str(source), '--output', str(path), '--mode', 'virtualization',
+                '--rva', str(native), '--seed', str(variant), '--json'], text=True))
+            assert report['mode'] == 'virtualization' and report['seed'] == variant
+            (out / f'{variant}-cli.json').write_text(json.dumps(report, indent=2) + '\n')
+            row = {key: int(report[key], 16) for key in ('entry', 'instance')}
+        else:
+            row = json.loads(subprocess.check_output(['cargo', 'run', '-q', '-p', 'vmp-emit', '--example',
+                            'emit_leaf_pe', '--', str(source), str(path), str(variant)] +
+                            (['--redirect'] if redirected else []), text=True))
         pe = pefile.PE(str(path))
         entries = records(pe)
         assert entries[:len(old)] == old and len(entries) == len(old) + 24

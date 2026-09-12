@@ -10,6 +10,9 @@ on:
       - crates/vmp-pe/**
       - crates/vmp-ir/**
       - crates/vmp-types/**
+      - crates/vmp-x86/**
+      - crates/vmp-compiler/**
+      - crates/vmp-cli/**
       - Cargo.toml
       - Cargo.lock
       - .github/workflows/cpp-unwind-proof.yml
@@ -70,6 +73,8 @@ jobs:
         run: python crates/vmp-emit/tests/proofs/leaf_pe.py leaf-loader.dll native-dispatch.exe
       - name: Execute redirected original-RVA PE unwind
         run: python crates/vmp-emit/tests/proofs/leaf_pe.py leaf-loader.dll native-dispatch.exe --redirect
+      - name: Execute CLI-produced original-RVA PE unwind
+        run: python crates/vmp-emit/tests/proofs/leaf_pe.py leaf-loader.dll native-dispatch.exe --cli
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
         with:
@@ -86,5 +91,6 @@ jobs:
             target/rust-exit-unwind/*.json
             target/leaf-pe-unwind/*.json
             target/leaf-pe-redirect/*.json
+            target/leaf-pe-cli/*.json
           if-no-files-found: warn
           retention-days: 7

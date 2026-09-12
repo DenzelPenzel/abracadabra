@@ -7,6 +7,7 @@
 mod disasm;
 mod protect;
 mod report;
+mod virtualize;
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
@@ -19,6 +20,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ProtectionMode {
+    Mutation,
+    Virtualization,
+}
 use vmp_compiler::{
     protect_mutation, Error as CompilerError, MutationRequest, Seed, SymbolSelection,
 };
@@ -67,13 +74,19 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Mutate functions into an appended section and write a protected PE.
+    /// Protect functions and write a protected PE.
     Protect {
         /// Path to the input PE file.
         input: PathBuf,
         /// Path to write the protected PE to.
         #[arg(long)]
         output: PathBuf,
+        /// Protection mode; virtualization currently accepts one explicit scalar leaf RVA.
+        #[arg(long, value_enum, default_value = "mutation")]
+        mode: ProtectionMode,
+        /// Additional known code entry for virtualization reference analysis; repeatable.
+        #[arg(long, value_parser = parse_rva)]
+        external_entry: Vec<Rva>,
         /// RVA of a function entry to protect; repeatable. Without an explicit
         /// selector, SDK markers take precedence over the exception-directory
         /// sweep. Accepts `0x`-prefixed hex.
@@ -135,20 +148,34 @@ fn run(command: &Command) -> Result<()> {
         Command::Protect {
             input,
             output,
+            mode,
+            external_entry,
             rva,
             symbol,
             symbol_index,
             seed,
             json,
-        } => cmd_protect(
-            input,
-            output,
-            rva,
-            symbol.as_deref(),
-            *symbol_index,
-            *seed,
-            *json,
-        ),
+        } => match mode {
+            ProtectionMode::Mutation => {
+                anyhow::ensure!(
+                    external_entry.is_empty(),
+                    "--external-entry requires --mode virtualization"
+                );
+                cmd_protect(
+                    input,
+                    output,
+                    rva,
+                    symbol.as_deref(),
+                    *symbol_index,
+                    *seed,
+                    *json,
+                )
+            }
+            ProtectionMode::Virtualization => {
+                anyhow::ensure!(rva.len() == 1 && symbol.is_none(), "virtualization requires exactly one --rva and does not yet support --symbol or automatic selection");
+                virtualize::run(input, output, rva[0], external_entry, *seed, *json)
+            }
+        },
     }
 }
 
