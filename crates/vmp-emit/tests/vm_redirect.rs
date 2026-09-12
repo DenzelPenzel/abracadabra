@@ -10,12 +10,18 @@ fn redirected_leaf_preserves_ret_and_targets_generated_entry() {
         include_bytes!("../../vmp-pe/test-corpus/win64-app-msvc-amd64").to_vec(),
     )
     .expect("fixture");
-    let rva = image.next_section_rva().expect("leaf RVA");
+    let rva = image
+        .next_section_rva()
+        .expect("section RVA")
+        .checked_add(8)
+        .expect("leaf RVA");
     let code = [0x48, 0x89, 0xc8, 0x48, 0x01, 0xd0, 0xc3, 0x90];
+    let mut section = vec![0; 8];
+    section.extend_from_slice(&code);
     image
         .add_section(vmp_pe::NewSection {
             name: ".leaf",
-            data: &code,
+            data: &section,
             characteristics: 0x6000_0020,
         })
         .expect("leaf");
@@ -51,6 +57,31 @@ fn redirected_leaf_preserves_ret_and_targets_generated_entry() {
             .0
     );
     assert_eq!(&patched[5..], &[0x90, 0xc3]);
+    for kind in [vmp_pe::FixupKind::HighLow, vmp_pe::FixupKind::Dir64] {
+        for overlap in [false, true] {
+            let mut candidate =
+                vmp_pe::PeImage::from_bytes(image.bytes().to_vec()).expect("candidate");
+            candidate
+                .extend_base_relocations(
+                    ".edge",
+                    &[vmp_pe::Fixup {
+                        rva: vmp_types::Rva(rva.get() - kind.width() + u32::from(overlap)),
+                        kind,
+                    }],
+                )
+                .expect("boundary relocation");
+            let result =
+                vmp_emit::vm::redirect_leaf_vm_instance(candidate.into_bytes(), &bodies, 37);
+            if overlap {
+                assert!(matches!(
+                    result,
+                    Err(vmp_emit::vm::VmEmbeddingError::LeafSource)
+                ));
+            } else {
+                assert!(result.is_ok(), "adjacent {kind:?} must not overlap");
+            }
+        }
+    }
     assert!(matches!(
         vmp_emit::vm::redirect_leaf_vm_instance(image.bytes().to_vec(), &bodies[1..], 37),
         Err(vmp_emit::vm::VmEmbeddingError::LeafSource)

@@ -36,7 +36,7 @@ pub enum VmEmbeddingError {
     Placement(#[from] VmPlacementError),
 }
 
-/// Serialized PE with an appended VM that is not connected to its original entry point
+/// Serialized PE with an appended VM and optional original-entry redirection
 pub struct VmPeArtifact {
     image: PeImage,
     placement: VmPlacement,
@@ -173,7 +173,8 @@ fn append_instance(
             || image.pe().base_relocations.as_ref().is_some_and(|relocs| {
                 relocs.fixups().iter().any(|fixup| {
                     u64::from(fixup.rva.get()) < u64::from(end.get())
-                        && u64::from(fixup.rva.get()) + 8 > u64::from(start.get())
+                        && u64::from(fixup.rva.get()) + u64::from(fixup.kind.width())
+                            > u64::from(start.get())
                 })
             })
         {
