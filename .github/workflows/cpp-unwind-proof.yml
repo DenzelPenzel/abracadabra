@@ -1,0 +1,102 @@
+name: C++ Windows unwind proof
+
+on:
+  push:
+    branches: [test/cpp-windows-unwind-proof]
+  pull_request:
+    paths:
+      - crates/vmp-vm/**
+      - crates/vmp-emit/**
+      - crates/vmp-pe/**
+      - crates/vmp-ir/**
+      - crates/vmp-types/**
+      - crates/vmp-x86/**
+      - crates/vmp-compiler/**
+      - crates/vmp-cli/**
+      - crates/vmp-symbols/**
+      - crates/vmp-demangle/**
+      - crates/vmp-pdb/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/cpp-unwind-proof.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-unwind:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: x64
+      - name: Install pinned proof dependencies
+        run: python -m pip install unicorn==2.1.4 pefile==2024.8.26
+      - name: Execute Windows metadata and callback proof
+        run: |
+          python crates/vmp-vm/tests/proofs/cpp_unwind/test_safety.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python crates/vmp-vm/tests/proofs/cpp_unwind/windows.py 2>&1 | Tee-Object -Variable output
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $passed = @($output | Where-Object { $_ -eq 'PASS: 30 Windows metadata/handler walks; 30 removed-table lookup negatives' })
+          if ($passed.Count -ne 1) { throw "Windows unwind proof did not execute exactly 30 cases" }
+      - name: Pin original C++ early-entry metadata gap
+        run: python crates/vmp-vm/tests/proofs/cpp_unwind/windows.py --entry-boundaries
+      - name: Observe original C++ exit boundary unwind
+        run: python crates/vmp-vm/tests/proofs/cpp_unwind/windows.py --exit-boundaries
+      - name: Build native exception probe
+        shell: cmd
+        run: cl /nologo /W4 /WX /Od crates\vmp-vm\tests\proofs\cpp_unwind\native_dispatch.c /Fe:native-dispatch.exe /Fo:native-dispatch.obj /link /dynamicbase /base:0x180000000
+      - name: Probe native C++ early-entry exceptions
+        run: python crates/vmp-vm/tests/proofs/cpp_unwind/entry_dispatch.py native-dispatch.exe
+      - name: Observe native C++ exit exceptions
+        run: python crates/vmp-vm/tests/proofs/cpp_unwind/exit_dispatch.py native-dispatch.exe
+      - name: Verify Rust entry unwind at every instruction boundary
+        run: python crates/vmp-vm/tests/proofs/cpp_unwind/rust_entry.py
+      - name: Verify Rust exit unwind at every instruction boundary
+        run: python crates/vmp-vm/tests/proofs/cpp_unwind/rust_exit.py
+      - name: Execute native exception dispatch
+        run: |
+          python crates/vmp-vm/tests/proofs/cpp_unwind/native_dispatch.py native-dispatch.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python crates/vmp-vm/tests/proofs/cpp_unwind/rust_leaf.py native-dispatch.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build persisted PE fixture
+        shell: cmd
+        run: |
+          ml64 /nologo /c /Foleaf-loader.obj crates\vmp-emit\tests\proofs\leaf_loader.asm
+          if errorlevel 1 exit /b 1
+          link /nologo /dll /noentry /dynamicbase /base:0x140000000 /export:VmOriginal /out:leaf-loader.dll leaf-loader.obj
+      - name: Execute persisted PE unwind
+        run: python crates/vmp-emit/tests/proofs/leaf_pe.py leaf-loader.dll native-dispatch.exe
+      - name: Execute redirected original-RVA PE unwind
+        run: python crates/vmp-emit/tests/proofs/leaf_pe.py leaf-loader.dll native-dispatch.exe --redirect
+      - name: Execute CLI-produced original-RVA PE unwind
+        run: python crates/vmp-emit/tests/proofs/leaf_pe.py leaf-loader.dll native-dispatch.exe --cli
+      - name: Execute symbol-selected CLI PE unwind
+        run: python crates/vmp-emit/tests/proofs/leaf_pe.py leaf-loader.dll native-dispatch.exe --cli-symbol
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: cpp-windows-unwind-results
+          path: |
+            cpp-windows-unwind-results.json
+            cpp-windows-entry-boundaries.json
+            cpp-windows-exit-boundaries.json
+            target/cpp-native-dispatch/*.json
+            target/cpp-entry-dispatch/*.json
+            target/cpp-exit-dispatch/*.json
+            target/rust-leaf-unwind/*.json
+            target/rust-entry-unwind/*.json
+            target/rust-exit-unwind/*.json
+            target/leaf-pe-unwind/*.json
+            target/leaf-pe-redirect/*.json
+            target/leaf-pe-cli/*.json
+            target/leaf-pe-cli-symbol/*.json
+          if-no-files-found: warn
+          retention-days: 7

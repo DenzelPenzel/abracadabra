@@ -379,6 +379,14 @@ impl SymbolIndex {
         Ok(())
     }
 
+    /// All known code addresses, including unselected names and aliases
+    pub fn code_entries(&self) -> impl Iterator<Item = Rva> + '_ {
+        self.symbols
+            .iter()
+            .filter(|symbol| symbol.kind.is_code())
+            .map(|symbol| symbol.rva)
+    }
+
     pub fn resolve_code(&self, selector: &Selector) -> Result<Vec<Rva>, ResolveError> {
         let (name, occurrence) = match selector {
             Selector::All(name) => (name, None),

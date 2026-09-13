@@ -4,14 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A ground-up Rust rewrite of the VMProtect 3.5.1 executable protector. Host platform is
+A standalone executable protector written in Rust. Host platform is
 macOS on Apple Silicon, the first and only target is Windows x64 PE, and the interface is
 a CLI (`vmp`).
 
 The original C++ tree sits one level up: `../core/` (the protector), `../runtime/`,
 `../unit-tests/`, `../test-binaries/`. It is **technical documentation and a behavioural
 oracle, never a build dependency** — it is not compiled, not patched, and no C++ ships in
-the product. Byte-for-byte compatibility with VMProtect output is explicitly out of scope.
+the product. Byte-for-byte compatibility with the reference implementation's output is explicitly out of scope.
 
 Two protection modes are planned. `Mutation` is functionally closed end to end (select →
 decode → mutate → append section → atomic publish, with a real Windows execution gate).
