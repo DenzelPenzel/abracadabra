@@ -16,3 +16,7 @@ path = "tests/proofs/emit_instance.rs"
 
 [lints]
 workspace = true
+
+[[example]]
+name = "leaf_unwind"
+path = "tests/proofs/emit_leaf_unwind.rs"

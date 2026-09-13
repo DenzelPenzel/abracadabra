@@ -310,12 +310,15 @@ dependencies = [
 name = "vmp-compiler"
 version = "0.1.0"
 dependencies = [
+ "iced-x86",
  "thiserror",
  "vmp-emit",
+ "vmp-ir",
  "vmp-mutation",
  "vmp-pe",
  "vmp-symbols",
  "vmp-types",
+ "vmp-vm",
  "vmp-x86",
 ]
 
