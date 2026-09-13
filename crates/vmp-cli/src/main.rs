@@ -175,15 +175,16 @@ fn run(command: &Command) -> Result<()> {
                 use vmp_compiler::virtualization::Selection;
                 let selection = match (rva.as_slice(), symbol) {
                     ([rva], None) => Selection::Rva(*rva),
-                    ([], Some(name)) => {
-                        let (map, pdb) = read_symbol_sidecars(input)?;
-                        Selection::Symbol {
-                            symbol: SymbolSelection { name: try_owned_cli(name)?, occurrence: *symbol_index },
-                            map,
-                            pdb,
-                        }
+                    ([], Some(name)) => Selection::Symbol(SymbolSelection {
+                        name: try_owned_cli(name)?,
+                        occurrence: *symbol_index,
+                    }),
+                    _ => {
+                        return Err(anyhow!(
+                            "virtualization requires exactly one --rva or --symbol, not both; \
+                             automatic selection is unsupported"
+                        ));
                     }
-                    _ => return Err(anyhow!("virtualization requires exactly one --rva or --symbol, not both; automatic selection is unsupported")),
                 };
                 virtualize::run(input, output, selection, external_entry, *seed, *json)
             }

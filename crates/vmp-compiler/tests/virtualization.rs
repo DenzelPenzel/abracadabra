@@ -49,14 +49,11 @@ fn image(target: u32) -> Vec<u8> {
 
 fn symbol_request(bytes: Vec<u8>, map: &str, occurrence: Option<usize>) -> Request {
     let mut input = request(bytes);
-    input.selection = Selection::Symbol {
-        symbol: vmp_compiler::SymbolSelection {
-            name: "leaf".into(),
-            occurrence,
-        },
-        map: Some(map.into()),
-        pdb: None,
-    };
+    input.selection = Selection::Symbol(vmp_compiler::SymbolSelection {
+        name: "leaf".into(),
+        occurrence,
+    });
+    input.map = Some(map.into());
     input
 }
 
@@ -96,19 +93,27 @@ fn unselected_code_symbols_remain_known_entry_roots() {
     let mut bytes = image(0x1000);
     bytes[0x220..0x226].copy_from_slice(&[0xe8, 0xde, 0xff, 0xff, 0xff, 0xc3]);
     let map = format!("{LEAF_MAP}0x140001020 0x6 [  1] caller\n");
-    assert!(matches!(
-        protect_virtualization(symbol_request(bytes, &map, None)),
-        Err(Error::InteriorEntry {
-            target: Rva(0x1003),
-            ..
-        })
-    ));
+    for by_rva in [false, true] {
+        let mut input = symbol_request(bytes.clone(), &map, None);
+        if by_rva {
+            input.selection = Selection::Rva(Rva(0x1000));
+        }
+        assert!(matches!(
+            protect_virtualization(input),
+            Err(Error::InteriorEntry {
+                target: Rva(0x1003),
+                ..
+            })
+        ));
+    }
 }
 
 fn request(image: Vec<u8>) -> Request {
     Request {
         image,
         selection: Selection::Rva(Rva(0x1000)),
+        map: None,
+        pdb: None,
         external_entries: Vec::new(),
         seed: 37,
     }

@@ -161,6 +161,17 @@ fn symbol_selection_uses_sidecars_and_preserves_output_on_resolution_failure() {
             std::fs::read(&output).expect("unchanged destination")
         );
     }
+    let result = invoke(&["--rva", "0x1000"]);
+    assert!(
+        !result.status.success(),
+        "RVA selection must analyze the same MAP caller"
+    );
+    assert!(result.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("replaced interior"));
+    assert_eq!(
+        expected,
+        std::fs::read(&output).expect("unchanged RVA destination")
+    );
 }
 
 #[test]

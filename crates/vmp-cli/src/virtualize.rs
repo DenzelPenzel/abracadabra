@@ -32,6 +32,7 @@ pub fn run(
     let image = std::fs::read(input)
         .with_context(|| format!("failed to read input file {}", input.display()))?;
     let input_size = image.len() as u64;
+    let (map, pdb) = super::read_symbol_sidecars(input)?;
     let seed = super::protection_seed(seed, |bytes| {
         getrandom::fill(bytes).map_err(|error| anyhow!("system CSPRNG failed: {error}"))
     })?;
@@ -43,6 +44,8 @@ pub fn run(
     let product = protect_virtualization(Request {
         image,
         selection,
+        map,
+        pdb,
         external_entries: entries,
         seed: seed.get(),
     })

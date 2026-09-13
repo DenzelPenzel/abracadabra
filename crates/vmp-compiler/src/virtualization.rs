@@ -18,17 +18,15 @@ const DECODE_BUDGET: usize = 4096;
 /// Exactly one explicit address or one resolved code-symbol occurrence
 pub enum Selection {
     Rva(Rva),
-    Symbol {
-        symbol: crate::SymbolSelection,
-        map: Option<String>,
-        pdb: Option<Vec<u8>>,
-    },
+    Symbol(crate::SymbolSelection),
 }
 
 /// One explicitly selected complete leaf and any additional known code entries.
 pub struct Request {
     pub image: Vec<u8>,
     pub selection: Selection,
+    pub map: Option<String>,
+    pub pdb: Option<Vec<u8>>,
     pub external_entries: Vec<Rva>,
     pub seed: u64,
 }
@@ -80,11 +78,15 @@ pub fn protect_virtualization(request: Request) -> Result<Product, Error> {
     if pe.architecture != Architecture::X64 {
         return Err(Error::Leaf);
     }
-    let (rva, symbols) = match request.selection {
-        Selection::Rva(rva) => (rva, None),
-        Selection::Symbol { symbol, map, pdb } => {
-            let symbols =
-                vmp_symbols::load_symbols(&pe, &request.image, map.as_deref(), pdb.as_deref())?;
+    let symbols = vmp_symbols::load_symbols(
+        &pe,
+        &request.image,
+        request.map.as_deref(),
+        request.pdb.as_deref(),
+    )?;
+    let rva = match request.selection {
+        Selection::Rva(rva) => rva,
+        Selection::Symbol(symbol) => {
             let selector = match symbol.occurrence {
                 Some(index) => vmp_symbols::Selector::Occurrence {
                     name: symbol.name,
@@ -106,7 +108,7 @@ pub fn protect_virtualization(request: Request) -> Result<Product, Error> {
                     });
                 }
             };
-            (rva, Some(symbols))
+            rva
         }
     };
     let view = Image::new(&pe, &request.image);
@@ -134,7 +136,7 @@ pub fn protect_virtualization(request: Request) -> Result<Product, Error> {
         end,
         &request.external_entries,
         body,
-        symbols.as_ref(),
+        &symbols,
     )?;
 
     // The native decoder uses RVA coordinates; generated shadows require VA coordinates
@@ -178,15 +180,13 @@ fn validate_entries(
     end: Rva,
     declared: &[Rva],
     selected: &[Instruction],
-    symbols: Option<&vmp_symbols::SymbolIndex>,
+    symbols: &vmp_symbols::SymbolIndex,
 ) -> Result<(), Error> {
     let mut roots = Vec::new();
     let mut add = |target| add_root(image, &mut roots, entry, end, target);
     add(entry)?;
-    if let Some(symbols) = symbols {
-        for target in symbols.code_entries() {
-            add(target)?;
-        }
+    for target in symbols.code_entries() {
+        add(target)?;
     }
     if image.pe().entry_point().get() != 0 {
         add(image.pe().entry_point())?;
