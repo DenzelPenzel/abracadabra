@@ -152,13 +152,31 @@ The reviewer did not execute Cargo, native, Unicorn or Windows gates; the local
 execution results above belong to the primary verification run. The verdict is not
 acceptance of the full randomized generator or complete C++ compiler/PE execution.
 
+## Windows execution
+
+The [Windows workflow](https://github.com/DenzelPenzel/abracadabra/actions/runs/35273113779)
+passed on `db202f2ec2b5e055233ce693a8b9a8c8b4a0c9a7`. It built a separate SUB
+fixture and subtraction catcher, published the protected PE through the CLI, and
+executed it with the Windows loader and native exception dispatcher.
+
+The downloaded SUB observations contain exactly:
+
+- 280 positive entry metadata walks and 276 removed-metadata negatives
+- 200 positive exit metadata walks and four removed-metadata negatives
+- 72 normal body returns, 72 exception dispatches and 72 removed-handler negatives,
+  covering ADD/NOR and both flags-pop/after-pop windows
+- 16 entry returns and 16 entry exceptions without the body handler
+- 72 exit returns and 72 exit exceptions without the body handler
+
+The native cases cover all four layouts and the declared argument/site matrices;
+removed-handler cases end with the exact expected illegal-instruction status, not
+an arbitrary failure. This is bounded Windows execution evidence, separate from
+the Rosetta CPU comparisons and Unicorn frame/relocation proofs.
+
 ## Acceptance limits
 
-Rosetta is a physical CPU oracle, not Windows. Unicorn does not prove the Windows
-loader or OS exception dispatch. The Windows workflow adds a separately assembled SUB
-leaf and separately compiled subtraction catcher, CLI-published PE execution, faults in
-both ALU/flags windows, and entry/exit metadata walks. That workflow has not been run
-on this local uncommitted change. Complete Windows acceptance remains pending.
+The exception probes instrument selected instructions and do not establish exception
+resumption or full SIMD/FP preservation at every possible machine boundary.
 
 The original C++ tree, SDK contract, selection policy and unsupported-input boundaries
 are unchanged. Full randomized cryptor generation, NAND branch coverage and the general

@@ -114,7 +114,10 @@ fn sub_matches_extracted_cpp_lowering_including_discarded_flags() {
     let actual: String = body.commands().iter().map(cpp_sub_row).collect();
     let fixture = include_str!("fixtures/cpp_sub_qword.txt").replace("\r\n", "\n");
     for expected in [fixture.clone(), fixture.replace('\n', "\r\n")] {
-        assert_eq!(actual, expected);
+        assert_eq!(
+            actual.lines().collect::<Vec<_>>(),
+            expected.lines().collect::<Vec<_>>()
+        );
     }
 }
 
