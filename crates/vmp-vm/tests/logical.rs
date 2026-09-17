@@ -112,7 +112,10 @@ fn sub_matches_extracted_cpp_lowering_including_discarded_flags() {
     let source = decoded(&[0x48, 0x29, 0xd0]);
     let body = lower_instruction(Architecture::X64, &source).expect("SUB");
     let actual: String = body.commands().iter().map(cpp_sub_row).collect();
-    assert_eq!(actual, include_str!("fixtures/cpp_sub_qword.txt"));
+    let fixture = include_str!("fixtures/cpp_sub_qword.txt").replace("\r\n", "\n");
+    for expected in [fixture.clone(), fixture.replace('\n', "\r\n")] {
+        assert_eq!(actual, expected);
+    }
 }
 
 fn cpp_sub_row(command: &Command) -> String {
