@@ -211,7 +211,7 @@ impl VmPlacement {
     /// Generates at the final placement before translating instance-owned pointer positions
     ///
     /// `rva` locates the whole instance, not its entry point. The PE image base and any
-    /// loader replacement base must be 64-KiB aligned so byte-key inputs survive rebasing
+    /// loader replacement base must satisfy the PE's 64-KiB image-base alignment contract
     /// The caller still owns section permissions, function links, unwind and publication
     pub fn generate(
         bodies: &[LogicalInstruction<'_>],
@@ -260,19 +260,14 @@ impl VmPlacement {
             while image.len() % 4 != 0 {
                 image.push(0);
             }
-            for (index, range) in unwind.processor.iter().enumerate() {
+            for processor in &unwind.processor {
                 let unwind_info = at(image.len())?;
-                image.extend_from_slice(&unwind.codes[index]);
-                let handler = if index == 1 {
-                    unwind.shifted_handler
-                } else {
-                    unwind.handler.start
-                };
-                image.extend_from_slice(&at(handler)?.get().to_le_bytes());
+                image.extend_from_slice(&processor.codes);
+                image.extend_from_slice(&at(processor.handler)?.get().to_le_bytes());
                 image.extend_from_slice(&0u32.to_le_bytes());
                 functions.push(RuntimeFunction {
-                    begin: at(range.start)?,
-                    end: at(range.end)?,
+                    begin: at(processor.range.start)?,
+                    end: at(processor.range.end)?,
                     unwind_info,
                 });
             }

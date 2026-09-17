@@ -26,6 +26,7 @@ fn fixups_cover_exactly_the_decoded_gate_pointers_and_entire_table() {
             );
             let mut expected = Vec::new();
             let mut table = None;
+            let mut correction = None;
             while decoder.can_decode() {
                 let instruction = decoder.decode();
                 assert!(!instruction.is_invalid());
@@ -35,6 +36,10 @@ fn fixups_cover_exactly_the_decoded_gate_pointers_and_entire_table() {
                     expected.push((instruction.ip() - base) as usize + fields.immediate_offset());
                     if instruction.op0_register() == Register::R10 {
                         table = Some((instruction.immediate64() - base) as usize);
+                    }
+                    if instruction.op0_register() == Register::RAX {
+                        assert_eq!(instruction.immediate64(), 0, "preferred-base correction");
+                        correction = expected.last().copied();
                     }
                 }
             }
@@ -50,7 +55,11 @@ fn fixups_cover_exactly_the_decoded_gate_pointers_and_entire_table() {
                         .try_into()
                         .expect("qword"),
                 );
-                assert!((base..base + instance.image().len() as u64).contains(&address));
+                if Some(offset) == correction {
+                    assert_eq!(address, 0);
+                } else {
+                    assert!((base..base + instance.image().len() as u64).contains(&address));
+                }
             }
             // Independently apply only reported loader fixups; no replacement image is executed
             let mut relocated = instance.image().to_vec();
@@ -65,7 +74,12 @@ fn fixups_cover_exactly_the_decoded_gate_pointers_and_entire_table() {
                 NativeInstance::generate(&bodies, VirtualAddress(base + 0x10000), variant)
             }
             .expect("aligned rebase");
-            assert_eq!(relocated, regenerated.image());
+            let mut expected_image = regenerated.image().to_vec();
+            if let Some(offset) = correction {
+                // Regeneration has a new preferred base; relocation retains the old one
+                expected_image[offset..offset + 8].copy_from_slice(&0x10000u64.to_le_bytes());
+            }
+            assert_eq!(relocated, expected_image);
         }
     }
 }

@@ -5,12 +5,24 @@ mod fixture;
 
 #[test]
 fn cli_publishes_replayable_vm_pe_and_preserves_destination_on_refusal() {
-    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/cli-virtualization-proof");
+    for opcode in [0x01, 0x29] {
+        publication_case(opcode);
+    }
+}
+
+fn publication_case(opcode: u8) {
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+        "../../target/cli-virtualization-proof-{opcode:02x}"
+    ));
+    let image = |target| {
+        let mut bytes = fixture::image(target);
+        bytes[0x204] = opcode;
+        bytes
+    };
     std::fs::create_dir_all(&directory).expect("proof directory");
     let input = directory.join("input.exe");
     let output = directory.join("protected.exe");
-    std::fs::write(&input, fixture::image(0x1000)).expect("input");
+    std::fs::write(&input, image(0x1000)).expect("input");
     let invoke = || {
         Command::new(env!("CARGO_BIN_EXE_vmp"))
             .arg("protect")
@@ -42,7 +54,7 @@ fn cli_publishes_replayable_vm_pe_and_preserves_destination_on_refusal() {
     assert_eq!(report["source_length"], 6);
     let protected = std::fs::read(&output).expect("published PE");
     let pe = vmp_pe::PeFile::parse(&protected).expect("PE");
-    let original = vmp_pe::PeFile::parse(&fixture::image(0x1000)).expect("original PE");
+    let original = vmp_pe::PeFile::parse(&image(0x1000)).expect("original PE");
     let instance = &pe.sections[original.sections.len()];
     assert_eq!(report["instance"], instance.virtual_address.to_string());
     let gate = pe
@@ -57,7 +69,7 @@ fn cli_publishes_replayable_vm_pe_and_preserves_destination_on_refusal() {
     );
     assert!(invoke().status.success());
     assert_eq!(protected, std::fs::read(&output).expect("replay"));
-    std::fs::write(&input, fixture::image(0x1003)).expect("interior caller");
+    std::fs::write(&input, image(0x1003)).expect("interior caller");
     let rejected = invoke();
     assert!(!rejected.status.success());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("replaced interior"));

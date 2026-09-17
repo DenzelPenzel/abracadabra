@@ -164,6 +164,23 @@ fn refuses_a_declared_external_entry_into_the_replaced_interior() {
 }
 
 #[test]
+fn names_a_declared_external_entry_outside_executable_sections() {
+    let mut input = request(image(0x1000));
+    input.external_entries.push(Rva(0x100));
+    let Err(error) = protect_virtualization(input) else {
+        panic!("a header RVA must not be accepted as a code entry");
+    };
+    assert!(matches!(
+        error,
+        Error::ExternalEntryNotExecutable { rva: Rva(0x100) }
+    ));
+    assert!(
+        error.to_string().contains("--external-entry"),
+        "refusal must name the offending argument: {error}"
+    );
+}
+
+#[test]
 fn refuses_an_unresolved_indirect_caller() {
     let mut bytes = image(0x1000);
     bytes[0x210..0x213].copy_from_slice(&[0xff, 0xd0, 0xc3]);

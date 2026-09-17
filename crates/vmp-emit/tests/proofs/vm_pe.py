@@ -26,11 +26,11 @@ CASES = [(0, 0, 0, 0x246), (1, 2, 3, 0x206),
          (0x123456789abcdef0, 0xfedcba9876543210, 0x1111111111111100, 0x207)]
 
 
-def execute(data, entry_rva, delta, case):
+def execute(data, entry_rva, delta, case, sub=False):
     m = Uc(UC_ARCH_X86, UC_MODE_64)
     stop, rsp = 0x50001000, 0x60010008
     m.mem_map(0x50000000, 0x2000)
-    m.mem_write(0x50000000, bytes.fromhex('4889c84801d0c3'))
+    m.mem_write(0x50000000, bytes.fromhex('4889c84829d0c3' if sub else '4889c84801d0c3'))
     entry = 0x50000000
     if data is not None:
         pe = pefile.PE(data=data)
@@ -42,7 +42,7 @@ def execute(data, entry_rva, delta, case):
                     continue
                 assert fixup.type == 10, 'proof fixture requires DIR64'
                 old, = struct.unpack_from('<Q', image, fixup.rva)
-                struct.pack_into('<Q', image, fixup.rva, old + delta)
+                struct.pack_into('<Q', image, fixup.rva, (old + delta) & 0xffffffffffffffff)
         size = (pe.OPTIONAL_HEADER.SizeOfImage + 4095) & ~4095
         m.mem_map(base, size)
         m.mem_write(base, bytes(image))
@@ -59,19 +59,22 @@ def execute(data, entry_rva, delta, case):
     m.emu_start(entry, stop, count=100000)
     assert m.reg_read(x.UC_X86_REG_RIP) == stop, 'gate must actually return'
     assert m.reg_read(x.UC_X86_REG_RSP) == rsp + 8
-    assert bytes(m.mem_read(rsp - 400, 8)) == b'\x5a' * 8
+    assert bytes(m.mem_read(rsp - (416 if sub else 400), 8)) == b'\x5a' * 8
     result = ([m.reg_read(reg) for reg in REGS], m.reg_read(x.UC_X86_REG_EFLAGS))
-    assert result[0][0] == case[2] and result[1] == case[3]
+    if not sub:
+        assert result[0][0] == case[2] and result[1] == case[3]
     return result
 
 
-def omit_stream_fixup(data, entry_rva):
+def omit_gate_fixup(data, entry_rva, field):
     pe = pefile.PE(data=data)
     section = pe.get_section_by_rva(entry_rva)
     gate = pe.get_data(entry_rva, section.VirtualAddress + section.Misc_VirtualSize - entry_rva)
-    # The gate initializes RSI with a movabs immediate; omit that serialized record
-    assert gate.count(bytes.fromhex('48be')) == 1
-    target = entry_rva + gate.index(bytes.fromhex('48be')) + 2
+    # Identify the stream pointer or the zero-valued loader-delta immediate independently
+    assert field in ('stream', 'delta')
+    needle = bytes.fromhex('48be' if field == 'stream' else '48b80000000000000000')
+    assert gate.count(needle) == 1
+    target = entry_rva + gate.index(needle) + 2
     mutated = bytearray(data)
     matches = 0
     for block in pe.DIRECTORY_ENTRY_BASERELOC:
@@ -81,11 +84,12 @@ def omit_stream_fixup(data, entry_rva):
             if word >> 12 == 10 and block.struct.VirtualAddress + (word & 4095) == target:
                 struct.pack_into('<H', mutated, offset, word & 4095)
                 matches += 1
-    assert matches == 1, 'exactly one persisted stream pointer fixup'
+    assert matches == 1, 'exactly one persisted gate fixup'
     return bytes(mutated)
 
 
 def main():
+    sub = '--sub' in sys.argv
     output = Path(sys.argv[1]).resolve()
     output.mkdir(parents=True, exist_ok=True)
     original = pefile.PE(str(ROOT / 'crates/vmp-pe/test-corpus/win64-app-msvc-amd64'))
@@ -95,7 +99,7 @@ def main():
         path = output / f'vm-{variant}.exe'
         meta = json.loads(subprocess.check_output([
             'cargo', 'run', '--quiet', '-p', 'vmp-emit', '--example', 'emit_vm_pe',
-            '--', str(path), str(variant)], cwd=ROOT, text=True))
+            '--', str(path), str(variant)] + (['--sub'] if sub else []), cwd=ROOT, text=True))
         data = path.read_bytes()
         pe = pefile.PE(data=data)
         assert pe.verify_checksum()
@@ -107,18 +111,21 @@ def main():
         old = {(e.rva, e.type) for b in original.DIRECTORY_ENTRY_BASERELOC for e in b.entries if e.type}
         new = {(e.rva, e.type) for b in pe.DIRECTORY_ENTRY_BASERELOC for e in b.entries if e.type}
         assert old <= new and len(new - old) == 260
-        mutant = omit_stream_fixup(data, meta['entry_rva'])
+        mutants = [omit_gate_fixup(data, meta['entry_rva'], field)
+                   for field in (('stream', 'delta') if sub else ('stream',))]
         for delta in [-0x10000, 0, 0x10000]:
             for case in CASES:
-                assert execute(data, meta['entry_rva'], delta, case) == execute(None, 0, 0, case)
+                assert execute(data, meta['entry_rva'], delta, case, sub) == execute(None, 0, 0, case, sub)
                 comparisons += 1
             if delta:
-                try:
-                    execute(mutant, meta['entry_rva'], delta, CASES[1])
-                except (UcError, AssertionError):
-                    negatives += 1
-                else:
-                    raise AssertionError('omitted serialized fixup escaped the execution oracle')
+                for mutant in mutants:
+                    try:
+                        actual = execute(mutant, meta['entry_rva'], delta, CASES[1], sub)
+                        assert actual == execute(None, 0, 0, CASES[1], sub), 'wrong rebased SUB'
+                    except (UcError, AssertionError):
+                        negatives += 1
+                    else:
+                        raise AssertionError('omitted serialized fixup escaped the execution oracle')
         manifest.append(dict(meta, path=str(path), sha256=hashlib.sha256(data).hexdigest()))
     manifest_path = output / 'manifest.json'
     manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')
@@ -126,7 +133,7 @@ def main():
     assert len(saved) == len({m['variant'] for m in saved}) == 4
     for artifact in saved:
         assert hashlib.sha256(Path(artifact['path']).read_bytes()).hexdigest() == artifact['sha256']
-    assert comparisons == 84 and negatives == 8
+    assert comparisons == 84 and negatives == (16 if sub else 8)
     print(f'PASS: {len(saved)} serialized PEs, {comparisons} native-oracle comparisons, '
           f'{negatives} omitted-fixup negatives; manifest: {manifest_path}')
 

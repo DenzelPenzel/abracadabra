@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import struct
 import subprocess
+import sys
 
 from unicorn import Uc, UC_ARCH_X86, UC_MODE_64, UC_HOOK_CODE
 from snapshot import REGS, STACK, STACK_SIZE, SP, STOP
@@ -98,7 +99,8 @@ def windows(image, snapshots, expected, records=None):
 
 
 def main():
-    output = subprocess.check_output(['cargo', 'run', '-q', '-p', 'vmp-vm', '--example', 'leaf_unwind'], text=True)
+    sub = '--sub' in sys.argv
+    output = subprocess.check_output(['cargo', 'run', '-q', '-p', 'vmp-vm', '--example', 'leaf_unwind'] + (['--', '--sub'] if sub else []), text=True)
     instances = [json.loads(line) for line in output.splitlines()]
     assert [row['variant'] for row in instances] == [0, 1, 127, 255]
     reports = []
@@ -109,9 +111,12 @@ def main():
         struct.pack_into('<III', image, 0x8000, PLACEMENT + row['entry'], PLACEMENT + row['empty'], 0x8100)
         image[0x8100:0x8128] = bytes(row['entry_codes'])
         snapshots, expected = states(row, image)
+        # Pin the boundary set: a shortened entry sequence must fail here rather
+        # than report a smaller PASS count that still looks green
+        assert len(snapshots) == 70
         cases = windows(image, snapshots, expected) if os.name == 'nt' else []
         reports.append(dict(variant=row['variant'], boundaries=len(snapshots), cases=cases))
-    out = Path('target/rust-entry-unwind')
+    out = Path('target/rust-entry-unwind-sub' if sub else 'target/rust-entry-unwind')
     out.mkdir(parents=True, exist_ok=True)
     (out / 'results.json').write_text(json.dumps(reports, indent=2) + '\n')
     print('PASS:', sum(r['boundaries'] for r in reports), 'live entry boundaries;',

@@ -1,7 +1,56 @@
 //! Production stack transport against source-derived C++ byte-layout pins
 
 use vmp_vm::operand::{Register, Width};
-use vmp_vm::stack::{Instruction, Machine, Output, StackError};
+use vmp_vm::stack::{BinaryOp, Instruction, Machine, Output, StackError};
+
+#[test]
+fn nor_captures_flags_from_the_inverted_operands_and_keeps_older_bytes() {
+    for (lhs, rhs, result, flags) in [(0u64, 0u64, u64::MAX, 0x84), (u64::MAX, 0, 0, 0x44)] {
+        let mut m = Machine::new(24);
+        push(&mut m, Width::Qword, 0xabcdef);
+        push(&mut m, Width::Qword, lhs);
+        push(&mut m, Width::Qword, rhs);
+        m.binary(BinaryOp::Nor, Width::Qword, u64::MAX)
+            .expect("NOR");
+        // AF is undefined after the native AND and retained only as host logical data
+        assert_eq!(
+            m.step(Instruction::PopFlags),
+            Ok(Output::FlagsWord((!0x8c5u64) | flags))
+        );
+        assert_eq!(m.step(Instruction::PopFlags), Ok(Output::FlagsWord(result)));
+        assert_eq!(
+            m.step(Instruction::PopFlags),
+            Ok(Output::FlagsWord(0xabcdef))
+        );
+    }
+}
+
+#[test]
+fn stack_pointer_is_captured_before_push_and_dereferenced_atomically() {
+    let mut m = Machine::new(24);
+    push(&mut m, Width::Qword, 0x123456789abcdef0);
+    m.step(Instruction::PushStackPointer)
+        .expect("SP before push");
+    assert_eq!(&bytes(&m)[..8], 16u64.to_le_bytes());
+    m.step(Instruction::LoadStack {
+        width: Width::Qword,
+    })
+    .expect("duplicate top");
+    assert_eq!(bytes(&m), 0x123456789abcdef0u64.to_le_bytes().repeat(2));
+    for address in [0, 23, 24, u64::MAX] {
+        let mut m = Machine::new(24);
+        push(&mut m, Width::Qword, 0xabcdef);
+        push(&mut m, Width::Qword, address);
+        let before = bytes(&m);
+        assert!(matches!(
+            m.step(Instruction::LoadStack {
+                width: Width::Qword
+            }),
+            Err(StackError::StackAddress { .. })
+        ));
+        assert_eq!(bytes(&m), before);
+    }
+}
 
 #[test]
 fn shl_count_classes_padding_and_atomic_bounds() {

@@ -7,6 +7,30 @@ use vmp_vm::{
 };
 
 #[test]
+fn qword_immediates_are_loaded_and_decrypted_as_one_full_width_field() {
+    let bytes = [0x48, 0x29, 0xd0];
+    let raw = Decoder::with_ip(64, &bytes, 0x1000, DecoderOptions::NONE).decode();
+    let native = Instruction::decoded(Rva(0x1000), raw, &bytes);
+    let body = lower_instruction(Architecture::X64, &native).expect("SUB");
+    let instance =
+        BodyInstance::generate_encrypted(&[body], VirtualAddress(0x140000000), 0).expect("body");
+    let handler = &instance.image()[instance.handlers()[6]..instance.handlers()[7]];
+    let code: Vec<_> = Decoder::new(64, handler, DecoderOptions::NONE)
+        .into_iter()
+        .collect();
+    let loads: Vec<_> = code
+        .iter()
+        .filter(|i| i.memory_base() == iced_x86::Register::RSI)
+        .collect();
+    assert_eq!(loads.len(), 1, "one qword field, not eight byte fields");
+    assert_eq!(loads[0].code(), iced_x86::Code::Mov_r64_rm64);
+    assert!(code
+        .iter()
+        .any(|i| i.code() == iced_x86::Code::Xor_rm64_r64
+            && i.op0_register() == iced_x86::Register::RDI));
+}
+
+#[test]
 fn encrypted_instance_owns_stream_key_and_processor() {
     let bytes = [0x48, 0x89, 0xc8];
     let raw = Decoder::with_ip(64, &bytes, 0x1000, DecoderOptions::NONE).decode();

@@ -5,7 +5,11 @@ use vmp_vm::{instance::NativeInstance, logical::lower_instruction};
 
 #[test]
 fn leaf_handler_uses_cpp_shadow_layout_and_reports_native_rip_fixup() {
-    let bytes = [0x48, 0x01, 0xd0];
+    check_leaf([0x48, 0x01, 0xd0], 32);
+    check_leaf([0x48, 0x29, 0xd0], 34);
+}
+
+fn check_leaf(bytes: [u8; 3], scratch_slots: u8) {
     let raw = Decoder::with_ip(64, &bytes, 0x140001000, DecoderOptions::NONE).decode();
     let native = Instruction::decoded(Rva(0x1000), raw, &bytes);
     let bodies = [lower_instruction(Architecture::X64, &native).expect("ADD")];
@@ -48,7 +52,7 @@ fn leaf_handler_uses_cpp_shadow_layout_and_reports_native_rip_fixup() {
             let skip = index.saturating_sub(1);
             let mut expected = vec![1, 0, (16 - skip + if index == 0 { 2 } else { 0 }) as u8, 0];
             if index == 0 {
-                expected.extend_from_slice(&[0, 1, 32, 0]);
+                expected.extend_from_slice(&[0, 1, scratch_slots, 0]);
             }
             for &op in &remaining[skip..] {
                 expected.extend_from_slice(&[0, op]);
@@ -94,29 +98,51 @@ fn leaf_handler_uses_cpp_shadow_layout_and_reports_native_rip_fixup() {
         let allocation = decoder.decode();
         assert_eq!(allocation.mnemonic(), iced_x86::Mnemonic::Sub);
         let end = allocation.next_ip() as u8;
-        let mut expected = vec![1, end, 18, 0, end, 1, 32, 0];
+        assert_eq!(allocation.immediate32(), u32::from(scratch_slots) * 8);
+        let mut expected = vec![1, end, 18, 0, end, 1, scratch_slots, 0];
         for slot in slots.into_iter().rev() {
             expected.extend_from_slice(&slot);
         }
         assert_eq!(unwind.entry_codes.as_slice(), expected.as_slice());
-        assert_eq!(unwind.processor[0].start, 0);
-        assert!(unwind.processor[2].end < instance.exit_offset());
-        assert_eq!(unwind.processor[0].end, unwind.processor[1].start);
-        assert_eq!(unwind.processor[1].end, unwind.processor[2].start);
-        assert_eq!(
-            &instance.image()[unwind.processor[1].clone()],
-            &[0x8f, 0x45, 0]
-        );
+        // The processor is covered without gaps whatever the handler count is
+        let ranges = &unwind.processor;
+        assert_eq!(ranges.first().expect("first range").range.start, 0);
+        assert!(ranges.last().expect("last range").range.end < instance.exit_offset());
+        assert!(ranges
+            .windows(2)
+            .all(|pair| pair[0].range.end == pair[1].range.start));
+        assert!(ranges.iter().all(|r| r.range.start < r.range.end));
         assert_eq!(instance.image()[unwind.empty_ret], 0xc3);
         assert!(unwind.handler.start > instance.entry_offset());
-        assert_eq!(
-            unwind.codes[0],
-            [0x09, 0, 6, 0, 0, 1, 26, 0, 0, 0x50, 0, 0x60, 0, 0x70, 0, 0x30]
-        );
-        assert_eq!(unwind.codes[2], unwind.codes[0]);
-        let mut shifted = unwind.codes[0];
+        let base = [
+            0x09, 0, 6, 0, 0, 1, 26, 0, 0, 0x50, 0, 0x60, 0, 0x70, 0, 0x30,
+        ];
+        let mut shifted = base;
+        // The in-flight flags word occupies one more native slot than the body frame
         shifted[6] = 27;
-        assert_eq!(unwind.codes[1], shifted);
+        // A range describes the shifted frame exactly when it is a handler's POP after
+        // PUSHFQ, and those are the only ranges routed through the shifted handler
+        for processor in ranges {
+            let is_pop = instance.image()[processor.range.clone()] == [0x8f, 0x45, 0];
+            assert_eq!(processor.codes, if is_pop { shifted } else { base });
+            assert_eq!(processor.handler == unwind.handler.start, !is_pop);
+        }
+        // Every PUSHFQ/POP pair the generator emitted must be described by exactly one
+        // shifted range, so metadata cannot drift from the code as handlers are added
+        let transfers = instance
+            .image()
+            .windows(4)
+            .filter(|w| *w == [0x9c, 0x8f, 0x45, 0])
+            .count();
+        assert!(transfers > 0);
+        assert_eq!(
+            ranges
+                .iter()
+                .filter(|r| instance.image()[r.range.clone()] == [0x8f, 0x45, 0])
+                .count(),
+            transfers,
+            "one in-flight flags window per ALU handler"
+        );
         let pointers: Vec<_> = instance.absolute_address_offsets().collect();
         assert_eq!(pointers.len(), 261);
         assert!(pointers.windows(2).all(|w| w[0] < w[1]));

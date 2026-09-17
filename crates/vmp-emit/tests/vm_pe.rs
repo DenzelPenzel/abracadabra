@@ -47,10 +47,20 @@ fn serialized_leaf_unwind_preserves_original_entries() {
     let parsed = PeFile::parse(artifact.bytes()).expect("persisted PE");
     let after = parsed.exception_table.as_ref().expect("merged entries");
     assert_eq!(&after.entries()[..before.len()], before.entries());
-    assert_eq!(after.len(), before.len() + 24);
+    // Five processor ranges (two ALU handlers split it at two flags windows), the entry,
+    // eighteen exit ranges and the empty RET plus the handler itself
+    assert_eq!(after.len(), before.len() + 5 + 1 + 18 + 2);
     let added = &after.entries()[before.len()..];
-    assert!(added[..3].iter().all(|e| e.unwind.handler.is_some()));
-    assert_eq!(added[1].unwind.codes[2], 27);
+    assert!(added[..5].iter().all(|e| e.unwind.handler.is_some()));
+    // One shifted range per ALU handler, and only those describe the deeper frame
+    assert_eq!(
+        added
+            .iter()
+            .filter(|e| e.unwind.codes.get(2) == Some(&27))
+            .count(),
+        2,
+        "one in-flight flags window per ALU handler"
+    );
     assert_eq!(artifact.placement().relocations().len(), 261);
 }
 

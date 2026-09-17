@@ -45,7 +45,7 @@ impl Drop for Mapping {
     }
 }
 
-fn probe(gate: u64, address: u64, initial: &[u64; 15], flags: u64) -> Vec<u8> {
+fn probe(gate: u64, address: u64, initial: &[u64; 15], flags: u64, stack_bytes: i32) -> Vec<u8> {
     let mut a = CodeAssembler::new(64).expect("assembler");
     for r in [rbx, rbp, r12, r13, r14, r15] {
         a.push(r).expect("save caller");
@@ -86,7 +86,9 @@ fn probe(gate: u64, address: u64, initial: &[u64; 15], flags: u64) -> Vec<u8> {
     a.mov(qword_ptr(rdx + 120), rax).expect("output flags");
     a.lea(rax, qword_ptr(rsp + 128)).expect("post-call RSP");
     a.mov(qword_ptr(rdx + 136), rax).expect("output RSP");
-    for (source, dest) in [(-280, 144), (-272, 152)] {
+    // Account for the call's return address and the outer 128-byte observation snapshot
+    let deepest = 128 - 8 - stack_bytes;
+    for (source, dest) in [(deepest - 8, 144), (deepest, 152)] {
         a.mov(rax, qword_ptr(rsp + source))
             .expect("stack depth witness");
         a.mov(qword_ptr(rdx + dest), rax).expect("output depth");
@@ -183,8 +185,8 @@ fn execute_program(
         for offset in gate.absolute_address_offsets() {
             let old =
                 u64::from_le_bytes(image[offset..offset + 8].try_into().expect("fixup qword"));
-            let new = u64::try_from(i128::from(old) + i128::from(base) - i128::from(preferred))
-                .expect("rebased address");
+            // DIR64 is modulo-64-bit addition, including a zero-valued delta field
+            let new = old.wrapping_add(base.wrapping_sub(preferred));
             image[offset..offset + 8].copy_from_slice(&new.to_le_bytes());
         }
     }
@@ -218,7 +220,20 @@ fn execute_program(
         image.push(0xc3);
         base
     };
-    let outer = probe(entry, base + 0x8000, initial, flags);
+    let expected_stack = if native
+        .iter()
+        .any(|i| i.raw().mnemonic() == iced_x86::Mnemonic::Sub)
+    {
+        408
+    } else {
+        392
+    };
+    assert_eq!(gate.max_native_stack_bytes(), expected_stack as usize);
+    let outer = probe(entry, base + 0x8000, initial, flags, expected_stack);
+    assert!(
+        image.len() < 0x8000,
+        "processor must not overlap the independent probe"
+    );
     image.resize(0x8000, 0xcc);
     image.extend_from_slice(&outer);
     mapping.publish(&image);
@@ -375,12 +390,14 @@ fn all_register_pairs_match_native_including_aliases() {
     });
     for destination in regs {
         for source in regs {
-            for add in [false, true] {
+            // SUB is not commutative, so the aliased pairs matter more here than for ADD
+            for operation in ["mov", "add", "sub"] {
                 let mut a = CodeAssembler::new(64).expect("assembler");
-                if add {
-                    a.add(destination, source).expect("ADD");
-                } else {
-                    a.mov(destination, source).expect("MOV");
+                match operation {
+                    "mov" => a.mov(destination, source).expect("MOV"),
+                    "add" => a.add(destination, source).expect("ADD"),
+                    "sub" => a.sub(destination, source).expect("SUB"),
+                    other => panic!("unhandled operation {other}"),
                 }
                 let bytes = a.assemble(0x1000).expect("native instruction");
                 for variant in 0..16 {
@@ -397,7 +414,10 @@ fn maximum_body_compositions_match_native() {
     for template in [
         &[0x48, 0x89, 0xc8][..],
         &[0x48, 0x01, 0xd0][..],
+        &[0x48, 0x29, 0xd0][..],
         &[0x48, 0x89, 0xc8, 0x48, 0x01, 0xd0][..],
+        &[0x48, 0x89, 0xc8, 0x48, 0x29, 0xd0][..],
+        &[0x48, 0x01, 0xd0, 0x48, 0x29, 0xd0][..],
     ] {
         let instruction_count = Decoder::new(64, template, DecoderOptions::NONE)
             .into_iter()

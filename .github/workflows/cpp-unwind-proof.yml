@@ -2,7 +2,7 @@ name: C++ Windows unwind proof
 
 on:
   push:
-    branches: [test/cpp-windows-unwind-proof]
+    branches: [main]
   pull_request:
     paths:
       - crates/vmp-vm/**
@@ -21,16 +21,21 @@ on:
       - .github/workflows/cpp-unwind-proof.yml
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 permissions:
   contents: read
 
 jobs:
   windows-unwind:
     runs-on: windows-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: ilammy/msvc-dev-cmd@v1
+      - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -57,9 +62,17 @@ jobs:
       - name: Observe native C++ exit exceptions
         run: python crates/vmp-vm/tests/proofs/cpp_unwind/exit_dispatch.py native-dispatch.exe
       - name: Verify Rust entry unwind at every instruction boundary
-        run: python crates/vmp-vm/tests/proofs/cpp_unwind/rust_entry.py
+        run: |
+          python crates/vmp-vm/tests/proofs/cpp_unwind/rust_entry.py 2>&1 | Tee-Object -Variable output
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $passed = @($output | Where-Object { $_ -like 'PASS: 280 live entry boundaries;*' })
+          if ($passed.Count -ne 1) { throw "entry unwind proof did not cover exactly 280 boundaries" }
       - name: Verify Rust exit unwind at every instruction boundary
-        run: python crates/vmp-vm/tests/proofs/cpp_unwind/rust_exit.py
+        run: |
+          python crates/vmp-vm/tests/proofs/cpp_unwind/rust_exit.py 2>&1 | Tee-Object -Variable output
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $passed = @($output | Where-Object { $_ -like 'PASS: 200 live exit boundaries;*' })
+          if ($passed.Count -ne 1) { throw "exit unwind proof did not cover exactly 200 boundaries" }
       - name: Execute native exception dispatch
         run: |
           python crates/vmp-vm/tests/proofs/cpp_unwind/native_dispatch.py native-dispatch.exe
@@ -80,6 +93,26 @@ jobs:
         run: python crates/vmp-emit/tests/proofs/leaf_pe.py leaf-loader.dll native-dispatch.exe --cli
       - name: Execute symbol-selected CLI PE unwind
         run: python crates/vmp-emit/tests/proofs/leaf_pe.py leaf-loader.dll native-dispatch.exe --cli-symbol
+      - name: Build independent native SUB fixture and catcher
+        shell: cmd
+        run: |
+          cl /nologo /W4 /WX /Od /DVMP_SUB_PROBE crates\vmp-vm\tests\proofs\cpp_unwind\native_dispatch.c /Fe:native-sub-dispatch.exe /Fo:native-sub-dispatch.obj /link /dynamicbase /base:0x180000000
+          if errorlevel 1 exit /b 1
+          ml64 /nologo /c /DVMP_SUB_PROBE /Foleaf-sub-loader.obj crates\vmp-emit\tests\proofs\leaf_loader.asm
+          if errorlevel 1 exit /b 1
+          link /nologo /dll /noentry /dynamicbase /base:0x140000000 /export:VmOriginal /out:leaf-sub-loader.dll leaf-sub-loader.obj
+      - name: Verify SUB entry and exit unwind boundaries
+        run: |
+          python crates/vmp-vm/tests/proofs/cpp_unwind/rust_entry.py --sub 2>&1 | Tee-Object -Variable entryOutput
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $entries = @($entryOutput | Where-Object { $_ -like 'PASS: 280 live entry boundaries;*' })
+          if ($entries.Count -ne 1) { throw "SUB entry proof did not cover exactly 280 boundaries" }
+          python crates/vmp-vm/tests/proofs/cpp_unwind/rust_exit.py --sub 2>&1 | Tee-Object -Variable exitOutput
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exits = @($exitOutput | Where-Object { $_ -like 'PASS: 200 live exit boundaries;*' })
+          if ($exits.Count -ne 1) { throw "SUB exit proof did not cover exactly 200 boundaries" }
+      - name: Execute CLI-produced SUB PE and both ALU unwind windows
+        run: python crates/vmp-emit/tests/proofs/leaf_pe.py leaf-sub-loader.dll native-sub-dispatch.exe --cli --sub
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
         with:
@@ -94,6 +127,9 @@ jobs:
             target/rust-leaf-unwind/*.json
             target/rust-entry-unwind/*.json
             target/rust-exit-unwind/*.json
+            target/rust-entry-unwind-sub/*.json
+            target/rust-exit-unwind-sub/*.json
+            target/leaf-pe-cli-sub/*.json
             target/leaf-pe-unwind/*.json
             target/leaf-pe-redirect/*.json
             target/leaf-pe-cli/*.json

@@ -42,10 +42,32 @@ impl ByteCryptor {
     }
 }
 
+/// One full-width value recipe; the rolling key changes once per qword
+#[derive(Debug, Clone, Copy)]
+pub(super) struct QwordCryptor;
+
+impl QwordCryptor {
+    pub(super) fn encode(self, plain: u64, key: &mut u64) -> u64 {
+        let cipher = (!plain.wrapping_sub(1).rotate_left(17)).wrapping_add(1) ^ *key;
+        *key ^= plain;
+        cipher
+    }
+
+    pub(super) fn emit(self, image: &mut Vec<u8>) {
+        image.extend_from_slice(&[0x48, 0x31, 0xf8]); // xor rax, rdi
+        image.extend_from_slice(&[0x48, 0xff, 0xc8]); // dec rax
+        image.extend_from_slice(&[0x48, 0xf7, 0xd0]); // not rax
+        image.extend_from_slice(&[0x48, 0xc1, 0xc8, 17]); // ror rax, 17
+        image.extend_from_slice(&[0x48, 0xff, 0xc0]); // inc rax
+        image.extend_from_slice(&[0x48, 0x31, 0xc7]); // xor rdi, rax
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Cryptors {
     pub opcode: ByteCryptor,
     pub operand: ByteCryptor,
+    pub immediate: QwordCryptor,
 }
 
 impl Cryptors {
@@ -53,6 +75,7 @@ impl Cryptors {
         Self {
             opcode: ByteCryptor([Step::Ror(4), Step::Not, Step::Ror(7), Step::Xor(0x1b)]),
             operand: ByteCryptor([Step::Sub(1), Step::Not, Step::Ror(1), Step::Add(1)]),
+            immediate: QwordCryptor,
         }
     }
 }
@@ -60,6 +83,24 @@ impl Cryptors {
 #[cfg(test)]
 mod tests {
     use super::Cryptors;
+
+    #[test]
+    fn qword_fields_match_executed_cpp_recipe_and_full_key() {
+        let fixture = include_str!("../../tests/fixtures/cpp_qword_cryptor.txt");
+        assert_eq!(fixture.lines().next(), Some("# 4:1 8:0 7:17 3:1"));
+        for row in fixture.lines().skip(1) {
+            let values: Vec<_> = row
+                .split_whitespace()
+                .map(|field| u64::from_str_radix(field, 16).expect("C++ field"))
+                .collect();
+            let [plain, ciphertext, before, after] = values.as_slice() else {
+                panic!("four fields");
+            };
+            let mut key = *before;
+            assert_eq!(super::QwordCryptor.encode(*plain, &mut key), *ciphertext);
+            assert_eq!(key, *after);
+        }
+    }
 
     #[test]
     fn captured_cpp_fields_pin_ciphertext_and_full_key() {

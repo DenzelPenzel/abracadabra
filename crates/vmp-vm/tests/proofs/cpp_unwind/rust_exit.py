@@ -4,12 +4,14 @@ import os
 from pathlib import Path
 import struct
 import subprocess
+import sys
 
 from rust_entry import states, windows, BASE, PLACEMENT
 
 
 def main():
-    output = subprocess.check_output(['cargo', 'run', '-q', '-p', 'vmp-vm', '--example', 'leaf_unwind'], text=True)
+    sub = '--sub' in sys.argv
+    output = subprocess.check_output(['cargo', 'run', '-q', '-p', 'vmp-vm', '--example', 'leaf_unwind'] + (['--', '--sub'] if sub else []), text=True)
     instances = [json.loads(line) for line in output.splitlines()]
     assert [row['variant'] for row in instances] == [0, 1, 127, 255]
     reports = []
@@ -31,7 +33,7 @@ def main():
         assert len(snapshots) == 50
         cases = windows(image, snapshots, expected, records) if os.name == 'nt' else []
         reports.append(dict(variant=row['variant'], boundaries=len(snapshots), cases=cases))
-    out = Path('target/rust-exit-unwind')
+    out = Path('target/rust-exit-unwind-sub' if sub else 'target/rust-exit-unwind')
     out.mkdir(parents=True, exist_ok=True)
     (out / 'results.json').write_text(json.dumps(reports, indent=2) + '\n')
     print('PASS:', sum(r['boundaries'] for r in reports), 'live exit boundaries;',

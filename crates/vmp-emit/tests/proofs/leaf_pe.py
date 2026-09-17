@@ -15,6 +15,9 @@ def records(pe):
 
 
 def main():
+    sub = '--sub' in sys.argv
+    if sub:
+        sys.argv.remove('--sub')
     symbol = sys.argv[-1:] == ['--cli-symbol']
     cli = symbol or sys.argv[-1:] == ['--cli']
     redirected = cli or sys.argv[-1:] == ['--redirect']
@@ -24,6 +27,8 @@ def main():
     assert old, 'fixture must contain an original runtime entry'
     native = next(s.address for s in original.DIRECTORY_ENTRY_EXPORT.symbols if s.name == b'VmOriginal')
     out = Path('target/leaf-pe-cli-symbol' if symbol else 'target/leaf-pe-cli' if cli else 'target/leaf-pe-redirect' if redirected else 'target/leaf-pe-unwind')
+    if sub:
+        out = out.with_name(out.name + '-sub')
     out.mkdir(parents=True, exist_ok=True)
     results = []
     entry_results = []
@@ -45,7 +50,7 @@ def main():
                             (['--redirect'] if redirected else []), text=True))
         pe = pefile.PE(str(path))
         entries = records(pe)
-        assert entries[:len(old)] == old and len(entries) == len(old) + 24
+        assert entries[:len(old)] == old and len(entries) == len(old) + 26
         for section in original.sections:
             expected_section = bytearray(section.get_data())
             if redirected and section.VirtualAddress <= native < section.VirtualAddress + section.SizeOfRawData:
@@ -60,7 +65,7 @@ def main():
         assert pe.OPTIONAL_HEADER.CheckSum == pe.generate_checksum()
         generated = entries[len(old):]
         section = pe.get_section_by_rva(row['instance'])
-        code = pe.get_data(row['instance'], generated[2][1] - row['instance'])
+        code = pe.get_data(row['instance'], generated[4][1] - row['instance'])
         assert code.count(bytes.fromhex('48034508')) == 1
         pop = code.index(bytes.fromhex('9c8f4500')) + 1 + row['instance']
         assert generated[1][:2] == (pop, pop + 3)
@@ -69,7 +74,7 @@ def main():
         directory = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]
         gate = next(record for record in generated if record[0] == row['entry'])
         prefix = pe.get_data(gate[2], 4)
-        exits = [record for record in generated if generated[2][1] < record[0] < gate[0]]
+        exits = [record for record in generated if generated[4][1] < record[0] < gate[0]]
         assert len(exits) == 18 and exits[-1][1] == gate[0]
         for site, (fault, _, unwind) in enumerate(exits):
             for mode in ('normal', 'gate-exit'):
@@ -104,8 +109,15 @@ def main():
                     assert 'FAULT:' in r.stdout
                 entry_results.append(dict(variant=variant, site=site, mode=mode,
                                           exit=r.returncode, stdout=r.stdout, stderr=r.stderr))
-        for site, fault, bias in [('add', row['instance'] + code.index(bytes.fromhex('48034508')), 0),
-                                  ('flags-pop', pop, 8), ('after-pop', pop + 3, 0)]:
+        sites = [('add', row['instance'] + code.index(bytes.fromhex('48034508')), 0),
+                 ('flags-pop', pop, 8), ('after-pop', pop + 3, 0)]
+        if sub:
+            nor = code.index(bytes.fromhex('48f7d048f7d24821d0'))
+            nor_pop = row['instance'] + code.index(bytes.fromhex('9c8f4500'), nor) + 1
+            assert generated[3][:2] == (nor_pop, nor_pop + 3)
+            sites.extend([('nor', row['instance'] + nor, 0),
+                          ('nor-flags-pop', nor_pop, 8), ('nor-after-pop', nor_pop + 3, 0)])
+        for site, fault, bias in sites:
             unwind = next(u for start, end, u in generated if start <= fault < end)
             for lhs, rhs in ((1, 2), (0, 0), (0xffffffffffffffff, 1)):
                 for mode in ('normal', 'fault', 'no-handler'):
@@ -122,13 +134,14 @@ def main():
                         assert ('PASS: native normal return' if mode == 'normal' else 'PASS: native exception dispatch') in r.stdout
                     results.append(dict(variant=variant, site=site, lhs=lhs, rhs=rhs, mode=mode,
                                         exit=r.returncode, stdout=r.stdout, stderr=r.stderr))
-    assert len(results) == 108
+    assert len(results) == (216 if sub else 108)
     assert len(entry_results) == 32
     assert len(exit_results) == 144
     (out / 'entry-results.json').write_text(json.dumps(entry_results, indent=2) + '\n')
     print('PASS: 16 PE entry returns; 16 PE entry exception dispatches without body handler')
     (out / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
-    print('PASS: 36 PE loader returns; 36 native dispatches; 36 removed-handler negatives')
+    count = len(results) // 3
+    print(f'PASS: {count} PE loader returns; {count} native dispatches; {count} removed-handler negatives')
 
 
 if __name__ == '__main__':

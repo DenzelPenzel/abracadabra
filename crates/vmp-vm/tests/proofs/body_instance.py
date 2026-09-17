@@ -51,17 +51,17 @@ def execute(artifact, case, mutation=None):
     if encrypted:
         assert key == BASE + artifact['stream'][0], 'address-derived initial key'
         m.reg_write(x.UC_X86_REG_RDI, key)
-    p, q, a = artifact['opcodes']
+    p, q, a = artifact['opcodes'][:3]
     expected_fields = [p, offsets[1], q, offsets[0], p, offsets[2], p, offsets[0],
                        a, q, artifact['flags'], q, offsets[0]]
     operand_fields = {1, 3, 5, 7, 10, 12}
     updates = {BASE + i + 3 for i in range(artifact['table'] - 2)
                if image[i:i+3] == bytes.fromhex('4030d7')} if encrypted else set()
     if encrypted:
-        assert len(updates) == 3, 'three generated decryptors'
+        assert len(updates) == 3, 'opcode and two register-byte decryptors'
         assert artifact['stream'][1] - artifact['stream'][0] == len(expected_fields)
     fields = []
-    push, pop, add = [BASE + h for h in artifact['handlers']]
+    push, pop, add = [BASE + h for h in artifact['handlers'][:3]]
     if mutation == 'handler':
         assert bytes(m.mem_read(add + 4, 4)) == bytes.fromhex('48034508')
         m.mem_write(add + 5, b'\x2b')

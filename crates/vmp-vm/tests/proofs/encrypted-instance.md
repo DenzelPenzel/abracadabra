@@ -1,5 +1,9 @@
 # Captured Classic byte cryptors in a generated instance
 
+This document records the initial MOV/ADD byte-field proof. The current SUB extension,
+its full-width immediate recipe and preferred-base key correction are documented in
+`sub-mechanism.md`; the historical byte-only scope below does not describe that extension.
+
 ## Scope and ownership
 
 `BodyInstance::generate_encrypted` and `NativeInstance::generate_encrypted` use one

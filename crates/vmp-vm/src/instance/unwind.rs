@@ -3,21 +3,30 @@ use std::ops::Range;
 
 use super::{relative, BodyInstance};
 
+/// One processor range, carrying everything placement needs to describe it
+///
+/// The handler is part of the range rather than derived from its position: a range
+/// covering a handler's in-flight flags word unwinds through the shifted entry, and
+/// which range that is depends on how many ALU handlers the instance generated
+#[derive(Debug)]
+pub struct ProcessorRange {
+    pub range: Range<usize>,
+    pub codes: [u8; 16],
+    /// Image offset of the exception-handler entry this range unwinds through
+    pub handler: usize,
+}
+
 /// Image-relative gate, body and callback ranges
 ///
-/// `codes` holds the UNWIND_INFO prefixes for the three disjoint processor ranges
-/// Placement appends `shifted_handler` for the middle range and `handler.start` otherwise
 /// The handler and empty-RET ranges use an empty version-1 UNWIND_INFO
 #[derive(Debug)]
 pub struct LeafUnwind {
     pub exit: Vec<(Range<usize>, Vec<u8>)>,
     pub entry: Range<usize>,
     pub entry_codes: [u8; 40],
-    pub processor: [Range<usize>; 3],
+    pub processor: Vec<ProcessorRange>,
     pub handler: Range<usize>,
-    pub shifted_handler: usize,
     pub empty_ret: usize,
-    pub codes: [[u8; 16]; 3],
 }
 
 pub(super) fn shadows(body: &mut BodyInstance, native_rip: u64) -> usize {
@@ -47,10 +56,10 @@ fn store(image: &mut Vec<u8>, offset: u32) {
     image.extend_from_slice(&offset.to_le_bytes());
 }
 
-pub(super) fn entry_codes(order: [u8; 16], offsets: [u8; 16], end: u8) -> [u8; 40] {
+pub(super) fn entry_codes(order: [u8; 16], offsets: [u8; 16], end: u8, scratch: usize) -> [u8; 40] {
     let mut codes = [0; 40];
     // The entry unwinds saved registers directly, before native shadows are ready
-    codes[..8].copy_from_slice(&[1, end, 18, 0, end, 1, 32, 0]);
+    codes[..8].copy_from_slice(&[1, end, 18, 0, end, 1, (scratch / 8) as u8, 0]);
     for (index, id) in order.into_iter().enumerate() {
         codes[8 + index * 2] = offsets[15 - index];
         codes[9 + index * 2] = match id {
@@ -99,27 +108,43 @@ pub(super) fn handler(
     let codes = [9, 0, 6, 0, 0, 1, 26, 0, 0, 0x50, 0, 0x60, 0, 0x70, 0, 0x30];
     let mut shifted_codes = codes;
     shifted_codes[6] = 27;
+    let mut processor = Vec::new();
+    let mut cursor = 0;
+    let mut push = |range: Range<usize>, codes, handler| {
+        if range.start < range.end {
+            processor.push(ProcessorRange {
+                range,
+                codes,
+                handler,
+            });
+        }
+    };
+    for pop in &body.flags_pops {
+        push(cursor..pop.start, codes, start);
+        push(pop.clone(), shifted_codes, shifted_handler);
+        cursor = pop.end;
+    }
+    push(cursor..body.table, codes, start);
     LeafUnwind {
         exit,
         entry: entry..empty_ret,
         entry_codes,
-        processor: [
-            0..body.flags_pop.start,
-            body.flags_pop.clone(),
-            body.flags_pop.end..body.table,
-        ],
+        processor,
         handler: start..image.len(),
-        shifted_handler,
         empty_ret,
-        codes: [codes, shifted_codes, codes],
     }
 }
 
-pub(super) fn exit_codes(order: &[u8], scratch: bool) -> Vec<u8> {
+pub(super) fn exit_codes(order: &[u8], scratch: usize) -> Vec<u8> {
     // Only slots still below the caller return address participate in this unwind
-    let mut codes = vec![1, 0, (order.len() + if scratch { 2 } else { 0 }) as u8, 0];
-    if scratch {
-        codes.extend_from_slice(&[0, 1, 32, 0]);
+    let mut codes = vec![
+        1,
+        0,
+        (order.len() + if scratch != 0 { 2 } else { 0 }) as u8,
+        0,
+    ];
+    if scratch != 0 {
+        codes.extend_from_slice(&[0, 1, (scratch / 8) as u8, 0]);
     }
     for &id in order {
         codes.extend_from_slice(&[

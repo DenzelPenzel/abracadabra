@@ -1,4 +1,4 @@
-//! Bounded, unversioned body commands for one native qword register MOV or ADD
+//! Bounded, unversioned body commands for one native qword register MOV, ADD or SUB
 
 use iced_x86::{Code, OpKind, Register as NativeRegister};
 use thiserror::Error;
@@ -7,24 +7,34 @@ use vmp_types::Architecture;
 
 use crate::{
     operand::{Register, Width},
-    stack,
+    stack::{self, BinaryOp},
 };
 
 /// Logical operations with no opcode assignment or serialization contract
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Stack(stack::Instruction),
+    PushContext(ContextRegister),
+    PopContext(ContextRegister),
     /// Replaces two operands with a result below a qword raw flags word
-    Add {
+    Binary {
+        op: BinaryOp,
         width: Width,
     },
+}
+
+/// VM context words distinct from architectural GPRs
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextRegister {
+    Flags,
+    IntermediateFlags,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum LogicalError {
     #[error("unsupported native architecture {architecture:?}")]
     UnsupportedArchitecture { architecture: Architecture },
-    #[error("expected an unprefixed qword GPR MOV or ADD without RSP or operand references")]
+    #[error("expected an unprefixed qword GPR MOV, ADD or SUB without RSP or operand references")]
     UnsupportedInstruction,
 }
 
@@ -36,9 +46,14 @@ pub struct LogicalInstruction<'source> {
 }
 
 #[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "sealed bodies keep bounded lowering allocation-free"
+)]
 enum Body {
     Mov([Command; 2]),
-    Add([Command; 5]),
+    Binary([Command; 5]),
+    Sub([Command; 29]),
 }
 
 impl<'source> LogicalInstruction<'source> {
@@ -49,16 +64,26 @@ impl<'source> LogicalInstruction<'source> {
     pub fn commands(&self) -> &[Command] {
         match &self.body {
             Body::Mov(commands) => commands,
-            Body::Add(commands) => commands,
+            Body::Binary(commands) => commands,
+            Body::Sub(commands) => commands,
+        }
+    }
+
+    pub(crate) fn max_stack_bytes(&self) -> usize {
+        match self.body {
+            Body::Mov(_) => 8,
+            Body::Binary(_) => 16,
+            Body::Sub(_) => 24,
         }
     }
 }
 
 /// Produces only the context-free instruction body, using fixed storage and no allocation
 ///
-/// Accepts both opcode directions of qword GPR MOV/ADD, excluding RSP, with just one
+/// Accepts both opcode directions of qword GPR MOV/ADD/SUB, excluding RSP, with just one
 /// REX.W prefix and no operand references; the IR's paired payload/encoding is trusted
-/// ADD always takes the save-flags path: PopFlags transports raw data, not architectural POPF
+/// Arithmetic always saves flags; SUB uses the deterministic all-NOR decomposition
+/// PopFlags transports raw data, not architectural POPF
 ///
 /// The caller retains ownership and must separately handle any required unwind frame-register
 /// shadow stores, entry/exit sections and merging; these commands alone do not implement them
@@ -92,17 +117,76 @@ pub fn lower_instruction(
         width: Width::Qword,
         register: destination,
     });
-    let body = match raw.code() {
-        Code::Mov_rm64_r64 | Code::Mov_r64_rm64 => Body::Mov([push(source_register), pop]),
-        Code::Add_rm64_r64 | Code::Add_r64_rm64 => Body::Add([
+    let binary = |op| {
+        Body::Binary([
             push(source_register),
             push(destination),
-            Command::Add {
+            Command::Binary {
+                op,
                 width: Width::Qword,
             },
             Command::Stack(stack::Instruction::PopFlags),
             pop,
-        ]),
+        ])
+    };
+    let body = match raw.code() {
+        Code::Mov_rm64_r64 | Code::Mov_r64_rm64 => Body::Mov([push(source_register), pop]),
+        Code::Add_rm64_r64 | Code::Add_r64_rm64 => binary(BinaryOp::Add),
+        Code::Sub_rm64_r64 | Code::Sub_r64_rm64 => {
+            let nor = Command::Binary {
+                op: BinaryOp::Nor,
+                width: Width::Qword,
+            };
+            let add = Command::Binary {
+                op: BinaryOp::Add,
+                width: Width::Qword,
+            };
+            let discard_flags = Command::Stack(stack::Instruction::Drop {
+                width: Width::Qword,
+            });
+            let flags = Command::Stack(stack::Instruction::PopFlags);
+            let mask = 0x815u64;
+            Body::Sub([
+                push(source_register),
+                push(destination),
+                push(destination),
+                nor,
+                discard_flags,
+                add,
+                flags,
+                Command::Stack(stack::Instruction::PushStackPointer),
+                Command::Stack(stack::Instruction::LoadStack {
+                    width: Width::Qword,
+                }),
+                nor,
+                Command::PopContext(ContextRegister::IntermediateFlags),
+                pop,
+                // Keep P/O/A/C from ADD and take the other bits from the final inversion
+                Command::PushContext(ContextRegister::Flags),
+                Command::PushContext(ContextRegister::Flags),
+                nor,
+                discard_flags,
+                Command::Stack(stack::Instruction::PushImm {
+                    width: Width::Qword,
+                    value: !mask,
+                }),
+                nor,
+                discard_flags,
+                Command::PushContext(ContextRegister::IntermediateFlags),
+                Command::PushContext(ContextRegister::IntermediateFlags),
+                nor,
+                discard_flags,
+                Command::Stack(stack::Instruction::PushImm {
+                    width: Width::Qword,
+                    value: mask,
+                }),
+                nor,
+                discard_flags,
+                add,
+                discard_flags,
+                flags,
+            ])
+        }
         _ => return Err(LogicalError::UnsupportedInstruction),
     };
     Ok(LogicalInstruction { source, body })

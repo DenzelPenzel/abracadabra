@@ -9,10 +9,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let output = args.next().ok_or("expected output path and variant")?;
     let variant: u8 = args.next().ok_or("expected variant")?.parse()?;
+    let operation = match args.next().as_deref() {
+        None => 0x01,
+        Some("--sub") => 0x29,
+        Some(_) => return Err("unexpected argument".into()),
+    };
     if args.next().is_some() {
         return Err("unexpected argument".into());
     }
-    let code = [0x48, 0x89, 0xc8, 0x48, 0x01, 0xd0];
+    let code = [0x48, 0x89, 0xc8, 0x48, operation, 0xd0];
     let native: Vec<_> = Decoder::with_ip(64, &code, 0x1000, DecoderOptions::NONE)
         .into_iter()
         .map(|raw| {

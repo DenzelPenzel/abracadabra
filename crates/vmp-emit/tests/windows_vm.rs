@@ -202,7 +202,8 @@ fn windows_loader_rebases_and_executes_serialized_vm() {
                 assert_eq!(fixup.kind, FixupKind::Dir64);
                 let pos = pe.rva_to_offset(fixup.rva).expect("fixup bytes").get() as usize;
                 let old = u64::from_le_bytes(bytes[pos..pos + 8].try_into().expect("qword"));
-                let expected = u64::try_from(i128::from(old) + delta).expect("relocated pointer");
+                // A relocated zero records a negative loader delta modulo 2^64
+                let expected = old.wrapping_add(delta as u64);
                 if loaded.qword(fixup.rva) != expected {
                     mismatches.push(fixup.rva);
                 }

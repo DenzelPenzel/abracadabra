@@ -75,12 +75,20 @@ jobs:
         shell: bash
         run: |
           python crates/vmp-emit/tests/proofs/vm_pe.py target/vm-pe-proof
+      - name: Execute composed SUB and live-shadow negative controls
+        shell: bash
+        run: |
+          python crates/vmp-vm/tests/proofs/sub_instance.py
+          python crates/vmp-vm/tests/proofs/cpp_unwind/sub_shadows.py
+          python crates/vmp-emit/tests/proofs/vm_pe.py target/vm-sub-pe-proof --sub
       - name: Preserve PE proof artifacts
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: vm-pe-proof
-          path: target/vm-pe-proof/
+          path: |
+            target/vm-pe-proof/
+            target/vm-sub-pe-proof/
           if-no-files-found: error
           retention-days: 7
 
@@ -152,7 +160,7 @@ jobs:
             if ($summaries.Count -ne 1) { throw "Windows VM loader gate did not execute exactly one passing test" }
           }
 
-      - name: Current raw-stack ADD and SHL gate
+      - name: Current raw-stack ADD, SUB and SHL gate
         timeout-minutes: 10
         run: |
           $env:CARGO_TERM_COLOR = "never"
@@ -161,8 +169,8 @@ jobs:
           cargo test -p vmp-vm --test native_stack --release -- --nocapture 2>&1 | Tee-Object -Variable releaseConditions
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           foreach ($output in @($debugConditions, $releaseConditions)) {
-            $summaries = @($output | Where-Object { $_ -match '^test result: ok[.] 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in [0-9]+([.][0-9]+)?s$' })
-            if ($summaries.Count -ne 1) { throw "raw-stack ADD and SHL gate did not execute exactly two passing tests" }
+            $summaries = @($output | Where-Object { $_ -match '^test result: ok[.] 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in [0-9]+([.][0-9]+)?s$' })
+            if ($summaries.Count -ne 1) { throw "raw-stack ADD, SUB and SHL gate did not execute exactly three passing tests" }
           }
 
       # The loader gate proper: imagehlp recomputes the checksum, the kernel maps

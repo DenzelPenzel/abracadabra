@@ -2,7 +2,8 @@
 //!
 //! For the raw `BodyInstance`, RSP points to a writable 128-byte context, RBP to
 //! the top of a separate descending byte stack, RSI to the stream, R10 to the table,
-//! and R11 to the stream end. Reserve 16 bytes below RBP and 8 bytes below RSP
+//! and R11 to the stream end. SUB also needs an intermediate flags word at context+128
+//! Reserve `max_stack_bytes` below RBP and 8 bytes below RSP
 //! Entry is `entry_offset`; stop before `completion_offset` and read the context
 //! RAX, RDX and native flags are scratch. Never execute externally modified images
 //! Context, both stack scratch regions and image must be disjoint; flags output guarantees
@@ -20,9 +21,9 @@ pub use unwind::LeafUnwind;
 use vmp_types::VirtualAddress;
 
 use crate::{
-    logical::{Command, LogicalInstruction},
+    logical::{Command, ContextRegister, LogicalInstruction},
     operand::{Register, Width},
-    stack::Instruction,
+    stack::{BinaryOp, Instruction},
 };
 
 #[derive(Debug, Error)]
@@ -45,19 +46,21 @@ pub struct BodyInstance {
     image: Vec<u8>,
     stream: Range<usize>,
     table: usize,
-    handlers: [usize; 3],
-    flags_pop: Range<usize>,
-    opcodes: [u8; 3],
+    handlers: Vec<usize>,
+    /// One window per ALU handler where its PUSHFQ result still occupies a native slot
+    flags_pops: Vec<Range<usize>>,
+    opcodes: Vec<u8>,
     variant: u8,
     initial_key: Option<u64>,
     cryptors: Option<Cryptors>,
+    max_stack_bytes: usize,
 }
 
 impl BodyInstance {
     /// Generates an unencrypted forward stream and its matching native processor
     ///
     /// `variant` selects a bounded deterministic layout recipe, not cryptographic entropy
-    /// Only sealed MOV/ADD bodies are accepted; each has balanced stack use of at most 16 bytes
+    /// Sealed MOV/ADD/SUB bodies have balanced stack use of at most 24 bytes
     pub fn generate(
         bodies: &[LogicalInstruction<'_>],
         base: VirtualAddress,
@@ -84,14 +87,19 @@ impl BodyInstance {
         if bodies.is_empty() || bodies.len() > 256 {
             return Err(InstanceError::BodyCount);
         }
-        // The bounded code, 256 table slots and at most 9 stream bytes per body fit here
-        const CAPACITY: usize = 8192;
+        // Each command occupies at most nine bytes; fixed templates, table and gates fit
+        // in the extra reservation even when the body uses all 256 instruction slots
+        let capacity = 8192
+            + bodies
+                .iter()
+                .map(|body| body.commands().len() * 9)
+                .sum::<usize>();
         base.0
-            .checked_add(CAPACITY as u64)
+            .checked_add(capacity as u64)
             .ok_or(InstanceError::AddressOverflow)?;
         let mut image = Vec::new();
         image
-            .try_reserve_exact(CAPACITY)
+            .try_reserve_exact(capacity)
             .map_err(|_| InstanceError::Allocation)?;
         // Trap, completion marker, then checked end-of-body dispatch
         image.extend_from_slice(&[0x0f, 0x0b, 0x0f, 0x0b]);
@@ -115,20 +123,40 @@ impl BodyInstance {
         image.extend_from_slice(&[0x48, 0x89, 0x04, 0x14]);
         jump_dispatch(&mut image);
 
-        let add = image.len();
-        image.extend_from_slice(&[0x48, 0x8b, 0x45, 0]);
-        image.extend_from_slice(&[0x48, 0x03, 0x45, 8]); // add rax, [rbp + 8]
-        image.extend_from_slice(&[0x48, 0x89, 0x45, 8, 0x9c]);
-        let flags_pop_start = image.len();
-        image.extend_from_slice(&[0x8f, 0x45, 0]);
-        let flags_pop = flags_pop_start..image.len();
+        // One handler per ALU operation, in BINARY_OPS order
+        let alu: Vec<AluHandler> = BINARY_OPS
+            .iter()
+            .map(|operation| alu_handler(&mut image, *operation))
+            .collect();
+        let push_sp = image.len();
+        image.extend_from_slice(&[0x48, 0x89, 0xe8]); // mov rax, rbp
+        image.extend_from_slice(&[0x48, 0x83, 0xed, 8, 0x48, 0x89, 0x45, 0]);
+        jump_dispatch(&mut image);
+        let load = image.len();
+        image.extend_from_slice(&[0x48, 0x8b, 0x45, 0, 0x48, 0x8b, 0, 0x48, 0x89, 0x45, 0]);
+        jump_dispatch(&mut image);
+        let immediate = image.len();
+        image.extend_from_slice(&[0x48, 0x8b, 0x06, 0x48, 0x83, 0xc6, 8]);
+        if let Some(c) = cryptors {
+            c.immediate.emit(&mut image);
+        }
+        image.extend_from_slice(&[0x48, 0x83, 0xed, 8, 0x48, 0x89, 0x45, 0]);
+        jump_dispatch(&mut image);
+        let drop = image.len();
+        image.extend_from_slice(&[0x48, 0x83, 0xc5, 8]);
         jump_dispatch(&mut image);
         while image.len() % 8 != 0 {
             image.push(0xcc);
         }
         let table = image.len();
-        let handlers = [push, pop, add];
-        let opcodes = [variant, variant ^ 1, variant ^ 2];
+        let mut handlers = vec![push, pop];
+        handlers.extend(alu.iter().map(|handler| handler.entry));
+        handlers.extend([push_sp, load, immediate, drop]);
+        let flags_pops: Vec<Range<usize>> =
+            alu.into_iter().map(|handler| handler.flags_pop).collect();
+        // XOR is a permutation, so each handler receives a distinct instance-owned opcode
+        let count = u8::try_from(handlers.len()).map_err(|_| InstanceError::UnsupportedCommand)?;
+        let opcodes: Vec<u8> = (0..count).map(|index| variant ^ index).collect();
         for opcode in 0..=u8::MAX {
             let offset = opcodes
                 .iter()
@@ -158,12 +186,47 @@ impl BodyInstance {
                     Command::Stack(Instruction::PopFlags) => {
                         image.extend_from_slice(&[opcodes[1], slot_offset(15, variant)]);
                     }
-                    Command::Add {
+                    Command::PushContext(register) => {
+                        image.extend_from_slice(&[opcodes[0], context_offset(register, variant)]);
+                    }
+                    Command::PopContext(register) => {
+                        image.extend_from_slice(&[opcodes[1], context_offset(register, variant)]);
+                    }
+                    Command::Stack(Instruction::PushStackPointer) => image.push(opcodes[4]),
+                    Command::Stack(Instruction::LoadStack {
                         width: Width::Qword,
-                    } => image.push(opcodes[2]),
+                    }) => image.push(opcodes[5]),
+                    Command::Stack(Instruction::PushImm {
+                        width: Width::Qword,
+                        value,
+                    }) => {
+                        image.push(opcodes[6]);
+                        image.extend_from_slice(&value.to_le_bytes());
+                    }
+                    Command::Stack(Instruction::Drop {
+                        width: Width::Qword,
+                    }) => image.push(opcodes[7]),
+                    Command::Binary {
+                        op,
+                        width: Width::Qword,
+                    } => {
+                        let index = BINARY_OPS
+                            .iter()
+                            .position(|candidate| *candidate == op)
+                            .ok_or(InstanceError::UnsupportedCommand)?;
+                        image.push(opcodes[2 + index]);
+                    }
                     Command::Stack(
-                        Instruction::PushImm { .. }
-                        | Instruction::Drop { .. }
+                        Instruction::PushImm {
+                            width: Width::Byte | Width::Word | Width::Dword,
+                            ..
+                        }
+                        | Instruction::Drop {
+                            width: Width::Byte | Width::Word | Width::Dword,
+                        }
+                        | Instruction::LoadStack {
+                            width: Width::Byte | Width::Word | Width::Dword,
+                        }
                         | Instruction::PushReg {
                             width: Width::Byte | Width::Word | Width::Dword,
                             ..
@@ -173,16 +236,22 @@ impl BodyInstance {
                             ..
                         },
                     )
-                    | Command::Add {
+                    | Command::Binary {
                         width: Width::Byte | Width::Word | Width::Dword,
+                        ..
                     } => {
                         return Err(InstanceError::UnsupportedCommand);
                     }
                 }
                 if let Some(c) = cryptors {
-                    for (index, byte) in image[field_start..].iter_mut().enumerate() {
-                        let cryptor = if index == 0 { c.opcode } else { c.operand };
-                        *byte = cryptor.encode(*byte, &mut key);
+                    image[field_start] = c.opcode.encode(image[field_start], &mut key);
+                    if let Command::Stack(Instruction::PushImm { value, .. }) = *command {
+                        let encrypted = c.immediate.encode(value, &mut key);
+                        image[field_start + 1..].copy_from_slice(&encrypted.to_le_bytes());
+                    } else {
+                        for byte in &mut image[field_start + 1..] {
+                            *byte = c.operand.encode(*byte, &mut key);
+                        }
                     }
                 }
             }
@@ -193,11 +262,16 @@ impl BodyInstance {
             stream: start..end,
             table,
             handlers,
-            flags_pop,
+            flags_pops,
             opcodes,
             variant,
             initial_key,
             cryptors,
+            max_stack_bytes: bodies
+                .iter()
+                .map(LogicalInstruction::max_stack_bytes)
+                .max()
+                .unwrap_or(0),
         })
     }
 
@@ -213,12 +287,13 @@ impl BodyInstance {
     pub fn table_offset(&self) -> usize {
         self.table
     }
-    /// Push, pop and ADD handler offsets, in that order
-    pub fn handlers(&self) -> [usize; 3] {
-        self.handlers
+    /// Handler offsets: push, pop, ADD, NOR, push SP, stack load, immediate, discard
+    pub fn handlers(&self) -> &[usize] {
+        &self.handlers
     }
-    pub fn opcodes(&self) -> [u8; 3] {
-        self.opcodes
+    /// Opcodes in the same order as [`BodyInstance::handlers`]
+    pub fn opcodes(&self) -> &[u8] {
+        &self.opcodes
     }
     pub fn register_offset(&self, register: Register) -> u8 {
         register_offset(register, self.variant)
@@ -233,14 +308,14 @@ impl BodyInstance {
         2
     }
     pub fn max_stack_bytes(&self) -> usize {
-        16
+        self.max_stack_bytes
     }
 }
 
 /// Scalar native CALL/RET gate and its body processor in one placed image
 ///
 /// Captures RFLAGS and all GPRs except RSP before using work registers, and restores
-/// them from the modified context before RET. Only arithmetic flags are promised for ADD
+/// them from the modified context before RET. ADD/SUB promise the six arithmetic flag values
 /// The caller supplies a writable native stack, benign control flags and the original
 /// return address. The leaf-unwind constructor additionally describes entry, body and exit
 /// SIMD/control-state preservation and PE serialization are outside this generator
@@ -252,6 +327,7 @@ pub struct NativeInstance {
     gate_addresses: [usize; 4],
     shadow_address: Option<usize>,
     unwind: Option<LeafUnwind>,
+    max_native_stack_bytes: usize,
 }
 
 impl NativeInstance {
@@ -327,6 +403,8 @@ impl NativeInstance {
     ) -> Result<Self, InstanceError> {
         // Native register IDs in ascending context-slot order; 16 denotes flags
         let mut order = [16u8; 16];
+        // Shadows end at 240; operand scratch must not overlap them at maximum depth
+        let scratch = (240 + body.max_stack_bytes()).next_multiple_of(16).max(256);
         for register in [
             Register::Rax,
             Register::Rcx,
@@ -356,7 +434,7 @@ impl NativeInstance {
         body.image.extend_from_slice(&[0x48, 0x89, 0xec]); // mov rsp, rbp
         let mut exit_unwind = Vec::new();
         if native_rip.is_some() {
-            exit_unwind.push((exit..body.image.len(), unwind::exit_codes(&order, true)));
+            exit_unwind.push((exit..body.image.len(), unwind::exit_codes(&order, scratch)));
         }
         for (index, id) in order.into_iter().enumerate() {
             let start = body.image.len();
@@ -364,14 +442,14 @@ impl NativeInstance {
             if native_rip.is_some() {
                 exit_unwind.push((
                     start..body.image.len(),
-                    unwind::exit_codes(&order[index..], false),
+                    unwind::exit_codes(&order[index..], 0),
                 ));
             }
         }
         let ret = body.image.len();
         body.image.push(0xc3);
         if native_rip.is_some() {
-            exit_unwind.push((ret..body.image.len(), unwind::exit_codes(&[], false)));
+            exit_unwind.push((ret..body.image.len(), unwind::exit_codes(&[], 0)));
         }
 
         let entry = body.image.len();
@@ -381,10 +459,15 @@ impl NativeInstance {
             push_offsets[index] = (body.image.len() - entry) as u8;
         }
         body.image.extend_from_slice(&[0x48, 0x89, 0xe5]); // mov rbp, rsp
+        body.image.extend_from_slice(&[0x48, 0x81, 0xec]); // sub rsp, scratch
         body.image
-            .extend_from_slice(&[0x48, 0x81, 0xec, 0, 1, 0, 0]); // sub rsp, 256
-        let entry_codes =
-            unwind::entry_codes(order, push_offsets, (body.image.len() - entry) as u8);
+            .extend_from_slice(&(scratch as u32).to_le_bytes());
+        let entry_codes = unwind::entry_codes(
+            order,
+            push_offsets,
+            (body.image.len() - entry) as u8,
+            scratch,
+        );
         // The body addresses context at RSP; its descending VM stack starts at RBP
         for offset in (0..128u8).step_by(8) {
             body.image.extend_from_slice(&[0x48, 0x8b, 0x45, offset]);
@@ -406,10 +489,14 @@ impl NativeInstance {
             body.image
                 .extend_from_slice(&(base.0 + offset as u64).to_le_bytes());
         }
-        if let Some(key) = body.initial_key() {
-            body.image.extend_from_slice(&[0x48, 0xbf]); // mov rdi, initial key
+        if body.initial_key().is_some() {
+            // The loader relocates zero into its signed delta; remove that delta from
+            // the loaded stream pointer to recover the compiler's preferred-address key
+            body.image.extend_from_slice(&[0x48, 0x89, 0xf7]); // mov rdi, rsi
+            body.image.extend_from_slice(&[0x48, 0xb8]); // mov rax, relocation delta
             gate_addresses[3] = body.image.len();
-            body.image.extend_from_slice(&key.to_le_bytes());
+            body.image.extend_from_slice(&0u64.to_le_bytes());
+            body.image.extend_from_slice(&[0x48, 0x29, 0xc7]); // sub rdi, rax
         }
         // A register-direct jump is not a Windows tail epilogue; the entry frame is still live
         body.image.extend_from_slice(&[0x48, 0x8d, 0x05]);
@@ -426,6 +513,7 @@ impl NativeInstance {
             gate_addresses,
             shadow_address,
             unwind,
+            max_native_stack_bytes: 128 + scratch + 8,
         })
     }
 
@@ -439,12 +527,11 @@ impl NativeInstance {
         self.exit
     }
 
-    /// Sorted image-relative offsets of absolute little-endian 64-bit address fields
+    /// Sorted image-relative offsets of little-endian fields requiring DIR64 relocation
     ///
-    /// Includes all table slots and gate pointers, including the encrypted initial key
+    /// Includes table slots, gate pointers and the zero-valued loader-delta field
     /// Consumers must check conversion to their own address coordinates before publication
-    /// These fixups support whole-image rebasing with a delta divisible by 256 for the
-    /// captured byte cryptor; arbitrary placement changes require regenerating the stream
+    /// Key initialization removes the loader delta, leaving encrypted fields unchanged
     pub fn absolute_address_offsets(&self) -> impl Iterator<Item = usize> + '_ {
         let count = if self.body.initial_key().is_some() {
             4
@@ -456,9 +543,9 @@ impl NativeInstance {
             .chain(self.shadow_address)
             .chain(self.gate_addresses[..count].iter().copied())
     }
-    /// Below gate-entry RSP: 128 saved bytes, 256 scratch bytes, one PUSHF qword
+    /// Below gate-entry RSP: saved context, aligned scratch and one PUSHF qword
     pub fn max_native_stack_bytes(&self) -> usize {
-        392
+        self.max_native_stack_bytes
     }
 }
 
@@ -487,6 +574,48 @@ fn register_offset(register: Register, variant: u8) -> u8 {
 
 fn slot_offset(slot: u8, variant: u8) -> u8 {
     ((slot + (variant & 15)) & 15) * 8
+}
+
+/// Supported binary primitives in handler, opcode and unwind-range order
+///
+/// Each consumes `[rbp]` and `[rbp + 8]` and replaces them with flags above its result
+const BINARY_OPS: [BinaryOp; 2] = [BinaryOp::Add, BinaryOp::Nor];
+
+fn context_offset(register: ContextRegister, variant: u8) -> u8 {
+    match register {
+        ContextRegister::Flags => slot_offset(15, variant),
+        ContextRegister::IntermediateFlags => 128,
+    }
+}
+
+/// One generated binary ALU handler and the window its flags word is in flight
+struct AluHandler {
+    entry: usize,
+    flags_pop: Range<usize>,
+}
+
+/// Emits a binary primitive over the two topmost VM stack slots, with raw flags on top
+///
+/// The PUSHFQ result lives on the *native* stack until the following POP moves it onto
+/// the VM stack, so that one instruction runs with RSP 8 below the established frame.
+/// Its range is reported separately because Windows unwind needs the shifted handler there
+fn alu_handler(image: &mut Vec<u8>, operation: BinaryOp) -> AluHandler {
+    let entry = image.len();
+    image.extend_from_slice(&[0x48, 0x8b, 0x45, 0]); // mov rax, [rbp]
+    match operation {
+        BinaryOp::Add => image.extend_from_slice(&[0x48, 0x03, 0x45, 8]),
+        BinaryOp::Nor => {
+            image.extend_from_slice(&[0x48, 0x8b, 0x55, 8]); // mov rdx, [rbp + 8]
+            image.extend_from_slice(&[0x48, 0xf7, 0xd0, 0x48, 0xf7, 0xd2]); // not rax; not rdx
+            image.extend_from_slice(&[0x48, 0x21, 0xd0]); // and rax, rdx
+        }
+    }
+    image.extend_from_slice(&[0x48, 0x89, 0x45, 8, 0x9c]);
+    let start = image.len();
+    image.extend_from_slice(&[0x8f, 0x45, 0]); // pop qword [rbp]
+    let flags_pop = start..image.len();
+    jump_dispatch(image);
+    AluHandler { entry, flags_pop }
 }
 
 fn jump_dispatch(image: &mut Vec<u8>) {

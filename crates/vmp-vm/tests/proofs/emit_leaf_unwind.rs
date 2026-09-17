@@ -6,7 +6,12 @@ use vmp_vm::{instance::NativeInstance, logical::lower_instruction};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut native = Vec::new();
-    for (offset, bytes) in [(0, [0x48, 0x89, 0xc8]), (3, [0x48, 0x01, 0xd0])] {
+    let operation = if std::env::args().any(|arg| arg == "--sub") {
+        0x29
+    } else {
+        0x01
+    };
+    for (offset, bytes) in [(0, [0x48, 0x89, 0xc8]), (3, [0x48, operation, 0xd0])] {
         let raw = Decoder::with_ip(64, &bytes, 0x140001000 + offset, DecoderOptions::NONE).decode();
         native.push(Instruction::decoded(
             Rva(0x1000 + offset as u32),
@@ -22,9 +27,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let instance =
             NativeInstance::generate_leaf_unwind(&bodies, VirtualAddress(0x140002000), variant)?;
         let u = instance.unwind().expect("leaf metadata");
-        println!("{{\"variant\":{},\"image\":{:?},\"entry\":{},\"processor\":{:?},\"handler\":[{},{}],\"shifted_handler\":{},\"empty\":{},\"codes\":{:?},\"entry_codes\":{:?},\"exit_ranges\":{:?},\"exit_codes\":{:?}}}",
-            variant, instance.image(), instance.entry_offset(), u.processor.each_ref().map(|r| [r.start, r.end]),
-            u.handler.start, u.handler.end, u.shifted_handler, u.empty_ret, u.codes, u.entry_codes,
+        println!("{{\"variant\":{},\"image\":{:?},\"entry\":{},\"processor\":{:?},\"processor_codes\":{:?},\"processor_handlers\":{:?},\"handler\":[{},{}],\"empty\":{},\"entry_codes\":{:?},\"exit_ranges\":{:?},\"exit_codes\":{:?}}}",
+            variant, instance.image(), instance.entry_offset(),
+            u.processor.iter().map(|p| [p.range.start, p.range.end]).collect::<Vec<_>>(),
+            u.processor.iter().map(|p| p.codes).collect::<Vec<_>>(),
+            u.processor.iter().map(|p| p.handler).collect::<Vec<_>>(),
+            u.handler.start, u.handler.end, u.empty_ret, u.entry_codes,
             u.exit.iter().map(|(r, _)| [r.start, r.end]).collect::<Vec<_>>(),
             u.exit.iter().map(|(_, c)| c).collect::<Vec<_>>());
     }

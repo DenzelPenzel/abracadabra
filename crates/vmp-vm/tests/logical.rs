@@ -2,9 +2,9 @@ use iced_x86::{Decoder, DecoderOptions};
 use vmp_ir::{BranchKind, FieldSpan, Instruction, OperandRef};
 use vmp_types::{Architecture, Rva};
 use vmp_vm::{
-    logical::{lower_instruction, Command, LogicalError},
+    logical::{lower_instruction, Command, ContextRegister, LogicalError},
     operand::{Register, Width},
-    stack::{Instruction as Stack, Machine, Output},
+    stack::{BinaryOp, Instruction as Stack, Machine, Output},
 };
 
 const REGISTERS: [(u8, Register); 15] = [
@@ -64,7 +64,9 @@ fn fixture_tuple(command: Command) -> [u8; 6] {
             register,
         }) => [2, 2, 3, id(register), 0, 0],
         Command::Stack(Stack::PopFlags) => [2, 2, 3, 16, 0, 0],
-        Command::Add {
+        // This fixture covers MOV and ADD; composed SUB has its own extracted trace
+        Command::Binary {
+            op: BinaryOp::Add,
             width: Width::Qword,
         } => [4, 0, 3, 0, 0, 0],
         other => panic!("outside fixture: {other:?}"),
@@ -106,16 +108,76 @@ fn exact_cpp_fixtures_retain_single_source_ownership() {
 }
 
 #[test]
+fn sub_matches_extracted_cpp_lowering_including_discarded_flags() {
+    let source = decoded(&[0x48, 0x29, 0xd0]);
+    let body = lower_instruction(Architecture::X64, &source).expect("SUB");
+    let actual: String = body.commands().iter().map(cpp_sub_row).collect();
+    assert_eq!(actual, include_str!("fixtures/cpp_sub_qword.txt"));
+}
+
+fn cpp_sub_row(command: &Command) -> String {
+    let id = |register| {
+        REGISTERS
+            .iter()
+            .find(|(_, r)| *r == register)
+            .expect("GPR")
+            .0
+    };
+    let (op, operand, width, value) = match *command {
+        Command::Stack(Stack::PushReg { width, register }) => {
+            ("push", "reg", width, u64::from(id(register)))
+        }
+        Command::Stack(Stack::PopReg { width, register }) => {
+            ("pop", "reg", width, u64::from(id(register)))
+        }
+        Command::Stack(Stack::PopFlags) => ("pop", "reg", Width::Qword, 16),
+        Command::Stack(Stack::PushImm { width, value }) => ("push", "imm", width, value),
+        Command::Stack(Stack::Drop { width }) => ("pop", "reg", width, 255),
+        Command::Stack(Stack::PushStackPointer) => ("push", "reg", Width::Qword, 4),
+        Command::Stack(Stack::LoadStack { width }) => ("push", "mem", width, 2),
+        Command::PushContext(register) => (
+            "push",
+            "reg",
+            Width::Qword,
+            match register {
+                ContextRegister::Flags => 16,
+                ContextRegister::IntermediateFlags => 17,
+            },
+        ),
+        Command::PopContext(register) => (
+            "pop",
+            "reg",
+            Width::Qword,
+            match register {
+                ContextRegister::Flags => 16,
+                ContextRegister::IntermediateFlags => 17,
+            },
+        ),
+        Command::Binary {
+            op: BinaryOp::Add,
+            width,
+        } => ("add", "none", width, 1),
+        Command::Binary {
+            op: BinaryOp::Nor,
+            width,
+        } => ("nor", "none", width, 1),
+    };
+    format!("{op} {operand} {} {value}\n", width as u8)
+}
+
+#[test]
 fn all_gpr_pairs_and_both_native_opcode_directions() {
     // CompileOperand's ordinary GPR path is core/intel.cc:9674-9687
     // This tests body commands only, without frame-register shadow bookkeeping
     for (destination_id, destination) in REGISTERS {
         for (source_id, source) in REGISTERS {
-            for (opcode, reverse, add) in [
-                (0x89, false, false),
-                (0x8b, true, false),
-                (0x01, false, true),
-                (0x03, true, true),
+            for (opcode, reverse, binary) in [
+                (0x89, false, None),
+                (0x8b, true, None),
+                (0x01, false, Some(BinaryOp::Add)),
+                (0x03, true, Some(BinaryOp::Add)),
+                (0x29, false, None),
+                (0x2b, true, None),
             ] {
                 let (reg, rm) = if reverse {
                     (destination_id, source_id)
@@ -129,11 +191,32 @@ fn all_gpr_pairs_and_both_native_opcode_directions() {
                 ];
                 let native = decoded(&bytes);
                 let logical = lower_instruction(Architecture::X64, &native).expect("GPR pair");
-                let expected = if add {
+                if opcode == 0x29 || opcode == 0x2b {
+                    let expected: String = include_str!("fixtures/cpp_sub_qword.txt")
+                        .lines()
+                        .map(|row| match row {
+                            "push reg 8 0" => format!("push reg 8 {destination_id}\n"),
+                            "pop reg 8 0" => format!("pop reg 8 {destination_id}\n"),
+                            "push reg 8 2" => format!("push reg 8 {source_id}\n"),
+                            other => format!("{other}\n"),
+                        })
+                        .collect();
+                    assert_eq!(
+                        logical
+                            .commands()
+                            .iter()
+                            .map(cpp_sub_row)
+                            .collect::<String>(),
+                        expected
+                    );
+                    continue;
+                }
+                let expected = if let Some(op) = binary {
                     vec![
                         push(source),
                         push(destination),
-                        Command::Add {
+                        Command::Binary {
+                            op,
                             width: Width::Qword,
                         },
                         Command::Stack(Stack::PopFlags),
@@ -150,6 +233,7 @@ fn all_gpr_pairs_and_both_native_opcode_directions() {
 
 // Caller-driven test harness only: there is no production command execution loop
 fn apply(commands: &[Command], machine: &mut Machine, flags: &mut u64) {
+    let mut intermediate = 0;
     for command in commands {
         match *command {
             Command::Stack(instruction) => {
@@ -158,7 +242,31 @@ fn apply(commands: &[Command], machine: &mut Machine, flags: &mut u64) {
                     Output::FlagsWord(word) => *flags = word,
                 }
             }
-            Command::Add { width } => machine.add(width, *flags).expect("ADD"),
+            Command::Binary { op, width } => {
+                machine.binary(op, width, *flags).expect("binary operation")
+            }
+            Command::PushContext(register) => {
+                let value = match register {
+                    ContextRegister::Flags => *flags,
+                    ContextRegister::IntermediateFlags => intermediate,
+                };
+                machine
+                    .step(Stack::PushImm {
+                        width: Width::Qword,
+                        value,
+                    })
+                    .expect("context");
+            }
+            Command::PopContext(register) => {
+                let Output::FlagsWord(value) = machine.step(Stack::PopFlags).expect("context")
+                else {
+                    panic!("word");
+                };
+                match register {
+                    ContextRegister::Flags => *flags = value,
+                    ContextRegister::IntermediateFlags => intermediate = value,
+                }
+            }
         }
     }
 }

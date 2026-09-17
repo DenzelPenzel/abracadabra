@@ -120,7 +120,11 @@ __declspec(noinline) static void invoke(DWORD64 entry, uint64_t lhs, uint64_t rh
     __try {
         uint64_t result = ((probe_fn)entry)(lhs, rhs);
         require(normal, "faulting processor unexpectedly returned");
+#ifdef VMP_SUB_PROBE
+        require(result == lhs - rhs, "native SUB result");
+#else
         require(result == lhs + rhs, "native result");
+#endif
     } __except (catch_fault(GetExceptionInformation())) {
         caught = 1;
     }

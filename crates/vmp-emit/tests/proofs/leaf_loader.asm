@@ -2,7 +2,11 @@
 .code
 PUBLIC VmOriginal
 VmOriginal PROC
+IFDEF VMP_SUB_PROBE
+    DB 048h, 089h, 0C8h, 048h, 029h, 0D0h, 0C3h
+ELSE
     DB 048h, 089h, 0C8h, 048h, 001h, 0D0h, 0C3h
+ENDIF
 VmOriginal ENDP
 ExistingFrame PROC FRAME
     push rbx

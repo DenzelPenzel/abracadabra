@@ -5,6 +5,15 @@
 use crate::operand::{Register, Width};
 use thiserror::Error;
 
+/// Binary ALU operations sharing the two-operand, flags-above-result stack shape
+///
+/// Both operations consume the top two values and leave raw flags above the result
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryOp {
+    Add,
+    Nor,
+}
+
 /// Logical stack operations independent of their wire encoding
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Instruction {
@@ -21,6 +30,12 @@ pub enum Instruction {
         register: Register,
     },
     Drop {
+        width: Width,
+    },
+    /// Pushes the pre-push SP in the host stack's budget-relative address space
+    PushStackPointer,
+    /// Replaces a qword address with a promoted value read from live stack bytes
+    LoadStack {
         width: Width,
     },
     /// Consumes a qword and returns it without POPF normalization or definedness claims
@@ -46,6 +61,8 @@ pub enum StackError {
     Allocation,
     #[error("immediate {value:#x} exceeds {width:?} width")]
     ImmediateTooWide { width: Width, value: u64 },
+    #[error("stack address {address:#x} does not cover a live {width:?} value")]
+    StackAddress { address: u64, width: Width },
 }
 
 /// Caller-driven stack execution with an explicit live-byte budget and no implicit flags state
@@ -88,8 +105,18 @@ impl Machine {
     /// Replaces CF/PF/AF/ZF/SF/OF and preserves other input bits as logical data
     /// Any error preserves live bytes and registers; no flags are applied here
     pub fn add(&mut self, width: Width, flags_bits: u64) -> Result<(), StackError> {
+        self.binary(BinaryOp::Add, width, flags_bits)
+    }
+
+    /// NOR takes flags from AND of the inverted operands; its undefined AF is retained
+    pub fn binary(
+        &mut self,
+        op: BinaryOp,
+        width: Width,
+        flags_bits: u64,
+    ) -> Result<(), StackError> {
         self.stack
-            .add_with_reserve(width, flags_bits, |bytes, additional| {
+            .binary_with_reserve(op, width, flags_bits, |bytes, additional| {
                 bytes
                     .try_reserve(additional)
                     .map_err(|_| StackError::Allocation)
@@ -131,6 +158,12 @@ impl Machine {
             Instruction::Drop { width } => {
                 self.stack.pop(width)?;
             }
+            Instruction::PushStackPointer => {
+                let address = u64::try_from(self.stack.budget - self.stack.bytes.len())
+                    .map_err(|_| StackError::SizeOverflow)?;
+                self.stack.push(Width::Qword, address)?;
+            }
+            Instruction::LoadStack { width } => self.stack.load(width)?,
             Instruction::PopFlags => return self.stack.pop(Width::Qword).map(Output::FlagsWord),
         }
         Ok(Output::None)
@@ -145,6 +178,36 @@ struct ByteStack {
 }
 
 impl ByteStack {
+    fn load(&mut self, width: Width) -> Result<(), StackError> {
+        let available = self.bytes.len();
+        let remaining = available.checked_sub(8).ok_or(StackError::Underflow {
+            needed: 8,
+            available,
+        })?;
+        let address = self.bytes[remaining..]
+            .iter()
+            .fold(0u64, |value, byte| (value << 8) | u64::from(*byte));
+        let error = || StackError::StackAddress { address, width };
+        let end = usize::try_from(address)
+            .ok()
+            .and_then(|address| self.budget.checked_sub(address))
+            .filter(|&end| end <= available)
+            .ok_or_else(error)?;
+        let start = end.checked_sub(width.byte_len()).ok_or_else(error)?;
+        let value = self.bytes[start..end]
+            .iter()
+            .fold(0u64, |value, byte| (value << 8) | u64::from(*byte));
+        // The replacement is never larger than the consumed qword, so no allocation follows
+        self.bytes.truncate(remaining);
+        self.bytes.extend(
+            value.to_le_bytes()[..width.byte_len().max(2)]
+                .iter()
+                .rev()
+                .copied(),
+        );
+        Ok(())
+    }
+
     fn shl_with_reserve(
         &mut self,
         width: Width,
@@ -191,8 +254,9 @@ impl ByteStack {
         Ok(())
     }
 
-    fn add_with_reserve(
+    fn binary_with_reserve(
         &mut self,
+        op: BinaryOp,
         width: Width,
         flags_bits: u64,
         reserve: impl FnOnce(&mut Vec<u8>, usize) -> Result<(), StackError>,
@@ -214,17 +278,30 @@ impl ByteStack {
                 .fold(0u64, |value, byte| (value << 8) | u64::from(*byte))
                 & width.mask()
         };
-        let lhs = read(&operands[..storage]);
-        let rhs = read(&operands[storage..]);
-        let result = lhs.wrapping_add(rhs) & width.mask();
+        let deeper = read(&operands[..storage]);
+        let top = read(&operands[storage..]);
         let sign = 1u64 << (width.byte_len() * 8 - 1);
-        let flags = (flags_bits & !0x8d5)
-            | u64::from(rhs > width.mask() - lhs)
+        let (result, carry, overflow, auxiliary, changed) = match op {
+            BinaryOp::Add => {
+                let result = deeper.wrapping_add(top) & width.mask();
+                let overflow = (!(deeper ^ top) & (deeper ^ result)) & sign != 0;
+                (
+                    result,
+                    top > width.mask() - deeper,
+                    overflow,
+                    (deeper ^ top ^ result) & 0x10,
+                    0x8d5,
+                )
+            }
+            BinaryOp::Nor => (!(deeper | top) & width.mask(), false, false, 0, 0x8c5),
+        };
+        let flags = (flags_bits & !changed)
+            | u64::from(carry)
             | (u64::from((result as u8).count_ones().is_multiple_of(2)) << 2)
-            | ((lhs ^ rhs ^ result) & 0x10)
+            | auxiliary
             | (u64::from(result == 0) << 6)
             | (u64::from(result & sign != 0) << 7)
-            | (u64::from((!(lhs ^ rhs) & (lhs ^ result)) & sign != 0) << 11);
+            | (u64::from(overflow) << 11);
         self.bytes.truncate(remaining);
         self.bytes
             .extend(result.to_le_bytes()[..storage].iter().rev().copied());
@@ -314,21 +391,23 @@ mod tests {
     }
 
     #[test]
-    fn add_failed_reservation_preserves_both_operands_and_lower_bytes() {
-        for width in [Width::Byte, Width::Word, Width::Dword, Width::Qword] {
-            let storage = width.byte_len().max(2);
-            let mut stack = ByteStack {
-                bytes: vec![0xa5; 2 + 2 * storage],
-                budget: 32,
-            };
-            let before = stack.bytes.clone();
-            let result = stack.add_with_reserve(width, u64::MAX, |bytes, growth| {
-                assert_eq!(*bytes, before);
-                assert_eq!(growth, 8 - storage);
-                Err(StackError::Allocation)
-            });
-            assert_eq!(result, Err(StackError::Allocation));
-            assert_eq!(stack.bytes, before);
+    fn binary_failed_reservation_preserves_both_operands_and_lower_bytes() {
+        for op in [BinaryOp::Add, BinaryOp::Nor] {
+            for width in [Width::Byte, Width::Word, Width::Dword, Width::Qword] {
+                let storage = width.byte_len().max(2);
+                let mut stack = ByteStack {
+                    bytes: vec![0xa5; 2 + 2 * storage],
+                    budget: 32,
+                };
+                let before = stack.bytes.clone();
+                let result = stack.binary_with_reserve(op, width, u64::MAX, |bytes, growth| {
+                    assert_eq!(*bytes, before);
+                    assert_eq!(growth, 8 - storage);
+                    Err(StackError::Allocation)
+                });
+                assert_eq!(result, Err(StackError::Allocation));
+                assert_eq!(stack.bytes, before);
+            }
         }
     }
 

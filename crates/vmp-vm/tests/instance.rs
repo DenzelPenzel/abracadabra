@@ -24,7 +24,9 @@ fn instance_owns_opcode_table_context_and_stream() {
         let instance = BodyInstance::generate(&bodies, VirtualAddress(0x140000000), variant)
             .expect("bounded instance");
         let stream = &instance.image()[instance.stream()];
-        let [push, pop, add] = instance.opcodes();
+        let &[push, pop, add, _nor, _sp, _load, _immediate, _discard] = instance.opcodes() else {
+            panic!("the scalar instance generates only its declared primitives");
+        };
         assert_eq!(
             stream,
             [
@@ -43,7 +45,7 @@ fn instance_owns_opcode_table_context_and_stream() {
                 instance.register_offset(Register::Rax)
             ]
         );
-        for (opcode, offset) in instance.opcodes().into_iter().zip(instance.handlers()) {
+        for (&opcode, &offset) in instance.opcodes().iter().zip(instance.handlers()) {
             let start = instance.table_offset() + usize::from(opcode) * 8;
             let address =
                 u64::from_le_bytes(instance.image()[start..start + 8].try_into().expect("slot"));
@@ -57,6 +59,34 @@ fn instance_owns_opcode_table_context_and_stream() {
                 .image()
         );
     }
+}
+
+#[test]
+fn sub_emits_composed_primitives_and_never_a_direct_sub_handler() {
+    let source = native(&[0x48, 0x29, 0xd0]);
+    let body = lower_instruction(Architecture::X64, &source).expect("SUB");
+    let instance =
+        BodyInstance::generate(&[body], VirtualAddress(0x140000000), 0).expect("instance");
+    assert_eq!(instance.max_stack_bytes(), 24);
+    let code: Vec<_> = Decoder::new(
+        64,
+        &instance.image()[..instance.table_offset()],
+        DecoderOptions::NONE,
+    )
+    .into_iter()
+    .collect();
+    assert!(!code
+        .iter()
+        .any(|i| i.code() == iced_x86::Code::Sub_r64_rm64));
+    assert_eq!(
+        code.iter()
+            .filter(|i| i.code() == iced_x86::Code::Not_rm64)
+            .count(),
+        2
+    );
+    assert!(code
+        .iter()
+        .any(|i| i.code() == iced_x86::Code::And_rm64_r64));
 }
 
 #[test]

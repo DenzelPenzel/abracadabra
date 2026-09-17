@@ -14,6 +14,8 @@ use vmp_x86::{decode_function_with, DecodeOptions, Image};
 
 const MAX_ROOTS: usize = 4096;
 const DECODE_BUDGET: usize = 4096;
+/// Chained `UNWIND_INFO` links followed before the image is treated as out of scope
+const MAX_UNWIND_CHAIN: usize = 16;
 
 /// Exactly one explicit address or one resolved code-symbol occurrence
 pub enum Selection {
@@ -62,8 +64,16 @@ pub enum Error {
     OverlappingCode { rva: Rva },
     #[error("unresolved control flow at known code entry {rva}")]
     UnresolvedControlFlow { rva: Rva },
-    #[error("known-entry analysis exceeded its bounded budget")]
-    Budget,
+    #[error("declared --external-entry {rva} is not in an executable section")]
+    ExternalEntryNotExecutable { rva: Rva },
+    #[error(
+        "known-entry analysis reached its {limit}-root ceiling; virtualization is bounded to \
+         images whose reachable code closure stays under it, so this binary is out of scope \
+         rather than misconfigured"
+    )]
+    RootCeiling { limit: usize },
+    #[error("unwind chain at {rva} is longer than the {limit} links the analysis follows")]
+    UnwindChainDepth { rva: Rva, limit: usize },
     #[error("allocation failed while preparing virtualization")]
     Allocation,
     #[error("generating the VM failed: {0}")]
@@ -193,7 +203,7 @@ fn validate_entries(
     }
     for &target in declared {
         if !image.is_executable(target) {
-            return Err(Error::UnresolvedControlFlow { rva: target });
+            return Err(Error::ExternalEntryNotExecutable { rva: target });
         }
         add(target)?;
     }
@@ -214,7 +224,7 @@ fn validate_entries(
         for function in table.functions() {
             add(function.begin)?;
             let mut next = Some(function.unwind_info);
-            for _ in 0..16 {
+            for _ in 0..MAX_UNWIND_CHAIN {
                 let Some(rva) = next else { break };
                 let unwind = vmp_pe::UnwindInfo::parse(image.pe(), data, rva)?;
                 if let Some(handler) = unwind.handler {
@@ -229,7 +239,10 @@ fn validate_entries(
                 };
             }
             if next.is_some() {
-                return Err(Error::Budget);
+                return Err(Error::UnwindChainDepth {
+                    rva: function.begin,
+                    limit: MAX_UNWIND_CHAIN,
+                });
             }
         }
     }
@@ -326,7 +339,7 @@ fn add_root(
     check_interior(entry, end, target)?;
     if image.is_executable(target) && !roots.contains(&target) {
         if roots.len() == MAX_ROOTS {
-            return Err(Error::Budget);
+            return Err(Error::RootCeiling { limit: MAX_ROOTS });
         }
         roots.try_reserve(1).map_err(|_| Error::Allocation)?;
         roots.push(target);

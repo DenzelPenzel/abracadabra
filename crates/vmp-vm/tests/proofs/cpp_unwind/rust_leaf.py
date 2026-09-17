@@ -54,7 +54,16 @@ def main():
             body_codes[offset] = 0
         shifted_codes = bytearray(body_codes)
         shifted_codes[6] = 27
-        assert list(map(bytes, row['codes'])) == [bytes(body_codes), bytes(shifted_codes), bytes(body_codes)]
+        # Ranges describe either the established body frame or a handler's in-flight
+        # flags word; the generator decides which, this proof only checks the pairing
+        shifted = [bytes(c) == bytes(shifted_codes) for c in row['processor_codes']]
+        assert all(bytes(c) in (bytes(body_codes), bytes(shifted_codes))
+                   for c in row['processor_codes'])
+        # One shifted range per generated ALU handler, all sharing the shifted entry
+        transfers = [i for i in range(len(code) - 3) if code[i:i + 4] == bytes.fromhex('9c8f4500')]
+        assert sum(shifted) == len(transfers) > 0
+        assert [h == row['handler'][0] for h in row['processor_handlers']] == [not s for s in shifted]
+        assert len({row['processor_handlers'][i] for i, s in enumerate(shifted) if s}) == 1
         image = bytearray(65536)
         image[0x1000:0x1007] = bytes.fromhex('4889c84801d0c3')
         image[PLACEMENT:PLACEMENT + len(code)] = code
@@ -62,12 +71,13 @@ def main():
         image[0x8100:0x8110] = body_codes
         struct.pack_into('<II', image, 0x8110, PLACEMENT + row['handler'][0], 0)
         image[0x8120:0x8124] = bytes.fromhex('01000000')
-        image[0x8140:0x8150] = bytes(row['codes'][1])
-        struct.pack_into('<II', image, 0x8150, PLACEMENT + row['shifted_handler'], 0)
+        image[0x8140:0x8150] = bytes(shifted_codes)
+        struct.pack_into('<II', image, 0x8150,
+                         PLACEMENT + row['processor_handlers'][shifted.index(True)], 0)
         ranges = [(0x1000, 0x1007, 0x8120),
                   (PLACEMENT + row['empty'], PLACEMENT + row['empty'] + 1, 0x8120),
                   (PLACEMENT + row['handler'][0], PLACEMENT + row['handler'][1], 0x8120)]
-        ranges.extend((PLACEMENT + start, PLACEMENT + end, 0x8140 if index == 1 else 0x8100)
+        ranges.extend((PLACEMENT + start, PLACEMENT + end, 0x8140 if shifted[index] else 0x8100)
                       for index, (start, end) in enumerate(row['processor']))
         for index, record in enumerate(sorted(ranges)):
             struct.pack_into('<III', image, 0x8000 + index * 12, *record)
@@ -75,11 +85,11 @@ def main():
         assert code.count(signature) == 1
         fault = BASE + PLACEMENT + code.index(signature)
         entry = BASE + PLACEMENT + row['entry']
-        # The flags transfer also belongs to the advertised processor range
-        flags_transfer = bytes.fromhex('9c8f4500')
-        assert code.count(flags_transfer) == 1
-        flags_pop = code.index(flags_transfer) + 1
-        assert row['processor'][1] == [flags_pop, flags_pop + 3]
+        # The fault sites live in the ADD handler, so take its own flags transfer;
+        # it too must be advertised as a processor range
+        flags_pop = next(i for i in transfers if i > code.index(signature)) + 1
+        assert [flags_pop, flags_pop + 3] in row['processor']
+        assert shifted[row['processor'].index([flags_pop, flags_pop + 3])]
         bias = 8 if site == 'flags-pop' else 0
         if bias:
             fault = BASE + PLACEMENT + flags_pop

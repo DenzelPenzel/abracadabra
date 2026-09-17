@@ -5,7 +5,12 @@ use vmp_types::{Architecture, Rva, VirtualAddress};
 use vmp_vm::{instance::BodyInstance, logical::lower_instruction, operand::Register};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let native: Vec<_> = [&[0x48, 0x89, 0xc8][..], &[0x48, 0x01, 0xd0][..]]
+    let arithmetic = if std::env::args().any(|arg| arg == "--sub") {
+        [0x48, 0x29, 0xd0]
+    } else {
+        [0x48, 0x01, 0xd0]
+    };
+    let native: Vec<_> = [&[0x48, 0x89, 0xc8][..], &arithmetic[..]]
         .into_iter()
         .map(|bytes| {
             let raw = Decoder::with_ip(64, bytes, 0x1000, DecoderOptions::NONE).decode();
